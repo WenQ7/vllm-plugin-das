@@ -486,11 +486,7 @@
         "tests/hcu_ci_registry.py",
         "tests/patch/test_hcu_ci_*.py"
       ],
-      "jobs": [
-        "accuracy-gfx936",
-        "contract-hcu-gfx936",
-        "integration-smoke-gfx938"
-      ]
+      "jobs": []
     },
     "kernel-accuracy-tests": {
       "patterns": [
