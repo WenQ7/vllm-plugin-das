@@ -21,6 +21,7 @@ from . import (
     patch_engram_config,
     patch_engine_args,
     patch_envs,
+    patch_step5_config,
     patch_hy_v3_reasoning_parser,
     patch_hy_v3_tool_parser,
     patch_import_utils,
@@ -37,6 +38,7 @@ from . import (
 # reviewable when vLLM is upgraded.
 _ORDERED_ADAPTERS = (
     patch_envs,
+    patch_step5_config,
     patch_engram_config,
     patch_import_utils,
     patch_layer_name,
