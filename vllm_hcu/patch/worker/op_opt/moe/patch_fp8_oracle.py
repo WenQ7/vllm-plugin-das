@@ -336,6 +336,26 @@ def apply_to_module(module: ModuleType) -> bool:
     target.convert_to_fp8_moe_kernel_format = hcu_convert_to_fp8_moe_kernel_format
     target._vllm_hcu_original_make_fp8_moe_kernel = make_kernel
     target.make_fp8_moe_kernel = hcu_make_fp8_moe_kernel
+    # Quantization modules can import the oracle before worker adapters run.
+    # Rebind their known copied symbols so they use the selected HCU ABI too.
+    import sys
+
+    consumers = (
+        "vllm.model_executor.layers.quantization.fp8",
+        "vllm.model_executor.layers.quantization.online.fp8",
+        "vllm.model_executor.layers.quantization.modelopt",
+        "vllm.model_executor.layers.quantization.quark.quark_moe",
+        "vllm.model_executor.layers.quantization.compressed_tensors."
+        "compressed_tensors_moe.compressed_tensors_moe_w8a8_fp8",
+    )
+    for consumer_name in consumers:
+        consumer = sys.modules.get(consumer_name)
+        if consumer is None:
+            continue
+        for name in ("Fp8MoeBackend", "select_fp8_moe_backend",
+                     "convert_to_fp8_moe_kernel_format", "make_fp8_moe_kernel"):
+            if hasattr(consumer, name):
+                setattr(consumer, name, getattr(target, name))
     setattr(target, _MARKER, True)
     return True
 

@@ -1308,6 +1308,33 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
+        chunk_limit = getattr(self.fused_experts, "max_tokens_per_chunk", 0)
+        if chunk_limit > 0 and M_full > chunk_limit:
+            if a1q_scale is not None or a1q.ndim != 2:
+                raise RuntimeError("Received-token chunks support unquantized HT only")
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("Chunked HT experts cannot run inside graph capture")
+            # Each recursive call returns a scratch-backed view. Copy it before
+            # the next chunk reuses that workspace; combine all tokens only once.
+            result = torch.empty((M_full, K), device=a1q.device, dtype=in_dtype)
+            for start in range(0, M_full, chunk_limit):
+                stop = min(start + chunk_limit, M_full)
+                chunk = self._fused_experts(
+                    in_dtype, a1q[start:stop], None, w1, w2,
+                    topk_weights[start:stop], topk_ids[start:stop], activation,
+                    global_num_experts, local_num_experts, expert_map,
+                    apply_router_weight_on_input, None,
+                )
+                result[start:stop].copy_(chunk)
+            return result
+
+        # Backends may refresh post-dispatch metadata before sizing buffers.
+        prepare_metadata = getattr(self.fused_experts, "prepare_workspace_metadata", None)
+        if prepare_metadata is not None:
+            expert_tokens_meta = prepare_metadata(
+                topk_ids, local_num_experts, expert_map, expert_tokens_meta
+            )
+
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
