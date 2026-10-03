@@ -3,13 +3,14 @@
 """Step5 text decoder ported from OpenDAS/vllm-hcu step37-dp.
 
 Reference commit: 0686260600ad725f3c594a6ad9f5dd0a16830091.
-Vision and MTP execution are not enabled. The decoder preserves FP32 Gemma
-normalization and residuals, clamped SwiGLU, sigmoid expert routing, head-wise
-attention gates, and layer-specific rotary dimensions.
+Vision execution is not enabled. Step5MTP provides the separate three-module
+draft decoder. The target preserves FP32 Gemma normalization and residuals,
+clamped SwiGLU, sigmoid expert routing, head-wise attention gates, and
+layer-specific rotary dimensions.
 
-Only routed experts use the checkpoint quantization configuration. Packed
-expert names are replaced by prefix, preserving weight_scale_inv names and
-values for block-FP8 loading. Missing decoder parameters fail loading.
+Routed experts follow the checkpoint quantization configuration. Packed expert
+names are replaced by prefix, preserving their scale names and values for
+block-FP8 or channel-FP8 loading. Missing decoder parameters fail loading.
 
 Full-attention layers use the reference CSA/DSA indexer and kernels. Sliding
 layers explicitly use HCU FlashAttention with a compatible paged cache view.
@@ -106,8 +107,8 @@ def dsa_layer_indices(config: Any) -> list[int]:
     """Loaded layer indices that run DSA, in order.
 
     Read from ``sparse_config.apply_to_layer_types`` rather than assumed, and
-    bounded by ``num_hidden_layers`` -- ``layer_types`` is length 93 because it
-    includes the MTP layer at index 92, which is never loaded.
+    bound indices by ``num_hidden_layers`` for the main decoder. Checkpoint
+    per-layer lists may also include MTP layers, which Step5MTP loads separately.
     """
     if DISABLE_DSA:
         return []
@@ -236,6 +237,14 @@ class Step5MLP(nn.Module):
 
 
 class Step5FlashAttentionBackend(HcuFlashAttentionBackend):
+    @staticmethod
+    def get_builder_cls():
+        from vllm_hcu.model_executor.layers.step5_window_metadata import (
+            Step5WindowMetadataBuilder,
+        )
+
+        return Step5WindowMetadataBuilder
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int]:
         # V2 queries cache specs outside a current-config context. Step5's
@@ -747,6 +756,10 @@ class Step5Model(nn.Module):
         self.dsa_slots = {idx: slot for slot, idx in enumerate(sparse_layers)}
         self.dsa_state: Step4DSAState | None = None
         if sparse_layers:
+            speculative = vllm_config.speculative_config
+            num_speculative_tokens = (
+                speculative.num_speculative_tokens if speculative is not None else 0
+            )
             self.dsa_state = Step4DSAState(
                 num_layers=len(sparse_layers),
                 geometry=Step4DSAGeometry.from_config(config.sparse_config),
@@ -754,7 +767,9 @@ class Step5Model(nn.Module):
                 # max_num_seqs would do; the slack absorbs rows left behind by
                 # requests that finished mid-region, which are only reclaimed
                 # least-recently-touched.
-                max_pending=2 * vllm_config.scheduler_config.max_num_seqs + 16,
+                max_pending=(4 if num_speculative_tokens else 2)
+                * vllm_config.scheduler_config.max_num_seqs + 16,
+                num_speculative_tokens=num_speculative_tokens,
                 dtype=self.compute_dtype,
                 # Capture bounds: the decode schedule lives in [max_num_reqs]
                 # buffers at a score width covering max_model_len, so that both

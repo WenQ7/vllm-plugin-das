@@ -1471,6 +1471,15 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                     **prefill_kwargs,
                 )
             else:
+                # MTP verification has only a few query tokens. The untiled
+                # per-query kernel consumes the same causal region metadata
+                # without building a large union bitmap on the host.
+                if (
+                    0 < num_tokens - ndt <= 64
+                    and not PREFILL_QK_FP8
+                    and not PREFILL_PV_FP8
+                ):
+                    prefill_kwargs["logical_regions"] = None
                 out_p, lse_p = sparse_attention_prefill(
                     query[ndt:num_tokens],
                     k_flat,
@@ -1793,6 +1802,9 @@ class Step4DSASchedule:
     # Regions whose summary is now final; their pending rows are released after
     # every layer has consumed them.
     completed_slots: list[int] = field(default_factory=list)
+    # (pending row, assembled-buffer offset, prefix length). Verification can
+    # reopen a completed region after draft rejection, so retain its prefix.
+    rollback_prefixes: list[tuple[int, int, int]] = field(default_factory=list)
 
     # -- pure-decode fast path ---------------------------------------------
     # Set only when the step is decode-only (num_prefills == 0), where every
@@ -1866,12 +1878,14 @@ class Step4DSAState:
         dtype: torch.dtype,
         max_num_reqs: int = 0,
         max_model_len: int = 0,
+        num_speculative_tokens: int = 0,
     ) -> None:
         self.num_layers = num_layers
         self.geometry = geometry
         self.dtype = dtype
         self.pending = Step4PendingTable(max_pending)
         self.max_pending = max_pending
+        self.num_speculative_tokens = int(num_speculative_tokens)
         # One row past the allocator's capacity, never handed out by the table.
         # The vectorized decode path writes every request's tail unconditionally
         # and sends the requests that have no tail here, which keeps the scatter
@@ -1920,9 +1934,34 @@ class Step4DSAState:
 
     # -- allocation -------------------------------------------------------
 
+    def reset_cache(self) -> None:
+        # V2 graph-memory profiling binds a minimal, temporary KV cache.
+        # Its block IDs and graph buffers must not survive cache replacement.
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Cannot replace Step5 DSA cache during graph capture")
+        self.summary = None
+        self.pending_key = None
+        self.pending_z = None
+        self.pending = Step4PendingTable(self.max_pending)
+        self.block_size = 0
+        self.regions_per_page = 0
+        self.graph_regions = 0
+        self._buf = {}
+        self._host = {}
+        self._stage = 0
+        self._stage_ev = []
+        self._decode_logits = None
+        self._schedule_key = None
+        self._schedule = None
+        self._layers_done = 0
+
     def ensure_allocated(self, kv_cache: torch.Tensor, device: torch.device) -> None:
+        num_blocks, block_size = int(kv_cache.shape[1]), int(kv_cache.shape[2])
         if self.summary is not None:
-            return
+            expected_rows = num_blocks * (block_size // self.geometry.region_size)
+            if self.block_size == block_size and self.summary.shape[1] == expected_rows:
+                return
+            self.reset_cache()
         if torch.cuda.is_current_stream_capturing():
             # Anything allocated here would come out of the graph's private
             # memory pool and be freed with it. vLLM runs cudagraph_num_of_warmups
@@ -2230,11 +2269,21 @@ class Step4DSAState:
             # The head tokens were buffered by a previous step; that buffer is
             # only free once the region it belongs to has actually closed.
             pending_in = self.pending.get(first_slot) if head else -1
-            if head and nbuf >= region:
+            if head and nbuf >= region and not self.num_speculative_tokens:
                 sched.completed_slots.append(first_slot)
 
             tail = nbuf % region
             pending_out = self.pending.acquire(last_slot) if tail else -1
+            if self.num_speculative_tokens:
+                # Retain every region the next verified prefix can reopen.
+                # At least one token advances; up to all draft tokens reject.
+                earliest = max(0, (head + qlen - self.num_speculative_tokens) // region)
+                for j in range(earliest, nregions):
+                    prefix_len = min(region, nbuf - j * region)
+                    pending_row = self.pending.acquire(slot_of(first_region + j))
+                    sched.rollback_prefixes.append(
+                        (pending_row, buf_off + j * region, prefix_len)
+                    )
 
             sched.requests.append(
                 _RequestPlan(
@@ -2463,7 +2512,7 @@ class Step4DSAState:
                 continue
             head_row = int(head_np[row])
             rows_in[row] = self.pending.get(slot) if head_row else trash
-            if head_row == region - 1:
+            if head_row == region - 1 and not self.num_speculative_tokens:
                 # The region closed this step; its tokens are now in a summary
                 # and the pending row is released once every layer has read it.
                 sched.completed_slots.append(slot)
@@ -2938,6 +2987,14 @@ class Step4Indexer:
             state.summary[self.slot], summary_fp8, sched.slots, sched.live,
         )
 
+        for pending_row, offset, prefix_len in sched.rollback_prefixes:
+            pending_key[pending_row, :prefix_len] = buffer_key[
+                offset : offset + prefix_len, 0
+            ]
+            pending_z[pending_row, :prefix_len] = buffer_z[
+                offset : offset + prefix_len, 0
+            ]
+
         for plan in sched.requests:
             if not plan.tail:
                 continue
@@ -2999,7 +3056,8 @@ class Step4Indexer:
             state.summary[self.slot], summary_fp8, sched.slots, sched.live,
         )
 
-        tail_mask = (positions[None, :] < sched.tail[:, None]).unsqueeze(-1)
+        retained = sched.head + 1 if state.num_speculative_tokens else sched.tail
+        tail_mask = (positions[None, :] < retained[:, None]).unsqueeze(-1)
         rows = sched.pending_out
         pending_key[rows] = torch.where(tail_mask, buffer_key, pending_key[rows])
         pending_z[rows] = torch.where(tail_mask, buffer_z, pending_z[rows])

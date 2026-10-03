@@ -18,16 +18,27 @@ def region_topk_ids(logits, lengths, *, topk, block_r=2048):
         return out
     ids = torch.arange(width, device=logits.device)
     visible = lengths.to(torch.int64).clamp(0, width)
-    bits = logits.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    keys = torch.where(
-        (bits & 0x80000000) != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000
-    )
-    keys = torch.where(ids[None, :] < visible[:, None], keys, -1)
     take = min(int(topk), width)
-    ranked = torch.argsort(keys, dim=-1, descending=True, stable=True)[:, :take]
-    valid = torch.arange(take, device=logits.device)[None, :] < visible[:, None]
-    ranked = torch.where(valid, ranked, width).sort(dim=-1).values
-    out[:, :take] = torch.where(ranked < width, ranked, -1).to(torch.int32)
+    # Unique integer ranks preserve the lower-ID tie break of stable argsort.
+    tie_bits = max(1, (width - 1).bit_length())
+    if tie_bits > 31:
+        raise ValueError("selector width exceeds exact int64 rank capacity")
+    # Bound temporary rank tensors for long-context prefill. The original
+    # whole-matrix stable sort could consume several GiB for one DSA layer.
+    chunk_rows = max(1, min(rows, (4 * 1024 * 1024) // width))
+    for start in range(0, rows, chunk_rows):
+        end = min(rows, start + chunk_rows)
+        bits = logits[start:end].contiguous().view(torch.int32).to(torch.int64)
+        bits &= 0xFFFFFFFF
+        keys = torch.where(
+            (bits & 0x80000000) != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000
+        )
+        keys = torch.where(ids[None, :] < visible[start:end, None], keys, -1)
+        ranks = (keys << tie_bits) + (width - 1 - ids)[None, :]
+        ranked = torch.topk(ranks, take, dim=-1, sorted=False).indices
+        valid = ranked < visible[start:end, None]
+        ranked = torch.where(valid, ranked, width).sort(dim=-1).values
+        out[start:end, :take] = torch.where(ranked < width, ranked, -1).to(torch.int32)
     return out
 
 

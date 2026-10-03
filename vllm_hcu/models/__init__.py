@@ -7,6 +7,7 @@ from vllm import ModelRegistry
 
 
 def register_model():
+    ModelRegistry.register_model("Step5MTP", "vllm_hcu.models.step5_mtp:Step5MTP")
     ModelRegistry.register_model(
         "Step5ForCausalLM", "vllm_hcu.models.step5:Step5ForCausalLM"
     )
