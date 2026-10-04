@@ -286,6 +286,14 @@ def apply_to_module(module: ModuleType) -> bool:
         routing_tables=None,
     ):
         if fp8_backend == hcu_enum.HCU_DEEPGEMM:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.model_executor.layers.fused_moe.step5_sp_workspace import (
+                bound_sequence_parallel_workspace,
+            )
+            moe_config = bound_sequence_parallel_workspace(
+                moe_config, get_current_vllm_config_or_none()
+            )
+        if fp8_backend == hcu_enum.HCU_DEEPGEMM:
             # Scope the post-dispatch quantization ABI to the selected HCU
             # Channel-FP8 backend. Channel-INT8 and official FP8 kernels keep
             # their existing DeepEP dispatch behavior.

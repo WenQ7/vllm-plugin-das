@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: Apache-2.0
+# Bound Step5 low-latency dispatch storage to the sequence-parallel input.
+from __future__ import annotations
+import copy
+import os
+
+def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
+    if os.getenv("VLLM_STEP5_SP_LL_WORKSPACE", "0") != "1":
+        return None
+    if vllm_config is None:
+        vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
+    if vllm_config is None:
+        return None
+    parallel = vllm_config.parallel_config
+    hf = getattr(vllm_config.model_config, "hf_config", None)
+    architectures = getattr(
+        vllm_config.model_config, "architectures",
+        getattr(hf, "architectures", ()),
+    ) or ()
+    moe_parallel = moe_config.moe_parallel_config
+    if not (
+        any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
+            for a in architectures)
+        and parallel.tensor_parallel_size == 2
+        and parallel.data_parallel_size == 4
+        and parallel.pipeline_parallel_size == 1
+        and parallel.decode_context_parallel_size == 1
+        and getattr(parallel, "prefill_context_parallel_size", 1) == 1
+        and parallel.all2all_backend == "deepep_low_latency"
+        and os.getenv("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
+        and moe_parallel.is_sequence_parallel
+        and moe_parallel.sp_size == 2
+        and moe_parallel.ep_size == 8
+    ):
+        return None
+    # Account for target graph and speculative request padding before SP slicing.
+    scheduler = vllm_config.scheduler_config
+    captures = getattr(vllm_config.compilation_config, "cudagraph_capture_sizes", ()) or ()
+    spec = vllm_config.speculative_config
+    speculative_tokens = getattr(spec, "num_speculative_tokens", 0) if spec else 0
+    full_tokens = max(
+        int(moe_config.max_num_tokens),
+        int(scheduler.max_num_batched_tokens),
+        max(captures, default=0),
+        int(scheduler.max_num_seqs) * (1 + int(speculative_tokens)),
+    )
+    if full_tokens <= 0:
+        raise ValueError("Step5 dispatch requires a positive token capacity")
+    local_tokens = (full_tokens + moe_parallel.sp_size - 1) // moe_parallel.sp_size
+    # DeepEP low-latency kernels use 128-token tiles.
+    return ((local_tokens + 127) // 128) * 128
+
+def bound_sequence_parallel_workspace(moe_config, vllm_config):
+    bound = sequence_parallel_dispatch_bound(moe_config, vllm_config)
+    if bound is None:
+        return moe_config
+    # Keep the runner/quantization layer's config intact. Use the same private
+    # bound for native DeepEP handle, prepare/finalize and expert construction.
+    bounded = copy.copy(moe_config)
+    bounded.max_num_tokens = bound
+    from vllm.logger import init_logger
+    init_logger("vllm.hcu.step5_sp_workspace").info_once(
+        "Step5 SP LL workspace: full token bound=%s; per-dispatcher bound=%s",
+        moe_config.max_num_tokens, bound,
+    )
+    return bounded

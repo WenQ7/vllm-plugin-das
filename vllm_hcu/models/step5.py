@@ -35,6 +35,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
@@ -80,6 +81,7 @@ from vllm.model_executor.models.utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 
 from vllm_hcu.v1.attention.backends.flash_attn import HcuFlashAttentionBackend
@@ -191,6 +193,7 @@ class Step5MLP(nn.Module):
         hidden_act: str,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
+        is_sequence_parallel: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -199,6 +202,7 @@ class Step5MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -206,6 +210,7 @@ class Step5MLP(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            disable_tp=is_sequence_parallel,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
@@ -503,6 +508,16 @@ class FusedMoEBlock(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
+        self.is_sequence_parallel = (
+            os.environ.get("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
+            and parallel_config.use_sequence_parallel_moe
+            and parallel_config.pipeline_parallel_size == 1
+        )
+        if self.is_sequence_parallel:
+            logger.info_once(
+                "Step5 MoE sequence parallel: shard tokens within each TP group "
+                "and replicate shared-expert weights."
+            )
 
         self.hidden_size = config.hidden_size
         self.enable_eplb = parallel_config.enable_eplb
@@ -563,6 +578,7 @@ class FusedMoEBlock(nn.Module):
             intermediate_size=config.share_expert_dim,
             hidden_act="silu",
             reduce_results=False,
+            is_sequence_parallel=self.is_sequence_parallel,
             quant_config=None,
             prefix=f"{prefix}.share_expert",
         )
@@ -583,11 +599,14 @@ class FusedMoEBlock(nn.Module):
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             router_logits_dtype=torch.float32,
+            is_sequence_parallel=self.is_sequence_parallel,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+        if self.is_sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
 
         if self.experts.is_internal_router:
             final_hidden_states = self.experts(
@@ -599,6 +618,10 @@ class FusedMoEBlock(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+        if self.is_sequence_parallel:
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states, 0
+            )[:num_tokens]
         return final_hidden_states.view(num_tokens, hidden_dim)
 
 

@@ -212,6 +212,10 @@ def apply_to_module(module: ModuleType) -> bool:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 
         cfg = get_current_vllm_config_or_none()
+        from vllm_hcu.model_executor.layers.fused_moe.step5_sp_workspace import (
+            bound_sequence_parallel_workspace,
+        )
+        moe_config = bound_sequence_parallel_workspace(moe_config, cfg)
         if (
             os.getenv("VLLM_STEP5_HT_COMPACT_WORKSPACE", "0") == "1"
             and experts_cls is TritonExperts

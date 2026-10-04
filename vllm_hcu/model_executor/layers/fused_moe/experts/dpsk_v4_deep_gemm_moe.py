@@ -587,10 +587,22 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
             arch = torch.cuda.get_device_properties(
                 torch.cuda.current_device()
             ).gcnArchName.split(":")[0]
+            parallel = config.parallel_config
+            supported_parallel = (
+                parallel.tensor_parallel_size == 1
+                and parallel.data_parallel_size == 8
+            ) or (
+                parallel.tensor_parallel_size == 2
+                and parallel.data_parallel_size == 4
+                and parallel.pipeline_parallel_size == 1
+                and parallel.decode_context_parallel_size == 1
+                and moe_config.is_sequence_parallel
+                and moe_config.ep_size == 8
+                and os.environ.get("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
+            )
             self._step5_ll_tuning = (
                 config.model_config.hf_text_config.model_type == "step5"
-                and config.parallel_config.tensor_parallel_size == 1
-                and config.parallel_config.data_parallel_size == 8
+                and supported_parallel
                 and arch == "gfx938"
             )
             if self._step5_ll_tuning:
