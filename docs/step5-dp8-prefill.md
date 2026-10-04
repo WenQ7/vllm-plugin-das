@@ -28,3 +28,19 @@ EvalScope score or evidence that the communication setting improves accuracy.
 The DeepEP SM setting is opt-in through `VLLM_HCU_DEEPEP_NUM_SMS`. The runtime
 validates the supported six-SM granularity and communication budget before
 constructing the buffer. This profile is for single-node DP8 prefill.
+
+The profile also reuses the fresh DeepEP dispatch expert counts for channel-FP8
+compact workspace sizing. The receiver records routing provenance, and the
+workspace helper verifies the same routing tensor and contiguous local expert
+map. Changed versioned routing or maps, missing provenance and maps without a
+mutation counter use the original recount path.
+
+With SMS36 held fixed, one additional 64K-input, concurrency-eight prefill round
+increased input throughput from 8,869.85 to 8,967.62 tok/s (+1.10%). Output length,
+warmup, prompts and synthetic MTP parameters were unchanged. All eight native
+model traces removed the repeated GPU expert-count kernel. Forty native
+rank/case checks covered dispatch, compact permutation and combine.
+
+The corresponding standard-MTP GSM8K100 check remained 98/100 with identical
+per-question grading. Four short boundary probes and four 64K probes passed
+without truncation. This is the same smoke-check scope described above.

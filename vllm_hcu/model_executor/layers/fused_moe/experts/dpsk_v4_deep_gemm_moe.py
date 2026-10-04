@@ -194,6 +194,13 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         )
         if self._compact_step5_ht:
             logger.info_once("Step5 HT compact workspace uses fresh post-dispatch counts.")
+        self._step5_ht_dispatch_map_cache = (
+            {}
+            if self._compact_step5_ht
+            and os.getenv("VLLM_STEP5_HT_REUSE_DISPATCH_COUNTS", "0") == "1"
+            and getattr(config.parallel_config, "enable_eplb", True) is False
+            else None
+        )
         self._deepgemm_w13: torch.Tensor | None = None
         self._deepgemm_w2: torch.Tensor | None = None
         logger.info_once(
@@ -332,7 +339,8 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
         if not getattr(self, "_compact_step5_ht", False):
             return expert_tokens_meta
         return prepare_compact_metadata(
-            topk_ids, local_num_experts, expert_map, expert_tokens_meta
+            topk_ids, local_num_experts, expert_map, expert_tokens_meta,
+            self._step5_ht_dispatch_map_cache,
         )
 
     def workspace_shapes(

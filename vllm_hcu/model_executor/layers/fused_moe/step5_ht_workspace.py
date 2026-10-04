@@ -24,6 +24,62 @@ def aligned_expert_rows(counts: torch.Tensor, alignment: int = 256) -> int:
     values = counts.to(torch.int64)
     return int((((values + alignment - 1) // alignment) * alignment).sum())
 
+@dataclass
+class Step5HTDispatchTokensMetadata(ExpertTokensMetadata):
+    # Only the HT receiver creates this marker, after its local-to-global remap.
+    routed_ids: torch.Tensor | None = None
+    routed_version: int | None = None
+    rank_expert_offset: int = 0
+    global_num_experts: int = 0
+
+
+def mark_fresh_dispatch_metadata(meta, routed_ids, offset, global_num_experts):
+    return Step5HTDispatchTokensMetadata(
+        expert_num_tokens=meta.expert_num_tokens,
+        expert_num_tokens_cpu=meta.expert_num_tokens_cpu,
+        routed_ids=routed_ids,
+        routed_version=_tensor_version(routed_ids),
+        rank_expert_offset=offset,
+        global_num_experts=global_num_experts,
+    )
+
+
+def _dispatch_counts_match_local_map(meta, topk_ids, local_num_experts,
+                                    expert_map, map_cache):
+    if not isinstance(meta, Step5HTDispatchTokensMetadata):
+        return False
+    if meta.routed_ids is not topk_ids:
+        return False
+    if meta.routed_version != _tensor_version(topk_ids):
+        return False
+    cpu = meta.expert_num_tokens_cpu
+    if (cpu is None or cpu.device.type != "cpu" or cpu.ndim != 1
+            or cpu.numel() != local_num_experts
+            or meta.expert_num_tokens.shape != cpu.shape):
+        return False
+    if expert_map is None or expert_map.numel() != meta.global_num_experts:
+        return False
+    version = _tensor_version(expert_map)
+    if version is None:
+        # Inference tensors have no mutation counter. Retain the recount path.
+        return False
+    key = (version, meta.rank_expert_offset, local_num_experts,
+           meta.global_num_experts)
+    if map_cache.get("tensor") is not expert_map or map_cache.get("key") != key:
+        expected = torch.full((meta.global_num_experts,), -1,
+                              device="cpu", dtype=expert_map.dtype)
+        begin = meta.rank_expert_offset
+        if begin < 0 or begin + local_num_experts > expected.numel():
+            return False
+        expected[begin:begin + local_num_experts] = torch.arange(
+            local_num_experts, dtype=expected.dtype
+        )
+        actual = expert_map.detach().cpu()
+        map_cache.update(tensor=expert_map, key=key,
+                         matches=torch.equal(actual, expected))
+    return map_cache["matches"]
+
+
 def _tensor_version(tensor):
     # vLLM creates routing tensors under inference_mode, without a version counter.
     try:
@@ -31,12 +87,22 @@ def _tensor_version(tensor):
     except RuntimeError:
         return None
 
-def prepare_compact_metadata(topk_ids, local_num_experts, expert_map, previous):
+def prepare_compact_metadata(topk_ids, local_num_experts, expert_map, previous,
+                             dispatch_map_cache=None):
     # Count after dispatch/remapping; never shrink from stale dispatch metadata.
     if torch.cuda.is_current_stream_capturing() or torch.compiler.is_compiling():
         return previous
-    counts = count_expert_num_tokens(topk_ids, local_num_experts, expert_map)
-    cpu = counts.cpu()
+    if (dispatch_map_cache is not None
+            and _dispatch_counts_match_local_map(
+                previous, topk_ids, local_num_experts, expert_map,
+                dispatch_map_cache)):
+        counts = previous.expert_num_tokens
+        cpu = previous.expert_num_tokens_cpu
+        if bool((cpu < 0).any()):
+            raise RuntimeError("Fresh dispatch contains negative expert counts")
+    else:
+        counts = count_expert_num_tokens(topk_ids, local_num_experts, expert_map)
+        cpu = counts.cpu()
     total = int(cpu.to(torch.int64).sum())
     if total == 0:
         return previous  # Preserve the established all-invalid GEMM path.
