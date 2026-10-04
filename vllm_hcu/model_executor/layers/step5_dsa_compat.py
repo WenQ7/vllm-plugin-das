@@ -6,12 +6,16 @@ with the current DTK compiler. Keep the vendored file intact and substitute
 only its selectors when the launcher opts in. IEEE float ordering, tie breaks,
 ascending logical IDs, padding and metadata packing match the reference.
 """
+import os
 import torch
 
 
 def region_topk_ids(logits, lengths, *, topk, block_r=2048):
     if logits.dtype != torch.float32:
         raise ValueError("selector expects float32 scores")
+    if os.environ.get("VLLM_STEP5_DSA_FUSED_SELECTOR", "0") == "1":
+        from .step5_dsa_selector import region_topk_ids_fused
+        return region_topk_ids_fused(logits, lengths, topk=topk)
     rows, width = logits.shape
     out = torch.full((rows, int(topk)), -1, dtype=torch.int32, device=logits.device)
     if width == 0 or topk == 0:
@@ -58,6 +62,15 @@ def region_topk_pack(
     if block_table.ndim != 2:
         raise ValueError("block_table must be [num_reqs, pages]")
     logical = region_topk_ids(logits, lengths, topk=topk, block_r=block_r)
+    if os.environ.get("VLLM_STEP5_DSA_FUSED_SELECTOR", "0") == "1":
+        from .step5_dsa_selector import pack_regions_fused
+        packed = pack_regions_fused(
+            logical, q_positions, block_table, request_indices,
+            region_size=region_size, regions_per_page=regions_per_page)
+        if _logical_out is not None:
+            _logical_out.copy_(logical)
+            return packed, _logical_out
+        return packed
     safe = logical.clamp_min(0).to(torch.int64)
     if request_indices is None or block_table.shape[0] == 1:
         request_indices = torch.zeros(

@@ -43,6 +43,10 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
     sparse_attention_decode,
     sparse_attention_prefill,
 )
+from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
+    sparse_attention_short_prefill,
+    prefill_request_indices_device,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -909,6 +913,7 @@ class Step4DSAMetadata:
     # control flow and the one device-to-host read live, and the builder runs
     # eagerly on every step -- including the steps that are only a graph replay.
     schedule: Step4DSASchedule | None = None
+    prefill_request_indices: torch.Tensor | None = None
 
 
 class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
@@ -1006,6 +1011,16 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             block_size=self.block_size,
             block_table_np=getattr(m, "block_table_np", None),
         )
+
+        if (
+            os.environ.get("VLLM_STEP5_DEVICE_REQUEST_INDICES", "0") == "1"
+            and num_prefills > 0
+        ):
+            # Share one device-built integer map across all DSA layers. Supplying
+            # the known row count avoids repeat_interleave's device-to-host sync.
+            md.prefill_request_indices = prefill_request_indices_device(
+                m.query_start_loc, num_decodes, num_prefills, num_prefill_tokens,
+            )
 
         # Build the decode schedule here rather than in the indexer op. It is
         # the only part of the DSA step that has host control flow and a
@@ -1480,18 +1495,35 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                     and not PREFILL_PV_FP8
                 ):
                     prefill_kwargs["logical_regions"] = None
-                out_p, lse_p = sparse_attention_prefill(
-                    query[ndt:num_tokens],
-                    k_flat,
-                    v_flat,
-                    packed,
-                    counts,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    qk_fp8=PREFILL_QK_FP8 and k_flat.dtype == torch.float8_e4m3fn,
-                    pv_fp8=PREFILL_PV_FP8 and k_flat.dtype == torch.float8_e4m3fn,
-                    **prefill_kwargs,
-                )
+                if (
+                    os.environ.get("VLLM_STEP5_DSA_SHORT_QUERY", "0") == "1"
+                    and 0 < num_tokens - ndt <= 64
+                    and self.head_size == 192
+                    and not PREFILL_QK_FP8
+                    and not PREFILL_PV_FP8
+                ):
+                    splits = _decode_num_splits(
+                        (num_tokens - ndt) * num_kv_groups, packed.shape[1]
+                    )
+                    out_p, lse_p = sparse_attention_short_prefill(
+                        query[ndt:num_tokens], k_flat, v_flat, packed, counts,
+                        num_kv_groups=num_kv_groups,
+                        region_size=REGION_BLOCK_SIZE, softmax_scale=self.scale,
+                        num_splits=splits, k_scale=k_scale, v_scale=v_scale,
+                    )
+                else:
+                    out_p, lse_p = sparse_attention_prefill(
+                        query[ndt:num_tokens],
+                        k_flat,
+                        v_flat,
+                        packed,
+                        counts,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        qk_fp8=PREFILL_QK_FP8 and k_flat.dtype == torch.float8_e4m3fn,
+                        pv_fp8=PREFILL_PV_FP8 and k_flat.dtype == torch.float8_e4m3fn,
+                        **prefill_kwargs,
+                    )
             del lse_p
             output[ndt:num_tokens] = out_p
 
@@ -1558,21 +1590,24 @@ def build_plan(
         q_positions = positions[ndt : attn_metadata.num_actual_tokens].to(torch.int32)
         # request_indices maps each score row to its block-table row. Rows are
         # group-major, so the per-token request index tiles once per KV group.
-        starts = attn_metadata.query_start_loc_cpu
-        req_of_token = torch.repeat_interleave(
-            torch.arange(
-                nd,
-                nd + attn_metadata.num_prefills,
-                dtype=torch.int32,
-                device=positions.device,
-            ),
-            (starts[nd + 1 :] - starts[nd:-1]).to(positions.device),
-        )
+        req_of_token = attn_metadata.prefill_request_indices
+        if req_of_token is None:
+            starts = attn_metadata.query_start_loc_cpu
+            req_of_token = torch.repeat_interleave(
+                torch.arange(
+                    nd,
+                    nd + attn_metadata.num_prefills,
+                    dtype=torch.int32,
+                    device=positions.device,
+                ),
+                (starts[nd + 1 :] - starts[nd:-1]).to(positions.device),
+            )
+        group_request_indices = req_of_token.repeat(num_kv_groups)
         packed, counts, logical_ids = prefill_sparse_meta(
             prefill_logits,
             q_positions.repeat(num_kv_groups),
             attn_metadata.block_table,
-            req_of_token.repeat(num_kv_groups),
+            group_request_indices,
             topk=topk,
             region_size=REGION_BLOCK_SIZE,
             regions_per_page=regions_per_page,
@@ -1582,7 +1617,7 @@ def build_plan(
             packed,
             counts,
             logical_ids,
-            req_of_token.repeat(num_kv_groups),
+            group_request_indices,
         )
         _maybe_dump_prefill_plan(packed, counts, q_positions)
 
