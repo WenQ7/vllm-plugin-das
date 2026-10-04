@@ -1071,6 +1071,10 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self, *, vllm_config: VllmConfig, prefix: str = "",
     ):
         super().__init__()
+        from vllm_hcu.model_executor.layers.fused_moe.step5_bf16_tiles import (
+            configure_step5_bf16_tiles,
+        )
+        configure_step5_bf16_tiles(vllm_config)
         config = vllm_config.model_config.hf_config
         self.compute_dtype = vllm_config.model_config.dtype
         # The final three expert layers are BF16; exclusion entries in the
