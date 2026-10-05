@@ -337,28 +337,38 @@ def _flash_attn_dsa_ops() -> tuple[Any, Any, Any, Any]:
     Triton kernels here, at the same ``head_dim=192`` Step-4 uses throughout.
     """
     try:
-        from flash_attn.flash_attn_interface import (
-            fa_sparse_attention_decode,
-            fa_sparse_attention_decode_fp8,
-            fa_sparse_attention_prefill,
-            fa_sparse_attention_prefill_fp8,
-        )
+        from flash_attn import flash_attn_interface
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise ImportError(
             "VLLM_STEP4_DSA_FLASH_ATTN (or VLLM_HCU_USE_FLASH_ATTN/"
             "VLLM_HCU_USE_FLASH_ATTN_UNIFIED) asked for flash_attn sparse "
             "attention but flash_attn.flash_attn_interface could not be "
-            "imported, or does not expose the fa_sparse_attention_* ops"
+            "imported"
         ) from exc
+    required = {
+        "prefill": "fa_sparse_attention_prefill",
+        "decode": "fa_sparse_attention_decode",
+    }
+    missing = [
+        name
+        for stage, name in required.items()
+        if stage in FLASH_ATTN_DSA_STAGES
+        and not hasattr(flash_attn_interface, name)
+    ]
+    if missing:
+        raise ImportError(
+            "flash_attn does not expose the enabled sparse attention op(s): "
+            + ", ".join(missing)
+        )
     logger.info(
         "step4 DSA: %s from flash_attn.flash_attn_interface",
         ", ".join(sorted(FLASH_ATTN_DSA_STAGES)),
     )
     return (
-        fa_sparse_attention_prefill,
-        fa_sparse_attention_prefill_fp8,
-        fa_sparse_attention_decode,
-        fa_sparse_attention_decode_fp8,
+        getattr(flash_attn_interface, "fa_sparse_attention_prefill", None),
+        getattr(flash_attn_interface, "fa_sparse_attention_prefill_fp8", None),
+        getattr(flash_attn_interface, "fa_sparse_attention_decode", None),
+        getattr(flash_attn_interface, "fa_sparse_attention_decode_fp8", None),
     )
 
 
@@ -388,6 +398,10 @@ def _flash_attn_prefill(
     """
     prefill_bf16, prefill_fp8, _, _ = _flash_attn_dsa_ops()
     if key_cache.dtype == torch.float8_e4m3fn:
+        if prefill_fp8 is None:
+            raise RuntimeError(
+                "installed flash_attn lacks fa_sparse_attention_prefill_fp8"
+            )
         return prefill_fp8(
             query,
             key_cache,
@@ -438,6 +452,10 @@ def _flash_attn_decode(
     """
     _, _, decode_bf16, decode_fp8 = _flash_attn_dsa_ops()
     if key_cache.dtype == torch.float8_e4m3fn:
+        if decode_fp8 is None:
+            raise RuntimeError(
+                "installed flash_attn lacks fa_sparse_attention_decode_fp8"
+            )
         return decode_fp8(
             query,
             key_cache,
