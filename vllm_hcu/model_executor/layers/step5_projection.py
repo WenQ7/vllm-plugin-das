@@ -83,9 +83,15 @@ def prepare_merged_projection(owner: nn.Module) -> None:
 
 
 def prepare_model_projections(model: nn.Module) -> None:
+    import os
+    full = os.getenv("VLLM_STEP5_FULL_MIXED_PROJECTION", "0") == "1"
     for module in model.modules():
         if hasattr(module, "merge_attention_projection"):
+            requested = module.merge_attention_projection
             prepare_merged_projection(module)
+            if full and requested:
+                from .step5_full_projection import prepare_full_projection
+                prepare_full_projection(module)
 
 
 def merged_projection(owner: nn.Module, hidden_states: torch.Tensor):

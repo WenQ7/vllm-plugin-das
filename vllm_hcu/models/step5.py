@@ -489,7 +489,10 @@ class Step5Attention(nn.Module):
     ) -> torch.Tensor:
         projected_index = None
         projected_gate = None
-        if self.merge_attention_projection:
+        if getattr(self, "step5_full_projection_ready", False):
+            from vllm_hcu.model_executor.layers.step5_full_projection import full_projection
+            qkv, projected_index, projected_gate = full_projection(self, hidden_states)
+        elif self.merge_attention_projection:
             qkv, projected_index, projected_gate = merged_projection(self, hidden_states)
             if qkv is None:
                 qkv, _ = self.qkv_proj(hidden_states)
