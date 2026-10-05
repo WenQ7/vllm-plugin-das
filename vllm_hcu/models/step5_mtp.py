@@ -191,6 +191,10 @@ class Step5MultiTokenPredictor(nn.Module):
 
 @support_torch_compile
 class Step5MTP(nn.Module, SupportsPP):
+    def process_weights_after_loading(self) -> None:
+        from .step5 import prepare_model_projections
+        prepare_model_projections(self)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         speculative = vllm_config.speculative_config

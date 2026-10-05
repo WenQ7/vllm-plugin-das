@@ -2831,7 +2831,8 @@ class Step4Indexer:
 
     # -- forward ----------------------------------------------------------
 
-    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> None:
+    def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor,
+                projected_index: torch.Tensor | None = None) -> None:
         """Score and select, via the opaque op so that ``torch.compile`` cannot
         trace into this. See ``step4_dsa_index`` for why that matters."""
         torch.ops.vllm.step4_dsa_index(
@@ -2840,9 +2841,11 @@ class Step4Indexer:
             self.layer_name,
             # Read through the owner, not cached: .cuda() rebinds the buffer.
             self.owner.step4_dsa_plan_token,
+            projected_index,
         )
 
-    def run(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> int:
+    def run(self, hidden_states: torch.Tensor, positions: torch.Tensor,
+            projected_index: torch.Tensor | None = None) -> int:
         attn = self.owner.attn
         raw = get_forward_context().attn_metadata
         if isinstance(raw, dict):
@@ -2892,7 +2895,8 @@ class Step4Indexer:
 
         num_tokens = md.num_actual_tokens
         index_q, index_k, index_z, weights = self._project(
-            hidden_states[:num_tokens], positions[:num_tokens], num_tokens
+            hidden_states[:num_tokens], positions[:num_tokens], num_tokens,
+            projected_index[:num_tokens] if projected_index is not None else None,
         )
         self._update_summaries(sched, index_k, index_z)
         prefill_logits, decode_logits, width = self._score(md, sched, index_q, weights)
@@ -2912,14 +2916,22 @@ class Step4Indexer:
     # -- stage 1: projection ----------------------------------------------
 
     def _project(
-        self, hidden_states: torch.Tensor, positions: torch.Tensor, num_tokens: int
+        self, hidden_states: torch.Tensor, positions: torch.Tensor, num_tokens: int,
+        projected_index: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         owner = self.owner
         proxy = self.geometry.proxy_dim
 
-        index_q = owner.sparse_indexer_q(hidden_states)
-        index_k = owner.sparse_indexer_k(hidden_states)
-        index_z = owner.sparse_indexer_z(hidden_states)
+        if projected_index is None:
+            index_q = owner.sparse_indexer_q(hidden_states)
+            index_k = owner.sparse_indexer_k(hidden_states)
+            index_z = owner.sparse_indexer_z(hidden_states)
+            raw_weights = F.linear(
+                hidden_states, owner.sparse_indexer_w.weight.to(hidden_states.dtype)
+            )
+        else:
+            sizes = (self.num_heads * proxy, proxy, proxy, self.num_heads)
+            index_q, index_k, index_z, raw_weights = projected_index.split(sizes, dim=-1)
 
         cos, sin = self.state.rope_tables(
             theta=self.rope_theta,
@@ -2932,9 +2944,9 @@ class Step4Indexer:
         # rotation and index_z is returned untouched -- it is a per-dimension
         # softmax logit, not a key.
         index_q, index_k, index_z = indexer_norm_rope(
-            index_q.contiguous(),
-            index_k.contiguous(),
-            index_z.contiguous(),
+            index_q,
+            index_k,
+            index_z,
             owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype),
             owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype),
             owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype),
@@ -2952,9 +2964,7 @@ class Step4Indexer:
         # Round the fp32 weight to the activation dtype *before* the GEMM and
         # widen the result back to fp32 afterwards. Both boundaries are part of
         # the deployed semantics: doing the GEMM in fp32 gives different scores.
-        weights = F.linear(
-            hidden_states, owner.sparse_indexer_w.weight.to(hidden_states.dtype)
-        ).float()
+        weights = raw_weights.float()
         weights = weights.view(num_tokens, self.num_kv_groups, self.heads_per_group)
         weights = (weights * self.weight_prescale).contiguous()
 
@@ -3281,6 +3291,7 @@ def step4_dsa_index(
     positions: torch.Tensor,
     layer_name: str,
     plan_token: torch.Tensor,
+    projected_index: torch.Tensor | None = None,
 ) -> None:
     indexer = _INDEXERS.get(layer_name)
     if indexer is None:
@@ -3289,7 +3300,7 @@ def step4_dsa_index(
             f"layer name, so the indexer must be constructed before the first "
             f"forward pass."
         )
-    plan_token.fill_(indexer.run(hidden_states, positions))
+    plan_token.fill_(indexer.run(hidden_states, positions, projected_index))
 
 
 def step4_dsa_index_fake(
@@ -3297,6 +3308,7 @@ def step4_dsa_index_fake(
     positions: torch.Tensor,
     layer_name: str,
     plan_token: torch.Tensor,
+    projected_index: torch.Tensor | None = None,
 ) -> None:
     return None
 

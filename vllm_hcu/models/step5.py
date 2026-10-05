@@ -29,7 +29,7 @@ from torch.nn.parameter import Parameter
 
 
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import CacheConfig, ModelConfig, VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_ep_group,
     get_pp_group,
@@ -85,6 +85,11 @@ from vllm.model_executor.models.utils import (
 )
 
 from vllm_hcu.v1.attention.backends.flash_attn import HcuFlashAttentionBackend
+from vllm_hcu.model_executor.layers.step5_attention_ops import fused_qknorm_rope
+from vllm_hcu.model_executor.layers.step5_projection import (
+    merged_projection, prepare_model_projections,
+)
+from vllm_hcu.model_executor.layers.step5_qkv_fp8 import Step5QKVFp8LinearMethod
 
 logger = init_logger(__name__)
 
@@ -352,6 +357,10 @@ class Step5Attention(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.qkv_proj",
         )
+        self.qkv_fp8_w8a8 = os.environ.get("VLLM_STEP5_QKV_FP8_W8A8", "0") == "1"
+        if self.qkv_fp8_w8a8:
+            self.qkv_proj.quant_method = Step5QKVFp8LinearMethod(prefix=prefix)
+
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -442,6 +451,30 @@ class Step5Attention(nn.Module):
                 num_attention_heads=total_num_attention_heads or self.total_num_heads,
             )
 
+        self.merge_attention_projection = os.environ.get("VLLM_STEP5_MERGED_ATTENTION_PROJECTION", "0") == "1"
+        self.register_buffer("step5_merged_weight", None, persistent=False)
+        self.register_buffer("step5_merged_bias", None, persistent=False)
+        self.step5_merged_offsets = {}
+        self.step5_merged_ready = False
+        compiled_native_rope = False
+        if os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1":
+            fusion_config = get_current_vllm_config()
+            norm_priority = fusion_config.kernel_config.ir_op_priority.rms_norm
+            compiled_native_rope = (
+                fusion_config.compilation_config.mode != 0
+                and fusion_config.compilation_config.backend == "inductor"
+                and bool(norm_priority) and norm_priority[0] == "native"
+                and getattr(self.rotary_emb._forward_method, "__name__", "") == "forward_native"
+            )
+        self.fused_qk_norm_rope = (
+            os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1"
+            and compiled_native_rope
+            and self.head_dim == 192 and self.use_rope
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim in (64, 192)
+        )
+        if self.fused_qk_norm_rope:
+            logger.info_once("Step5 main Attention: fused FP32-weight QK-norm + RoPE enabled.")
         self.max_position_embeddings = max_position
         # Step-4 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
@@ -454,24 +487,42 @@ class Step5Attention(nn.Module):
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
+        projected_index = None
+        projected_gate = None
+        if self.merge_attention_projection:
+            qkv, projected_index, projected_gate = merged_projection(self, hidden_states)
+            if qkv is None:
+                qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head.contiguous())
-        q = q_by_head.view(q.shape)
+        if self.fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            q, k = fused_qknorm_rope(
+                qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
+                self.num_heads, self.num_kv_heads, self.rotary_dim // 2,
+                self.q_norm.variance_epsilon,
+            )
+        else:
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head.contiguous())
-        k = k_by_head.view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
             # reads. It needs hidden_states, which Attention.forward never sees.
-            self.indexer.forward(hidden_states, positions)
+            self.indexer.forward(hidden_states, positions, projected_index)
         attn_output = self.attn(q, k, v)
         if self.use_head_wise_attn_gate:
-            extra_dims, _ = self.g_proj(hidden_states)
+            if projected_gate is None:
+                extra_dims, _ = self.g_proj(hidden_states)
+            else:
+                extra_dims = projected_gate
             output = (
                 attn_output.view(*attn_output.shape[:-1], self.num_heads, self.head_dim)
                 * extra_dims.unsqueeze(-1).sigmoid()
@@ -1066,6 +1117,9 @@ class Step5ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={".share_expert.": ".moe.share_expert."}
     )
+
+    def process_weights_after_loading(self) -> None:
+        prepare_model_projections(self)
 
     def __init__(
         self, *, vllm_config: VllmConfig, prefix: str = "",
