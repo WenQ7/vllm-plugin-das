@@ -21,15 +21,15 @@ def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
     if not (
         any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
             for a in architectures)
-        and parallel.tensor_parallel_size == 2
-        and parallel.data_parallel_size == 4
+        and (parallel.tensor_parallel_size, parallel.data_parallel_size)
+        in ((2, 4), (4, 2))
         and parallel.pipeline_parallel_size == 1
         and parallel.decode_context_parallel_size == 1
         and getattr(parallel, "prefill_context_parallel_size", 1) == 1
         and parallel.all2all_backend == "deepep_low_latency"
         and os.getenv("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
         and moe_parallel.is_sequence_parallel
-        and moe_parallel.sp_size == 2
+        and moe_parallel.sp_size == parallel.tensor_parallel_size
         and moe_parallel.ep_size == 8
     ):
         return None

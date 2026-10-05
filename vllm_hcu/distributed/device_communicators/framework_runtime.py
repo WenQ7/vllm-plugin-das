@@ -54,9 +54,12 @@ def make_deep_ep_ht_kwargs(manager: object, envs: object) -> dict[str, Any]:
             "DeepEP HT explicit communication budget: %d SMs", requested_sms
         )
 
+    from .step5_ht_buffer import step5_ht_nvl_buffer_bytes
+    nvl_bytes = step5_ht_nvl_buffer_bytes(
+        manager, envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024)
     return {
         "group": manager.cpu_group,
-        "num_nvl_bytes": envs.VLLM_DEEPEP_BUFFER_SIZE_MB * 1024 * 1024,
+        "num_nvl_bytes": nvl_bytes,
         "num_rdma_bytes": num_rdma_bytes,
         "low_latency_mode": False,
         "num_qps_per_rank": num_qps_per_rank,
