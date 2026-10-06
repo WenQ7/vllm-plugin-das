@@ -157,8 +157,9 @@ An earlier short-drain service A/B did not justify enabling it: the same synthet
 took 9.56 seconds with `FULL_AND_PIECEWISE` and 6.67 seconds with `PIECEWISE`, a
 43.3% regression. The completion-drain interval was essentially unchanged
 (2.92 versus 2.94 seconds), so that workload did not establish a steady
-decode benefit and showed additional initial latency. The formal launcher therefore retains target
-`PIECEWISE`; the MTP draft keeps its verified full decode graph.
+decode benefit and showed additional initial latency. At that point the formal launcher retained target
+`PIECEWISE`; later qualification below adopted FULL_AND_PIECEWISE.
+The MTP draft keeps its verified full decode graph.
 
 After the live BF16 grid and ragged-query fixes, a matching warmed BS64,
 input1024/output512 synthetic run measured 806.0666 -> 817.3194 output token/s
@@ -890,3 +891,91 @@ CPU-only gfx938 compilation found zero-scratch configurations for M4/64
 after reducing K tile and stages. It remains outside production pending
 native quantization/Graph correctness and timing against the actual
 LightOp QKV method. No GPU microtest was run during the long benchmark.
+
+
+### Small-M QKV offline qualification follow-up
+
+The isolated quantization/GEMM candidate now compiles both debug and
+production specializations for M1/4/16/32/64 and two tiles per shape.
+All ten production gfx938 variants have zero scratch spill. Explicit
+HIP/gfx938 compilation runs with both CUDA_VISIBLE_DEVICES and
+HIP_VISIBLE_DEVICES empty; compilation is not a GPU timing result.
+
+The pending GPU qualifier uses the actual layer0 TP2 rank0 BF16 Q/K/V
+checkpoint shards, then the existing output-MSE weight calibration and
+LightOp baseline method. Quantization scales use a relative-only check,
+so a large absolute tolerance cannot hide an incorrect tiny-input scale.
+It checks production/debug equivalence in eager and six input-changing
+Graph replays (zero, signed constant, signed tiny, random), adjacent FP8
+midpoint differences, FP32 scaled-GEMM outputs and bias. It refuses to run
+alongside an active vLLM service/worker. No GPU results or adoption yet.
+Evidence: bs64-capacity-20261007/qkv_smallm_fused_all_shapes_compile.json.
+
+A fresh AST inventory includes methods as well as top-level functions
+from installed AITER, LightOp, DeepGEMM and DeepEP. Native AITER sources
+confirm HD128-only and BF16-weight constraints in fused_qk_rmsnorm_rope;
+cache-quant variants dispatch 64/128/256 or require weights in the input
+dtype. The more general pts variant also reads scale.item<float>() on
+the host and takes weights via data_ptr<scalar_t>(). These APIs do not
+directly preserve Step5 HD192/FP32 Gemma norm weights and full-Graph
+semantics. AITER/LightOp exposed Python producer APIs did not contain
+signal/overlap arguments; DeepGEMM's exposed arguments still lead to
+the previously verified native overlap rejection. This is interface
+evidence, not proof that every conceivable vendor implementation is
+unavailable.
+Evidence: library_fusion_inventory.json and library_native_overlap_inventory.json.
+
+
+### BS64 long Decode result and rejected small-M fused GEMM
+
+The single v9 BS64/input65536/output4096 iteration completed64/64 requests,
+262144 output tokens and4194304 input tokens with zero native preemptions.
+The independently checked common window lasts173.26135s, contains256636
+tokens and covers98.0979% of decode candidates. Decode throughput is
+1481.2074 token/s; client chunk mean/P50/P90/P99 ITL is
+121.5150/121.4509/123.0527/125.0942ms. Target dispatcher logs explicitly
+record steady64-token FULL replay on all four DP engines. Ragged drain
+batches can still use NONE/eager. This proves uniform target Decode Graph
+execution, not every ragged Decode shape.
+
+Balanced24-token per-request prefill completed with maximum TTFT1661.1613s
+and test-internal Prefill throughput2524.9227 token/s. The capacity-safe
+profile has a material Prefill cost and is not promoted as the best combined
+Prefill/Decode profile. This remains synthetic-MTP performance evidence,
+not a real acceptance-rate or accuracy result and not a controlled BS32 A/B.
+The service was stopped only after independent result validation and all
+eight running/waiting request counters were zero.
+
+Evidence: bs64-capacity-20261007/fp8-crop-reserve-v9_verified_result.json,
+fp8-crop-reserve-v9_runtime_graph_log.txt and fp8-crop-reserve-v9_shutdown.json.
+
+The isolated small-M fused QKV candidate completed native qualification
+against actual layer0 TP2 rank0 weights and output-MSE-calibrated LightOp.
+The first strict zero-input check discovered that LightOp uses amax/448
+without the exploratory1e-12 floor, including scale0 for an all-zero row.
+The candidate was corrected, retaining the strict oracle and prior failure.
+All18 shape/tile variants then passed FP8 midpoint/scales, FP32 GEMM, bias
+and six changing Graph replay checks. No model-accuracy claim is made.
+
+Every candidate was slower than the current native method. M1/4/16/32/64
+native versus best fused times (microseconds, captured Graph) were
+33.59/55.57,33.62/55.83,33.23/56.49,35.49/87.11,35.11/106.93.
+All current fused-GEMM tiles are rejected; the production path is unchanged.
+Evidence: qkv_native_zero_tiny_scale.json, qkv_smallm_fused_qualification.json
+and qkv_smallm_fused_decision.json in bs64-capacity-20261007.
+
+LightOp also exposes gemma_rms_norm_per_token_fp8_quant(input,weight,
+epsilon,fp8type,residual,update_input). A next candidate must preserve
+Step5's FP32 Gemma weight, FP32 residual and explicit BF16 narrowing before
+activation FP8 conversion, while retaining the BF16 hidden tensor used by
+the indexer/gate. The exposed API alone does not prove these semantics.
+
+
+Native LightOp Gemma-FP8 probing with the actual FP32 layer0 norm weight
+executed on FP32 residual input, but differed from Step5's BF16-narrowed
+reference in403/16384 FP8 values (reconstruction RMS difference0.01077).
+BF16 input with the required FP32 weight was rejected for dtype mismatch.
+No norm-weight cast or rounding-stage removal is adopted. A custom fused
+norm/quant candidate must explicitly retain the BF16 stage and be checked
+against the compiled production norm before any model-level adoption.
+Evidence: bs64-capacity-20261007/lightop_gemma_fp8_semantics_probe.json.
