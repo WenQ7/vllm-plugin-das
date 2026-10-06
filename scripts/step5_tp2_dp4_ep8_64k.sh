@@ -7,13 +7,18 @@ case "$stage" in prefill|decode) ;; *) echo "Usage: $0 [prefill|decode] [standar
 case "$sampling" in standard|synthetic) ;; *) echo "MTP sampling must be standard or synthetic" >&2; exit 2;; esac
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
+export VLLM_TUNED_CONFIG_FOLDER="${repo_root}/configs/step5_moe"
+[[ -f "${VLLM_TUNED_CONFIG_FOLDER}/E=44,N=1536,device_name=BW1101.json" ]] || {
+  echo "Missing Step5 MoE tuning config" >&2
+  exit 2
+}
 export OMP_NUM_THREADS=1 HSA_FORCE_FINE_GRAIN_PCIE=1
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export VLLM_STEP4_DSA_FP8_MATH=off VLLM_STEP4_DISABLE_DSA=0
 export VLLM_STEP5_DSA_TORCH_SELECTOR=0 VLLM_STEP5_DSA_RADIX_SELECTOR=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_KV_CACHE_LAYOUT=LBNHC VLLM_USE_AOT_COMPILE=0
-export VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 VLLM_STEP5_LL_GEMM_TUNING=0
+export VLLM_DISABLE_SHARED_EXPERTS_STREAM=1 VLLM_STEP5_LL_GEMM_TUNING=1
 export VLLM_STEP5_SEQUENCE_PARALLEL_MOE=1 VLLM_STEP5_DSA_SHORT_QUERY=1
 export VLLM_STEP5_DEVICE_REQUEST_INDICES=1 VLLM_STEP5_BF16_TILE_TUNING=1
 export VLLM_STEP5_TP2_HT_BF16_CHUNKS=0 VLLM_STEP5_DSA_FUSED_SELECTOR=1
