@@ -96,6 +96,16 @@ quantization. AITER has no `BW200B/BW1101-GEMM-A8W8` tuning file in the
 installed package. LightOP W8A16 was also slower, so retaining an extra BF16
 weight copy for a shape switch would add memory without a decode gain.
 
+A Step5-specific FP32 Gemma norm + BF16 store + per-token FP8 quantization
+prototype was also measured. At the production BS64 per-DP shape (M=64), it
+was bit-identical to native Inductor norm plus LightOP quantization across 100
+random inputs and reduced that isolated pair from 0.01377 to 0.00997 ms. The
+end-to-end concurrency-64 1024-to-512 synthetic-MTP comparison nevertheless
+regressed: baseline/fused output throughput was 698.48/695.17 token/s and mean
+TPOT was 67.70/68.10 ms. Acceptance statistics were identical (60.6676%,
+21,156 accepted of 34,872 drafted tokens). The extra custom-op boundary erased
+the isolated gain, so the candidate was removed and is not enabled.
+
 ### Full target-model graph
 
 The target model can now capture all six uniform MTP3 graph sizes. Its
