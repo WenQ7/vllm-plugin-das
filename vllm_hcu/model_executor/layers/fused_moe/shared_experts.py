@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 shared-expert execution."""
 
 import inspect
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -63,6 +64,20 @@ class SharedExperts(torch.nn.Module):
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
+
+        self._step5_decode_only = (
+            os.environ.get("VLLM_STEP5_SHARED_EXPERTS_DECODE_ONLY", "0") == "1"
+        )
+        if self._step5_decode_only:
+            from vllm.config import get_current_vllm_config_or_none
+            config = get_current_vllm_config_or_none()
+            if (config is None
+                or config.model_config.hf_text_config.model_type != "step5"):
+                raise ValueError("Decode-only shared-expert overlap requires Step5")
+            logger.info_once(
+                "Step5 shared-expert overlap limited to uniform query lengths 1--4",
+                scope="local",
+            )
 
         # Allow disabling of the separate shared experts stream for
         # debug purposes.
@@ -157,6 +172,18 @@ class SharedExperts(torch.nn.Module):
                 "HCU shared-expert stream mode was explicitly enabled, but no "
                 "CUDA-alike auxiliary stream is available"
             )
+        if getattr(self, "_step5_decode_only", False):
+            from vllm.forward_context import (
+                get_forward_context, is_forward_context_available,
+            )
+            from .step5_overlap import is_short_uniform_decode
+            context = (
+                get_forward_context() if is_forward_context_available() else None
+            )
+            if not is_short_uniform_decode(context):
+                # Also prevent the MK-internal path from re-enabling overlap
+                # during chunked Prefill. Padding size alone is not a phase.
+                return SharedExpertsOrder.NO_OVERLAP
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
 

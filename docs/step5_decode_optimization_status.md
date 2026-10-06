@@ -440,3 +440,61 @@ The kernel and service evidence is preserved outside /tmp at
 /workspace/step5-tp2-performance/live-tile-and-index-rounding-20261007.
 The previous long-context evidence is preserved at
 /workspace/step5-tp2-performance/grouped-head-full-graph-64k-bs32-v2.
+
+### Small-M QKV and calibrated full-Graph FP8 screen
+
+A new fused token-amax / activation-quant / GEMM / scale prototype matched
+LightOp quantized bytes and per-token scales, including the zero-row scale
+contract. All tested GEMM tiles were slower than the current hipBLASLt path
+and differed in a small number of BF16 output elements. At M=1/4/16 the best
+candidate was about 0.0488/0.0487/0.0494 ms versus 0.0349/0.0349/0.0345 ms
+on native quant-plus-GEMM. It was not added to production code.
+
+The installed LightOp small-M smooth config has no N6912/K4096 entry.
+Six neighboring tile configs were tested through its raw smooth operator
+at M=1/4/16; all failed the FP8 output reference and were slower than the
+qualified channel-wise hipBLASLt path. They are not an FP8 replacement.
+
+Graph-level precision microbenchmarks used actual TP2 K4096/N6912 and
+included activation quantization. Native BF16 vs FP8 at M=1/4/16/32/64/128
+measured 0.0498/0.0431/0.0432/0.0439/0.0417/0.0538 ms versus
+0.0286/0.0286/0.0283/0.0315/0.0306/0.0413 ms. FP8 also won M256--4096.
+These random-weight operator results do not justify switching small M
+to BF16, and are not a model-accuracy evaluation.
+
+The current profile plus output-MSE-calibrated QKV FP8 completed a single
+warmed BS64 input1024/output512 screen: output throughput
+827.83147 -> 838.88914 token/s (+1.34%), mean TPOT
+55.90127 -> 55.18102 ms (-1.29%). All 64 requests completed with zero failures,
+input/output token totals 66176/32768 and identical synthetic MTP counts
+(11624 drafts, 34872 draft tokens, 21156 accepted tokens). No DP preemption
+counter increased. Main target FULL Graph remained active.
+Per-DP KV capacity rose from about 924201 to 994709 tokens (+7.63%).
+This still does not fit 16 requests/DP at input65536/output4096.
+
+The calibration file has all 92 main and three MTP groups and the matching
+model-index hash. It uses independent document activations from DP0/1;
+heldout DP2/3 and evaluation answers were excluded. The current candidate
+service is PID3217802, source1138074, with QKV FP8. Formal QKV stays BF16:
+ordinary MTP accuracy and a 64K/4K FP8 comparison remain unverified.
+Result: /tmp/step5_qkv_fp8_graph_v1_bench/openai-chat-infqps-concurrency64-step5-20261007-021335.json
+Evidence: /workspace/step5-tp2-performance/qkv-small-m-and-decode-overlap-20261007.
+
+### Decode-only shared-expert overlap candidate
+
+STEP5_SHARED_EXPERT_OVERLAP=decode now enables an opt-in profile whose
+shared-expert aux stream is gated by the scheduler's host BatchDescriptor:
+uniform batches with 1--4 queries/request are eligible; missing, mixed,
+nonuniform, or large query chunks stay serial, including the MK-internal
+fallback. The decision is cached once per ForwardContext without reading
+a GPU count. This avoids relying only on the padded hidden-state shape,
+which allowed the previous overlap candidate to compete with Prefill.
+The formal default stays off and the standalone Prefill profile rejects
+this option.
+
+Fifteen tests passed, including the existing input-alias preservation
+policy and native auxiliary-stream/Graph replays with changing BF16 inputs.
+The tests cover both serial and overlapped branches and their output
+dependencies. CLI checks verify default-off, Decode opt-in and rejection
+of standalone Prefill/invalid modes. A full-model service performance
+screen is still required before adopting this overlap profile.
