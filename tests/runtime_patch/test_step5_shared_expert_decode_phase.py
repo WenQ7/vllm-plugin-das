@@ -45,7 +45,8 @@ def test_prefill_guard_cannot_be_bypassed_by_mk_internal(monkeypatch,uniform,exp
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP unavailable")
 @pytest.mark.parametrize("uniform",[False,True])
-def test_native_aux_stream_and_graph_preserve_outputs(monkeypatch,uniform):
+@pytest.mark.parametrize("capture_descriptor",[False,True])
+def test_native_aux_stream_and_graph_preserve_outputs(monkeypatch,uniform,capture_descriptor):
     import vllm.config
     import vllm.forward_context
     from vllm_hcu.model_executor.layers.fused_moe import shared_experts as module
@@ -57,7 +58,11 @@ def test_native_aux_stream_and_graph_preserve_outputs(monkeypatch,uniform):
     monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD","128")
     config=NS(model_config=NS(hf_text_config=NS(model_type="step5")))
     monkeypatch.setattr(vllm.config,"get_current_vllm_config_or_none",lambda:config)
-    context=NS(batch_descriptor=BatchDescriptor(64,16,uniform))
+    starts = torch.arange(17,dtype=torch.int32) * (4 if uniform else 32)
+    metadata=NS(query_start_loc_cpu=starts,max_query_len=4 if uniform else 32,
+                num_actual_tokens=int(starts[-1]),num_decodes=0,num_prefills=16)
+    context=NS(batch_descriptor=BatchDescriptor(64,16,uniform) if capture_descriptor else None,
+               attn_metadata={"dsa":metadata})
     monkeypatch.setattr(vllm.forward_context,"is_forward_context_available",lambda:True)
     monkeypatch.setattr(vllm.forward_context,"get_forward_context",lambda:context)
     torch.manual_seed(107)
@@ -91,3 +96,37 @@ def test_native_aux_stream_and_graph_preserve_outputs(monkeypatch,uniform):
         torch.cuda.synchronize()
         assert torch.equal(out,layer(x))
         assert torch.equal(routed,x+1)
+
+@pytest.mark.parametrize("starts,max_query,tokens,expected", [
+    ([0,4,8,12,16],4,16,True),
+    ([0,1,2,3,4],1,4,True),
+    ([0,4,8,8,8],4,8,True),
+    ([0,1,5],4,5,False),
+    ([0,128,256],128,256,False),
+    ([0,4,3],4,3,False),
+    ([0,4,8],4,9,False),
+    ([1,5,9],4,9,False),
+])
+def test_full_capture_without_descriptor_uses_cpu_query_starts(starts,max_query,tokens,expected):
+    metadata=NS(query_start_loc_cpu=torch.tensor(starts),max_query_len=max_query,
+                num_actual_tokens=tokens,num_decodes=0,num_prefills=len(starts)-1)
+    ctx=NS(batch_descriptor=None,attn_metadata={"dsa":metadata})
+    assert is_short_uniform_decode(ctx) is expected
+
+def test_metadata_fallback_never_reads_gpu_counts():
+    class Poison:
+        device=NS(type="cuda")
+        def tolist(self):raise AssertionError("Device read would synchronize")
+    metadata=NS(query_start_loc_cpu=Poison(),max_query_len=4,num_actual_tokens=16)
+    assert not is_short_uniform_decode(NS(batch_descriptor=None,attn_metadata={"dsa":metadata}))
+
+def test_explicit_nonuniform_descriptor_overrides_uniform_metadata():
+    metadata=NS(query_start_loc_cpu=torch.tensor([0,4,8]),max_query_len=4,num_actual_tokens=8)
+    ctx=NS(batch_descriptor=BatchDescriptor(8,2,False),attn_metadata={"dsa":metadata})
+    assert not is_short_uniform_decode(ctx)
+
+def test_mixed_attention_groups_do_not_enable_overlap():
+    short=NS(query_start_loc_cpu=torch.tensor([0,4,8]),max_query_len=4,num_actual_tokens=8)
+    long=NS(query_start_loc_cpu=torch.tensor([0,128,256]),max_query_len=128,num_actual_tokens=256)
+    ctx=NS(batch_descriptor=None,attn_metadata={"short":short,"long":long})
+    assert not is_short_uniform_decode(ctx)

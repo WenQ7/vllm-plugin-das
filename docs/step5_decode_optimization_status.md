@@ -498,3 +498,18 @@ The tests cover both serial and overlapped branches and their output
 dependencies. CLI checks verify default-off, Decode opt-in and rejection
 of standalone Prefill/invalid modes. A full-model service performance
 screen is still required before adopting this overlap profile.
+
+The native MRv2 FULL capture caller was inspected before accepting the
+overlap performance run: it sets runtime NONE with no BatchDescriptor.
+The initial descriptor-only guard would therefore capture serial execution.
+That v1 startup was explicitly superseded before a measured benchmark.
+It was not restarted because of an observation timeout.
+
+The guard now falls back to existing CPU query-start mirrors during FULL
+capture, caches the result once per ForwardContext, and rejects large,
+ragged, inconsistent or nonuniform query groups. No device tensor is copied
+or reduced on the host. Twenty-eight tests passed after this repair,
+including auxiliary-stream Graph replays without a descriptor, GPU-count
+poison tests and mixed attention groups. The successful earlier 15-test
+descriptor-only screen did not cover the actual FULL-capture call shape.
+The repaired v2 service screen remains pending.

@@ -191,6 +191,11 @@ class SharedExperts(torch.nn.Module):
             hidden_states
         )
         if force_stream and should_run_shared_in_aux_stream:
+            if getattr(self, "_step5_decode_only", False):
+                logger.info_once(
+                    "Step5 decode-only shared experts selected the auxiliary stream",
+                    scope="local",
+                )
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
         if self._mk_can_overlap_shared_experts():
