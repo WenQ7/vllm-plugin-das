@@ -590,12 +590,45 @@ experts, then executes the receive hook. The revised guard limits only the
 new aux stream: non-short batches retain MK-internal overlap when supported,
 or remain serial when unsupported/native restrictions apply. EPLB and
 two-sided-backend restrictions are preserved. A native-finalizer ordering
-test confirms shared compute remains before receive completion. The new
-candidate has not yet been service-benchmarked; no recovery percentage is
-claimed from the code repair alone. Twenty-eight CPU tests and four native
+test confirms shared compute remains before receive completion. The repaired candidate was subsequently service-benchmarked; its result
+and actual mode-selection evidence are recorded below. Twenty-eight CPU tests and four native
 aux-stream/Graph GPU tests passed after the repair.
 
 The original vllm_hcu logger inherits WARNING and drops the candidate's
 INFO mode diagnostics. It now uses vllm.hcu.shared_experts, whose effective
-level is INFO, so the next full-model screen can verify the selected mode.
+level is INFO, and the v3 full-model screen verified both selected modes.
 Evidence and test logs are preserved in the fullgraph-qkv-ordinary directory.
+
+
+### Repaired auxiliary-stream result and long-context capacity candidate
+
+The repaired v3 short-context screen (BS64, input1024/output512) completed
+64/64 requests but measured 708.01256 output token/s versus 838.88914 with
+the auxiliary stream off (-15.60%). Mean TPOT increased from55.18102 to
+67.56472 ms (+22.44%). Input/output totals, synthetic draft/acceptance
+counts and zero DP preemption deltas match the baseline. INFO logs prove
+that short Decode selected the auxiliary stream and non-short batches
+retained MK-internal overlap. The candidate remains disabled.
+Evidence: /workspace/step5-tp2-performance/shared-overlap-v3-20261007.
+
+In this sequence-parallel profile shared MLP gate/up/down projections set
+disable_tp=True. The routed-plus-shared result uses the same final TP
+all-gather in both modes; an added shared-MLP TP collective is therefore
+not the cause. Auxiliary event/stream scheduling or compute contention
+remain hypotheses without a full trace. The default still retains native
+MK shared/combine overlap where supported.
+
+The optional SWA Prefill crop passed ten native GPU tests, including exact
+FlashAttention output equality for actual head_dim192, KVheads2 and64K
+contexts. It removes only KV pages invisible to every query and reads no
+device count on the CPU. It is disabled during full Graph capture.
+Test evidence: /workspace/step5-tp2-performance/bs64-capacity-20261007.
+
+The launcher accepts STEP5_GPU_MEMORY_UTILIZATION as an explicit candidate
+override and rejects non-finite or out-of-range values. Defaults remain0.92
+Decode and0.89 Prefill. Bash syntax and nine stub CLI cases passed. This
+adds no claim of successful higher-memory startup. Sixteen requests/DP at
+65536 input plus4096 output and four draft slots need1115136 whole-page
+tokens/DP; the0.92 FP8 profile's994709 tokens do not meet that bound.
+Higher-memory, cropped-workspace capacity must be verified by all four
+initialized DP capacities, successful Graph warmup and no runtime preemption.

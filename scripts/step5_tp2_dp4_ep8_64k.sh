@@ -70,6 +70,18 @@ else
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=0 VLLM_STEP5_SP_LL_WORKSPACE=1 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=1
   compilation='{"cudagraph_mode":"'"$target_graph_mode"'","cudagraph_copy_inputs":true,"mode":3,"cudagraph_capture_sizes":[4,8,16,32,64,128,256,512]}'
 fi
+# Keep the measured stage defaults; memory headroom candidates opt in.
+memory="${STEP5_GPU_MEMORY_UTILIZATION:-$memory}"
+python - "$memory" <<'PY_CHECK_MEMORY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit("STEP5_GPU_MEMORY_UTILIZATION must be a number in (0, 1]")
+if not math.isfinite(value) or not 0 < value <= 1:
+    raise SystemExit("STEP5_GPU_MEMORY_UTILIZATION must be a number in (0, 1]")
+PY_CHECK_MEMORY
 speculation='{"method":"mtp","num_speculative_tokens":3}'
 if [[ "$sampling" == synthetic ]]; then
   speculation='{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.838992,0.598322,0.362686]}'
