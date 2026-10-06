@@ -402,3 +402,15 @@ target model and enables grouped-head indexer scoring after the successful
 64K BS32 screen. STEP5_TARGET_GRAPH_MODE=PIECEWISE and
 VLLM_STEP5_GROUPED_HEAD_INDEXER=0 remain explicit fallback overrides.
 Prefill retains Graph NONE. This does not establish 64K BS64 capacity.
+
+The single warmed BS64 input1024/output512 service screen completed 64/64:
+output throughput 818.89871 -> 827.83147 token/s (+1.09%), mean TPOT
+56.89679 -> 55.90127 ms (-1.75%). Total input/output tokens were identical
+(66176/32768), as were synthetic MTP counts (11624 drafts, 34872 draft
+tokens, 21156 accepted tokens). No DP preemption counter increased.
+Both sides retained full target Graph, grouped-head indexer and BF16 QKV;
+the new side adds small live-batch tiles and invisible-score-tile skipping.
+This is a one-round short-context screen, not a new 64K/4K measurement.
+Result: /tmp/step5_small_tiles_v1_bench/openai-chat-infqps-concurrency64-step5-20261007-014602.json
+Manifest: /tmp/step5_small_tiles_v1_manifest.json
+Comparison: /tmp/step5_small_tiles_v1_comparison.json
