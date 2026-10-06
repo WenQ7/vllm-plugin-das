@@ -3169,6 +3169,7 @@ def _merge_split_states_kernel(
     head_dim: tl.constexpr,
     BLOCK_S: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ) -> None:
     """Combine per-split attention states into one, weighting by the partial lse.
 
@@ -3214,15 +3215,20 @@ def _merge_split_states_kernel(
         merged.to(out_ptr.dtype.element_ty),
         mask=dim_ok,
     )
-    tl.store(
-        lse_ptr + token * stride_lse_token + head,
-        tl.where(empty, NEGATIVE_INFINITY, shift + tl.log(total)),
-    )
+    if WRITE_LSE:
+        tl.store(
+            lse_ptr + token * stride_lse_token + head,
+            tl.where(empty, NEGATIVE_INFINITY, shift + tl.log(total)),
+        )
 
 
 def merge_split_states(
-    partial_out: torch.Tensor, partial_lse: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+    partial_out: torch.Tensor,
+    partial_lse: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    write_lse: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Reduce ``[splits, tokens, heads, dim]`` partial states to ``[tokens, heads, dim]``.
 
     Semantics follow ``merge_variable_split_nat_lse_states_sm90_gqa`` -- "nat" being the
@@ -3233,8 +3239,16 @@ def merge_split_states(
     uniform split and pays a little occupancy for a much simpler contract.
     """
     num_splits, tokens, num_heads, head_dim = partial_out.shape
-    out = torch.empty((tokens, num_heads, head_dim), device=partial_out.device, dtype=partial_out.dtype)
-    lse = torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
+    expected = (tokens, num_heads, head_dim)
+    if out is None:
+        out = torch.empty(expected, device=partial_out.device, dtype=partial_out.dtype)
+    elif out.shape != expected or out.dtype != partial_out.dtype or out.device != partial_out.device:
+        raise ValueError(f"merge output must be {expected} on {partial_out.device} with {partial_out.dtype}")
+    lse = (
+        torch.empty((tokens, num_heads), device=partial_out.device, dtype=torch.float32)
+        if write_lse else None
+    )
+    lse_arg = lse if lse is not None else partial_lse
     _merge_split_states_kernel[(tokens, num_heads)](
         partial_out,
         partial_lse,
@@ -3247,11 +3261,12 @@ def merge_split_states(
         partial_lse.stride(1),
         out.stride(0),
         out.stride(1),
-        lse.stride(0),
+        lse_arg.stride(0),
         num_splits,
         head_dim=head_dim,
         BLOCK_S=triton.next_power_of_2(num_splits),
         BLOCK_D=triton.next_power_of_2(head_dim),
+        WRITE_LSE=write_lse,
     )
     return out, lse
 

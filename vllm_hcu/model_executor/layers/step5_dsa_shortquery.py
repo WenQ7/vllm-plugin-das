@@ -46,6 +46,7 @@ def _sparse_attn_short_prefill_hd192_kernel(
     QK_FP8: tl.constexpr,
     PV_FP8: tl.constexpr,
     P_SCALE: tl.constexpr,
+    STORE_LSE: tl.constexpr,
 ) -> None:
     """HD192 split attention over the selector\'s causal int32 prefill regions."""
     request = tl.program_id(0)
@@ -205,21 +206,22 @@ def _sparse_attn_short_prefill_hd192_kernel(
         output2.to(out_ptr.dtype.element_ty),
         mask=head_ok[:, None],
     )
-    tl.store(
-        lse_ptr
-        + split * stride_lse_split
-        + request * stride_lse_token
-        + group * heads_per_group
-        + heads,
-        # running_max/running_sum are base-2; the stored lse is natural log, as the
-        # general kernel's is, so convert rather than changing the contract.
-        tl.where(
-            selected,
-            (running_max + tl.log2(running_sum)) * 0.6931471805599453,
-            NEGATIVE_INFINITY,
-        ),
-        mask=head_ok,
-    )
+    if STORE_LSE:
+        tl.store(
+            lse_ptr
+            + split * stride_lse_split
+            + request * stride_lse_token
+            + group * heads_per_group
+            + heads,
+            # running_max/running_sum are base-2; the stored lse is natural log, as the
+            # general kernel's is, so convert rather than changing the contract.
+            tl.where(
+                selected,
+                (running_max + tl.log2(running_sum)) * 0.6931471805599453,
+                NEGATIVE_INFINITY,
+            ),
+            mask=head_ok,
+        )
 
 
 
@@ -242,7 +244,8 @@ def short_query_num_splits(num_queries: int, num_kv_groups: int, topk: int) -> i
 def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions,
                                   region_counts, *, num_kv_groups, region_size=8,
                                   softmax_scale=None, num_splits=1,
-                                  k_scale=1.0, v_scale=1.0):
+                                  k_scale=1.0, v_scale=1.0,
+                                  output=None, return_lse=True):
     """Return merged short-query attention without quantizing Q or probabilities."""
     num_queries, num_heads, head_dim = query.shape
     if head_dim != 192 or query.dtype not in (torch.bfloat16, torch.float16):
@@ -266,10 +269,32 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     # it is 1.06x faster at M=32, 1.80x at M=64, and 3.03x at M=128, with
     # bit-identical output and LSE.
     stages = 1
-    out = torch.empty((num_splits, num_queries, num_heads, head_dim),
-                      device=query.device, dtype=query.dtype)
-    lse = torch.empty((num_splits, num_queries, num_heads),
-                      device=query.device, dtype=torch.float32)
+    expected_output = (num_queries, num_heads, head_dim)
+    if output is not None and (
+        output.shape != expected_output
+        or output.dtype != query.dtype
+        or output.device != query.device
+    ):
+        raise ValueError(
+            f"short prefill output must be {expected_output} on {query.device} "
+            f"with {query.dtype}"
+        )
+    direct = output is not None and num_splits == 1
+    out = (
+        output.unsqueeze(0)
+        if direct
+        else torch.empty(
+            (num_splits, num_queries, num_heads, head_dim),
+            device=query.device, dtype=query.dtype,
+        )
+    )
+    needs_partial_lse = return_lse or num_splits > 1
+    lse = (
+        torch.empty((num_splits, num_queries, num_heads),
+                    device=query.device, dtype=torch.float32)
+        if needs_partial_lse
+        else torch.empty((1,), device=query.device, dtype=torch.float32)
+    )
     scale = (softmax_scale if softmax_scale is not None else head_dim ** -0.5) * k_scale
     _sparse_attn_short_prefill_hd192_kernel[(num_queries, num_kv_groups, num_splits)](
         query, key_cache, value_cache, packed_regions, region_counts,
@@ -283,10 +308,12 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
         slots_per_split=slots_per_split,
         BLOCK_H=max(16, triton.next_power_of_2(heads_per_group)),
         BLOCK_R=block_r, DK=64, QK_FP8=False, PV_FP8=False, P_SCALE=256.0,
-        num_warps=2, num_stages=stages)
+        STORE_LSE=needs_partial_lse, num_warps=2, num_stages=stages)
     if num_splits == 1:
-        return out[0], lse[0]
-    return merge_split_states(out, lse)
+        return out[0], lse[0] if return_lse else None
+    return merge_split_states(
+        out, lse, out=output, write_lse=return_lse,
+    )
 
 
 def prefill_request_indices_device(query_start_loc, num_decodes,

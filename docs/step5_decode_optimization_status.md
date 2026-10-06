@@ -34,6 +34,11 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   per-position accepted-token counts, total/output throughput improved from
   1586.73/525.49 to 1598.64/529.43 token/s (+0.75%), mean TPOT fell from
   49.56 to 49.17 ms, and mean ITL fell from 135.35 to 134.26 ms.
+- Split-state merge now writes directly into the Attention output buffer and
+  omits the unused final LSE, eliminating one output copy per sparse layer.
+  Including that copy, the isolated M=32/64/128 paths improve from
+  0.1377/0.2218/0.3744 ms to 0.1342/0.2178/0.3681 ms, with bit-identical
+  output.
 - The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
   kernel. It is the fastest installed implementation for this shape.
 - MTP3 short-prefill indexer scoring is batched across requests and reads the

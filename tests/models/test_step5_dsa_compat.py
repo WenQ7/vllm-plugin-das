@@ -361,6 +361,22 @@ def test_flash_sparse_short_prefill_matches_triton():
         region_size=region_size,
         num_splits=4,
     )
+    direct = torch.empty_like(expected)
+    direct_out, direct_lse = sparse_attention_short_prefill(
+        query,
+        key,
+        value,
+        packed,
+        counts,
+        num_kv_groups=groups,
+        region_size=region_size,
+        num_splits=4,
+        output=direct,
+        return_lse=False,
+    )
+    assert direct_out.data_ptr() == direct.data_ptr()
+    assert direct_lse is None
+    assert torch.equal(direct_out, expected)
     actual, actual_lse = _flash_attn_prefill(
         query,
         key,

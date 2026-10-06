@@ -1939,6 +1939,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
 
         if attn_metadata.num_prefills > 0:
             packed, counts, logical_ids, request_indices = plan.prefill
+            wrote_prefill_output = False
             q_positions = attn_metadata.positions[ndt:num_tokens].to(torch.int32)
             prefill_tokens = num_tokens - ndt
             # The decode launcher captures up to max_num_seqs=32 target rows.
@@ -2032,7 +2033,9 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                         num_kv_groups=num_kv_groups,
                         region_size=REGION_BLOCK_SIZE, softmax_scale=self.scale,
                         num_splits=splits, k_scale=k_scale, v_scale=v_scale,
+                        output=output[ndt:num_tokens], return_lse=False,
                     )
+                    wrote_prefill_output = True
                 else:
                     out_p, lse_p = sparse_attention_prefill(
                         query[ndt:num_tokens],
@@ -2047,7 +2050,8 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                         **prefill_kwargs,
                     )
             del lse_p
-            output[ndt:num_tokens] = out_p
+            if not wrote_prefill_output:
+                output[ndt:num_tokens] = out_p
 
         return output
 
