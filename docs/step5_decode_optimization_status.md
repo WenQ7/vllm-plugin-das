@@ -77,6 +77,64 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   1593.50/527.73 total/output token/s versus 1598.64/529.43 immediately before
   them (-0.32%), so no additional BS32 service-level gain is claimed.
 
+### Live BF16 expert tiles and ragged MTP batches
+
+The three routed-expert layers that remain BF16 now use a device-counted
+expert grid for the TP2/DP4/EP8 low-latency profile. The previous native grid
+launched M tiles over the full 2048-row dispatch capacity for all 44 local
+experts, even though most decode experts only received a few live rows.
+The replacement launches expert/N tiles and loops over live M tiles using
+GPU counts. It reuses the native BF16 tile calculation and the selected
+BLOCK_SIZE_M/N/K, including its K-reduction order. It also works inside
+PIECEWISE capture when the batch descriptor is absent.
+
+With the production M128/N128/K64 configuration and 44 experts, the two
+isolated GEMMs measured 7.7919 -> 1.9930 ms and 3.8295 -> 1.0122 ms.
+Results and untouched padding were bit-identical, including graph replays
+with zero, partial, and multiple M tiles. With M32/N64/K64 the same grid
+change measured 6.8317 -> 1.2504 ms and 3.6132 -> 0.6479 ms; that tile
+configuration is not newly selected by this change.
+
+The warmed BS64, input1024/output512 synthetic-MTP service comparison
+completed 64/64 requests. Output throughput improved 698.4773 -> 806.0666
+token/s (+15.40%), mean TPOT 67.7000 -> 57.8990 ms (-14.48%), and mean
+ITL 189.4302 -> 162.0062 ms (-14.48%). Both runs had exactly 11624 drafts,
+34872 draft tokens, 21156 accepted tokens, and 60.6675843% acceptance.
+Baseline result: `/tmp/step5_norm_baseline_bench/openai-chat-infqps-concurrency64-step5-20261006-223408.json`.
+Candidate result: `/tmp/step5_bf16_compact_bench/openai-chat-infqps-concurrency64-step5-20261007-001232.json`.
+This is a short-context service screening result; it does not establish a
+new 64K/4K throughput figure. The formal Decode launcher enables
+`VLLM_STEP5_BF16_COMPACT_GRID=1`; an explicit value of 0 restores the prior
+path. The FP8 experts and extra shared-expert streams are unchanged.
+
+Ragged MTP batches of 65--128 tokens now also use short-query DSA when
+host metadata says every request has at most four queries. They no longer
+need to satisfy the uniform four-query graph schedule to avoid CPU tiles.
+Ordinary 65--128-token prefills keep the tiled path. Selector and Attention
+routing share one predicate, so selection omits logical IDs exactly when
+Attention will not consume them. Boundary/selection checks and 65/96/128
+query numerical comparisons passed. The DSA checks passed 33 tests
+(excluding an existing direct-import duplicate-registry test); the BF16
+expert checks passed two tests with dynamic graph counts and strided output.
+
+### Decode profiling scope
+
+The original `/tmp/step5_profile` trace was collected from the beginning of
+a benchmark and predominantly covered 512-token prefill chunks. The run
+also failed during profiler teardown, so its per-layer scalar-read counts
+must not be interpreted as steady Decode synchronization.
+
+A replacement `/tmp/step5_decode_profile` trace delays capture by 100 worker
+iterations and records three steady iterations on all eight ranks. Rank0
+Attention inputs are [64,32,192]; sliding layers use direct paged Attention,
+not a paged-to-contiguous prefill conversion. No scalar reads occur inside
+Attention or indexer scopes. The 45 CPU scalar operations and 12 DtoH events
+are outside those scopes. BF16 expert GEMMs took 86.869 ms of 442.601 ms
+GPU execution across the three sampled steps (~19.6%); DeepEP combine took
+53.893 ms (~12.2%). This evidence directed the live-tile optimization above.
+The profiled run was stopped after traces were collected and is not used
+for service throughput or correctness claims.
+
 ## Rejected after measurement
 
 ### Small-M QKV alternatives
