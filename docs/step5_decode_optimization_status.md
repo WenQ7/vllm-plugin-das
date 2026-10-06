@@ -981,14 +981,14 @@ against the compiled production norm before any model-level adoption.
 Evidence: bs64-capacity-20261007/lightop_gemma_fp8_semantics_probe.json.
 
 
-### Explicit-layout Gemma norm and FP8 activation quantization
+### Explicit-layout Gemma norm and FP8 activation quantization (8a51dd7)
 
 A new isolated source operator fuses FP32 Gemma normalization, the required
 BF16 narrowing, token amax/scale and E4M3FN conversion. It returns both BF16
 hidden and FP8 hidden, retains FP32 norm weights/residuals, and reuses the
-existing LightOp scaled GEMM. It is not wired into the model or enabled by
-the formal launcher; whole-model accuracy and runtime norm-profile routing
-remain pending.
+existing LightOp scaled GEMM. At measured revision 8a51dd7 it was not wired
+into the model or enabled by the formal launcher. The later opt-in integration
+is described below; the timings here remain historical operator evidence.
 
 The initial ordinary Triton variants failed exact BF16 checks because
 their reduction layouts differed from the selected Inductor native norm.
@@ -1024,7 +1024,9 @@ entry is one captured-Graph screen, not a model throughput measurement:
 | 6144 | 861.04 | 845.98 | 1.75% |
 M512 is slightly slower, so global adoption is not justified. An earlier
 M4 baseline timing outlier is preserved but excluded from the final table.
-The measured-source SHA is checked against the current operator file.
+The qualifier recorded the measured-source SHA at revision 8a51dd7. Later
+BF16-input and automatic-layout changes do not inherit these timings as a
+new same-source measurement.
 
 Reproduce on idle gfx938 GPUs:
 ```bash
@@ -1042,3 +1044,50 @@ Evidence: bs64-capacity-20261007/qkv_norm_gluon_native_configs_probe.json,
 qkv_norm_quant_source_rowwise_qualification.json and
 qkv_norm_quant_custom_op_final_tests.log. All six original optimization
 requirements remain in scope; this is progress on the small-M QKV item.
+
+
+### 2026-10-07: opt-in norm/quant integration and DCP2 CPU reference
+
+Local commit e9f9098 connects the norm/FP8 custom op to Step5 decoder input
+normalization and passes prequantized activations/scales to the existing
+LightOp QKV GEMM without a second quantization. BF16 hidden remains available
+to the indexer and gate; norm weights remain FP32. FP32 and BF16 inputs are
+supported because the first MTP decoder receives BF16 eh_proj output.
+The formal launcher leaves VLLM_STEP5_QKV_NORM_FP8_FUSION=0 by default.
+Its opt-in guards require FP8 QKV, custom ops and the native custom GEMM.
+
+34 kernel/interface checks passed, including independent FP64 rounding
+oracles, input preservation, changing Graph inputs/weights, fullgraph
+compilation and the no-requantization contract. Six CPU launcher checks
+passed. These are not model-accuracy or throughput results.
+
+The ordinary-MTP3 candidate at norm-quant-model-20261007-v2 loaded all eight
+workers, completed actual Graph captures and passed health. A fixed100
+GSM8K evaluation uses the prior frozen inputs, prompts, sampling and native
+EvalScope scoring. Evaluation is pending; no full-model gain or accuracy
+equivalence is claimed. The first controller audit failed because worker
+/proc environ was empty (all flags unavailable). Its failure was preserved.
+The resumed controller records that limitation instead of treating missing
+/proc data as proof the feature is disabled. Root launch environment, rank0
+feature log and DP0/TP2 model inspection provide narrower activation evidence;
+this is not an all-eight runtime environment audit.
+
+An isolated DCP2 CPU FP64 reference completed query lengths1-4, causal/SWA128,
+dense and sparse regions, striped cache slots, global replicated compressed
+summary slots, empty local keys and output/LSE combination. Maximum absolute
+error was 6.661338147750939e-16. This is CPU mapping proof only, with no
+production GPU DCP2 implementation or benchmark.
+
+TP2/DCP2 needs replicated full Q/K/V heads with striped contexts. Physical
+page64 corresponds to global logical page128; compression8 needs16 globally
+replicated summary slots per logical page. Preserve FP32 partial output/LSE
+until distributed combination, then narrow to BF16. Prefill parity, final
+KV clipping, SWA/causal offsets and output head sharding still need GPU
+implementation and Graph qualification. With doubled heads and halved
+contexts, per-GPU KV storage/attention work is not automatically halved;
+do not claim a BS64 capacity improvement from DCP2 before measurement.
+
+Evidence: bs64-capacity-20261007/qkv_norm_quant_integration_tests.log,
+qkv_norm_quant_launcher_checks.json; norm-quant-model-20261007-v2 runtime
+manifest/logs; dcp2-prototype-20261007/cpu_qualification.json.
+All six original optimization requirements remain active.
