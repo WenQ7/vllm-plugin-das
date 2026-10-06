@@ -5,6 +5,13 @@ stage="${1:-decode}"
 sampling="${2:-standard}"
 case "$stage" in prefill|decode) ;; *) echo "Usage: $0 [prefill|decode] [standard|synthetic]" >&2; exit 2;; esac
 case "$sampling" in standard|synthetic) ;; *) echo "MTP sampling must be standard or synthetic" >&2; exit 2;; esac
+dcp_size="${STEP5_DCP_SIZE:-1}"
+if [[ "$dcp_size" != 1 ]]; then
+  echo "Step5 TP2 cannot use DCP${dcp_size}: the model has four total KV heads," >&2
+  echo "and vLLM requires tensor_parallel_size > num_kv_heads for GQA/MQA DCP." >&2
+  echo "Keep STEP5_DCP_SIZE=1; an eight-card DCP2 topology needs TP8/DP1." >&2
+  exit 2
+fi
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
 export VLLM_TUNED_CONFIG_FOLDER="${repo_root}/configs/step5_moe"
@@ -24,6 +31,11 @@ export VLLM_STEP5_SEQUENCE_PARALLEL_MOE=1 VLLM_STEP5_DSA_SHORT_QUERY=1
 export VLLM_STEP5_DEVICE_REQUEST_INDICES=1 VLLM_STEP5_BF16_TILE_TUNING=1
 export VLLM_STEP5_TP2_HT_BF16_CHUNKS=0 VLLM_STEP5_DSA_FUSED_SELECTOR=1
 export VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH=0 VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE=0
+# These fused projection candidates regress the production TP2 shapes.
+# Keep the native LightOP FP8 QKV and native BF16 residual GEMM selection.
+export VLLM_STEP5_FUSED_QK_NORM_ROPE=0
+export VLLM_STEP5_MERGED_ATTENTION_PROJECTION=0
+export VLLM_STEP5_FULL_MIXED_PROJECTION=0
 export VLLM_SERVER_DEV_MODE=1 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600
 unset NCCL_TOPO_FILE VLLM_STEP5_HOST_REQUEST_INDICES
 if [[ "$stage" == prefill ]]; then
@@ -41,7 +53,7 @@ if [[ "$sampling" == synthetic ]]; then
 fi
 exec vllm serve "${STEP5_MODEL:-/data/model/step-5-preview-0913-fp8-per-channel}" \
   --tokenizer "${STEP5_TOKENIZER:-/workspace/step5-adaptation/tokenizer-bytelevel}" \
-  --tensor-parallel-size 2 --data-parallel-size 4 --pipeline-parallel-size 1 --decode-context-parallel-size 1 --enable-expert-parallel \
+  --tensor-parallel-size 2 --data-parallel-size 4 --pipeline-parallel-size 1 --decode-context-parallel-size "$dcp_size" --enable-expert-parallel \
   --dtype bfloat16 --moe-backend deep_gemm --all2all-backend "$backend" \
   --block-size 64 --max-model-len 69632 --max-num-seqs "$sequences" \
   --max-num-batched-tokens "$tokens" --gpu-memory-utilization "$memory" \
