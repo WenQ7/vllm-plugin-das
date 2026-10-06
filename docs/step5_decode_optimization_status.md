@@ -311,3 +311,23 @@ measured 0.20251/0.20279/0.20233/0.20023 ms on native and
 variant produced bit-identical scores. BK64 was slower than native for q=1/2,
 so the BF16-pool tile choice is not used for the production FP8 summary pool.
 These are operator results; service gains are still pending.
+
+The warmed BS64 input1024/output512 service screen with grouped-head scoring
+completed 64/64 requests, output throughput 817.3194 -> 818.8987 token/s
+(+0.19%), mean TPOT 56.9690 -> 56.8968 ms (-0.13%). Synthetic acceptance was
+identical: 11624 drafts, 34872 draft tokens, 21156 accepted tokens. Both sides
+used the full target Graph and BF16 QKV. The operator's long-context gain did
+not become a material short-context service gain. The selected BK128 tests
+passed 24 cases again after service startup.
+Result: `/tmp/step5_grouped_head_v2_bench/openai-chat-infqps-concurrency64-step5-20261007-010820.json`.
+A single BS32 65536-input/4096-output screening run is now testing the intended
+long-context workload; no 64K throughput improvement is claimed yet.
+
+A native KV allocator cost audit also rejected treating the 20 padding-layer
+warning as an automatic 27.78% capacity gain. Full and sliding groups share a
+physical page pool. With 23 full and 72 sliding layers, regrouping from size23
+to size24 reduces groups from five to four but increases the 69632-token
+per-request bound from 2622750720 to 2694316032 bytes in the native calculator
+(+2.73%). Smaller exact groups add substantial scheduler/group overhead.
+No speculative KV regrouping change was adopted. Audit:
+`/tmp/step5_kv_group_cost_audit.py`, `/tmp/step5_kv_group_cost_audit.log`.
