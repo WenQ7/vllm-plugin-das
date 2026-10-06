@@ -76,9 +76,15 @@ Changing the backend declaration from `UNIFORM_SINGLE_TOKEN_DECODE` to
 from the capture step, producing wrong attention after replay. A correct full
 target graph needs a persistent four-query schedule, a batched request/query
 indexer scorer, and graph-stable rollback buffers. It also needs the vLLM Eagle
-path to allow the draft model while the target uses a full graph. Until those
-pieces exist, the target stays `PIECEWISE`; the MTP draft keeps its verified
-`FULL_DECODE_ONLY` graph.
+path to allow the draft model while the target uses a full graph. A persistent
+four-query schedule and fixed-width scorer were prototyped and
+passed operator-equivalence tests. Service tests still hit an HSA VM fault when
+requests completed and the per-DP batch drained, both with padded graph replay
+and with exact 4-token capture sizes. The target therefore stays `PIECEWISE`;
+the MTP draft keeps its verified `FULL_DECODE_ONLY` graph. The short-prefill
+scorer no longer specializes on the live token count and is compiled during
+startup warmup, avoiding runtime Triton compilation on the first target step or
+as the batch shrinks.
 
 ### TP2 + DP4 + DCP2
 

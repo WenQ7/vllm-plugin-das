@@ -57,6 +57,6 @@ exec vllm serve "${STEP5_MODEL:-/data/model/step-5-preview-0913-fp8-per-channel}
   --dtype bfloat16 --moe-backend deep_gemm --all2all-backend "$backend" \
   --block-size 64 --max-model-len 69632 --max-num-seqs "$sequences" \
   --max-num-batched-tokens "$tokens" --gpu-memory-utilization "$memory" \
-  --no-enable-prefix-caching --compilation-config "$compilation" \
+  --no-enable-prefix-caching --disable-custom-all-reduce --compilation-config "$compilation" \
   --speculative-config "$speculation" --override-generation-config '{"eos_token_id":[1,2,128007]}' \
   --host 127.0.0.1 --port "${STEP5_PORT:-18106}" --served-model-name step5 --api-server-count 1

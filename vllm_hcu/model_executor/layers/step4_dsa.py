@@ -905,7 +905,7 @@ def decode_indexer_logits(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _short_prefill_indexer_logits_kernel(
     index_q_ptr,
     summary_ptr,
@@ -2384,6 +2384,31 @@ class Step4DSAState:
             region_size=region,
             regions_per_page=self.regions_per_page,
         )
+
+        if os.environ.get("VLLM_STEP5_BATCHED_SHORT_INDEXER", "0") == "1":
+            # MTP3 target verification reaches the four-query scorer only after
+            # serving begins.  Its live token count changes as requests finish;
+            # compile one non-specialized variant here so neither the first
+            # target step nor a later batch contraction performs Triton JIT.
+            num_tokens = 4
+            short_prefill_indexer_logits(
+                torch.zeros(
+                    (num_tokens, groups, hpg, proxy),
+                    dtype=self.dtype,
+                    device=device,
+                ),
+                torch.zeros(
+                    (num_tokens, groups, hpg),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                self.summary[0],
+                table,
+                torch.zeros(num_tokens, dtype=torch.int32, device=device),
+                torch.zeros(num_tokens, dtype=torch.int32, device=device),
+                self._decode_logits[: groups * num_tokens, : self.graph_regions],
+                regions_per_page=self.regions_per_page,
+            )
 
     def rope_tables(
         self,
