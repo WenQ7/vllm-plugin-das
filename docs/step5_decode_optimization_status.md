@@ -50,10 +50,13 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   throughput from 1557.44/515.79 to 1596.26/528.64 token/s (2.49%), reduced
   mean TPOT from 50.24 to 48.74 ms, and reduced mean ITL from 141.51 to
   137.27 ms.
-- Q/K indexer normalization and partial RoPE share one launch when a DP has at
-  most 32 target-verification tokens. The BS32 shape improved from 0.01319 ms
-  to 0.00966 ms (1.37x), bit-identically. At 64 tokens the joint grid is slower,
-  so BS64 and prefill retain the reference two-launch path.
+- Q/K indexer normalization and partial RoPE share one launch for up to 128
+  target-verification tokens. The original joint kernel used four warps and was
+  slower at 64 tokens; using one warp keeps the 256-wide reduction in one wave.
+  It improves M=32 from 0.01314 to 0.00840 ms, M=64 from 0.01362 to 0.00909 ms
+  (1.50x), and M=128 from 0.01686 to 0.01148 ms (1.47x), bit-identically.
+  Larger prefill shapes retain the reference two-launch path because the fused
+  reduction begins to diverge there.
 - Prefill radix selection now packs physical regions and appends the current
   causal region in the same kernel. At 64K/top-512 this reduces the selection
   metadata stage from 0.1184 ms to 0.1128 ms at BS32 (5.0%), and from 0.1537 ms

@@ -3776,12 +3776,10 @@ class Step4Indexer:
         q_norm_weight = owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype)
         k_norm_weight = owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype)
         k_norm_bias = owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype)
-        # At the TP2 + DP4 MTP3 shape, total BS32 gives each DP eight
-        # requests and therefore 32 target-verification tokens. Combining the
-        # Q and K grids removes one launch and is 1.37x faster there. Once the
-        # local token count reaches 64, the larger joint grid loses occupancy;
-        # retain the two reference launches for BS64 and prefill.
-        if num_tokens <= 32:
+        # The one-wave joint Q/K grid removes a launch and remains exact through
+        # 128 target-verification tokens. Larger prefill shapes retain the two
+        # reference launches because their reduction result starts to diverge.
+        if num_tokens <= 128:
             index_q, index_k = fused_indexer_qk_norm_rope(
                 index_q,
                 index_k,

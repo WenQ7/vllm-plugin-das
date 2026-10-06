@@ -198,5 +198,10 @@ def fused_indexer_qk_norm_rope(
         NUM_Q_HEADS=num_q_heads,
         BLOCK_D=triton.next_power_of_2(head_dim),
         BLOCK_R=triton.next_power_of_2(rotary_dim),
+        # One wave is enough for the 256-wide reduction and avoids the
+        # multi-wave synchronization cost that made the old joint launch
+        # slower at 64 verification tokens on BW1101.
+        num_warps=1,
+        num_stages=1,
     )
     return q_out, k_out
