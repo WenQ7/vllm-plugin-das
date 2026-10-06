@@ -1101,7 +1101,9 @@ All six original optimization requirements remain active.
 
 The isolated prototype is now source-owned in vllm_hcu/ops/step5_dcp2.py.
 It is not enabled in the model and does not remove the launcher DCP1 guard.
-The source file is byte-identical to the native GPU-qualified prototype.
+At b97dc34 the source file was byte-identical to the native GPU-qualified
+prototype. The later fine-region geometry extension is pending new GPU
+qualification and does not inherit that exact source claim.
 
 Two gfx938 GPUs completed62 cases per rank against independent CPU FP64
 references, with64 Q heads/4 KV heads, HD192, query lengths1-4, lengths1,
@@ -1152,3 +1154,36 @@ native LL tile tuning.
 
 Evidence: bs64-capacity-20261007/native_step5_ll_modes_cu_screen.json,
 native_step5_ll_modes_cu_decision.json and screen_native_step5_ll_modes_cu.py.
+
+
+### Fine sparse regions and isolated fusion performance run
+
+The DCP2 operator now distinguishes global sparse regions8 from logical
+cache pages128. A physical page64 contains16 local regions4. The packer
+maps region -> logical page -> physical page, preserves the in-page region
+offset and rank parity, and clips every query's visible local prefix.
+This geometry is required for Step5's region8 selector; the earlier native
+GPU prototype used region128 and is not direct proof of the fine variant.
+
+40 tests executed the actual production metadata kernel through Triton's
+CPU interpreter, covering both granularities, both ranks, lengths1/2/7/8/9/
+127/128/129/257/65538, shuffled two-request tables, invalid page/request/
+region IDs, padded queries and zero counts. Packing matched the independent
+integer oracle exactly.22 fine-region gfx938 variants compiled offline
+with no visible GPUs. BF16 attention variants had zero scratch; two FP8
+cache/BR8 variants had68 bytes of scratch per thread. Fine-region native
+GPU accuracy/Graph and FP8-cache qualification remain pending.
+
+The opt-in norm/FP8 fusion passed the fixed10097/100 check with unchanged
+per-item correctness labels. A single BS64/input65536/output4096 performance
+iteration now runs from frozen worktree /workspace/step5-norm-quant-perf-repo
+at0190ec8, retaining the v9 prompts, sampling, graph, capacity guards and
+measurement formula. The initial v10 startup omitted the ignored native
+hcu_ops extension and terminated before any benchmark. Its exact existing
+binary was copied and hash-checked into the worktree, then CPU-imported
+after torch. V11 loaded, captured actual Graphs, passed the unchanged
+capacity gate and began the one measured iteration. No TPS result yet.
+
+Evidence: dcp2-prototype-20261007/fine_regions_cpu_interpreter.log,
+fine_regions_gpu_compile.json; bs64-capacity-20261007/
+fp8-norm-fusion-v11_state.json and service/controller logs.

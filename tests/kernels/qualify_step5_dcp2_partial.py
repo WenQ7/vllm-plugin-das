@@ -19,9 +19,10 @@ dist.init_process_group("nccl",timeout=datetime.timedelta(seconds=300))
 assert dist.get_world_size()==2
 props=torch.cuda.get_device_properties(rank)
 assert props.gcnArchName.split(":")[0]=="gfx938"
-record={"source_sha256":hashlib.sha256(operator.read_bytes()).hexdigest(),
+record={"global_region_size":int(os.environ.get("STEP5_DCP2_REGION_SIZE","128")),"source_sha256":hashlib.sha256(operator.read_bytes()).hexdigest(),
         "world_size":2,"head_dim":192,"q_heads":64,"kv_heads":4,
         "native_distributed":True,"model_integrated":False,"cases":[]}
+global_region_size=int(os.environ.get("STEP5_DCP2_REGION_SIZE","128"))
 device=torch.device("cuda",rank)
 generator=torch.Generator(device="cpu").manual_seed(7707)
 def oracle(q,k,v,regions,counts,qpos,window,owner=None):
@@ -32,8 +33,8 @@ def oracle(q,k,v,regions,counts,qpos,window,owner=None):
     for qi in range(nq):
         for g in range(4):
             rr=regions[g*nq+qi,:counts[g*nq+qi]].numpy()
-            live=rr[(rr>=0)&(rr<(len(k)+127)//128)]
-            pos=np.arange(len(k));mask=np.isin(pos//128,live)&(pos<=int(qpos[qi]))
+            live=rr[(rr>=0)&(rr<(len(k)+global_region_size-1)//global_region_size)]
+            pos=np.arange(len(k));mask=np.isin(pos//global_region_size,live)&(pos<=int(qpos[qi]))
             if window:mask&=pos>=int(qpos[qi])-window+1
             if owner is not None:mask&=pos%2==owner
             pos=pos[mask]
@@ -60,6 +61,7 @@ def check(actual,expected,actual_lse,expected_lse):
     return dict(relative_l2=l2,max_abs=maxerr,lse_max_abs=lerr)
 def inputs(length,qlen,sparse,mode=0):
     pages=(length+127)//128
+    nregions=(length+global_region_size-1)//global_region_size
     table=torch.randperm(pages,generator=generator,dtype=torch.int64).to(torch.int32)[None]
     k=torch.randn((length,4,192),generator=generator).to(torch.bfloat16)
     v=torch.randn((length,4,192),generator=generator).to(torch.bfloat16)
@@ -67,14 +69,14 @@ def inputs(length,qlen,sparse,mode=0):
     if mode==1:q.zero_();k.zero_();v.zero_()
     if mode==2:q.mul_(1e-4);k.mul_(1e-4);v.mul_(1e-6)
     qpos=torch.arange(length-qlen,length,dtype=torch.int32)
-    regions=torch.full((qlen*4,pages+2),-1,dtype=torch.int32)
+    regions=torch.full((qlen*4,nregions+2),-1,dtype=torch.int32)
     counts=torch.empty((qlen*4,),dtype=torch.int32)
     for g in range(4):
         for qi in range(qlen):
-            chosen=list(range(pages)) if not sparse else sorted(set([0,pages//2,pages-1]))
+            chosen=list(range(nregions)) if not sparse else sorted(set([0,nregions//2,nregions-1]))
             # Distinct valid regions plus explicit masked out-of-range/tail entries.
             regions[g*qlen+qi,:len(chosen)]=torch.tensor(chosen,dtype=torch.int32)
-            regions[g*qlen+qi,len(chosen)]=pages+3
+            regions[g*qlen+qi,len(chosen)]=nregions+3
             counts[g*qlen+qi]=len(chosen)+1
     if mode==1:
         qpos[-1]=-1
@@ -88,7 +90,7 @@ def inputs(length,qlen,sparse,mode=0):
     return q,k,v,regions,counts,qpos,requests,table,cache_k,cache_v
 def run(q,k,v,regions,counts,qpos,requests,table,window,splits):
     outputs,lses,packed=partial(q,k,v,regions,counts,qpos,requests,table,
-         rank=rank,window=window,splits=splits)
+         rank=rank,window=window,splits=splits,global_region_size=global_region_size)
     local,local_lse=merge(outputs,lses)
     message=torch.cat([local.reshape(-1),local_lse.reshape(-1)])
     gathered=torch.empty((2*message.numel(),),device=device,dtype=torch.float32)
@@ -127,10 +129,11 @@ for ci,(length,qlen,sparse,window,splits,mode) in enumerate(cases):
         qi=row%qlen
         for slot in range(int(counts[row])):
             logical=int(regions[row,slot])
-            if logical<0 or logical>=table.shape[1] or qpos[qi]<0:continue
-            valid=min(128,max(0,int(qpos[qi])-logical*128+1))
+            per_page=128//global_region_size
+            if logical<0 or logical//per_page>=table.shape[1] or qpos[qi]<0:continue
+            valid=min(global_region_size,max(0,int(qpos[qi])-logical*global_region_size+1))
             local_count=(valid+1-rank)//2
-            if local_count:packed_expected[row,slot]=int(table[0,logical])|(local_count<<24)
+            if local_count:packed_expected[row,slot]=(int(table[0,logical//per_page])*per_page+logical%per_page)|(local_count<<24)
     assert torch.equal(result[4].cpu(),packed_expected)
     item=dict(length=length,qlen=qlen,sparse=sparse,window=window,splits=splits,
               mode=mode,full=full_error,local=local_error,packed_exact=True)

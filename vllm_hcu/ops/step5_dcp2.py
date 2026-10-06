@@ -16,7 +16,7 @@ REGION_VALID_SHIFT=tl.constexpr(24)
 def _pack_striped_regions(regions, counts, qpos, requests, table, packed,
                          ROWS:tl.constexpr, TOPK:tl.constexpr,
                          QUERIES:tl.constexpr, REQUESTS:tl.constexpr,
-                         TABLE_WIDTH:tl.constexpr, PHYSICAL_PAGES:tl.constexpr, RANK:tl.constexpr,
+                         TABLE_WIDTH:tl.constexpr, PHYSICAL_PAGES:tl.constexpr, GLOBAL_REGION_SIZE:tl.constexpr, RANK:tl.constexpr,
                          BLOCK:tl.constexpr):
     i=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)
     row=i//TOPK
@@ -27,12 +27,15 @@ def _pack_striped_regions(regions, counts, qpos, requests, table, packed,
     count=tl.load(counts+row,mask=row<ROWS,other=0)
     position=tl.load(qpos+query,mask=row<ROWS,other=-1)
     request=tl.load(requests+query,mask=row<ROWS,other=-1)
-    live=valid&(slot<count)&(logical>=0)&(logical<TABLE_WIDTH)&(position>=0)
+    regions_per_page:tl.constexpr=128//GLOBAL_REGION_SIZE
+    page=logical//regions_per_page
+    live=valid&(slot<count)&(logical>=0)&(page<TABLE_WIDTH)&(position>=0)
     live=live&(request>=0)&(request<REQUESTS)
-    physical=tl.load(table+request*TABLE_WIDTH+logical,mask=live,other=-1)
-    global_count=tl.minimum(128,tl.maximum(0,position-logical*128+1))
+    physical_page=tl.load(table+request*TABLE_WIDTH+page,mask=live,other=-1)
+    global_count=tl.minimum(GLOBAL_REGION_SIZE,tl.maximum(0,position-logical*GLOBAL_REGION_SIZE+1))
     local_count=(global_count+1-RANK)//2
-    live=live&(physical>=0)&(physical<PHYSICAL_PAGES)&(physical<1<<24)&(local_count>0)
+    physical=physical_page*regions_per_page+logical%regions_per_page
+    live=live&(physical_page>=0)&(physical_page<PHYSICAL_PAGES)&(physical<1<<24)&(local_count>0)
     meta=physical|(local_count<<24)
     tl.store(packed+i,tl.where(live,meta,-1),mask=valid)
 @triton.jit
@@ -148,7 +151,7 @@ def _striped_hd192_partial_kernel(
         logical = tl.load(logical_ptr + row * stride_packed_row + slots,
                           mask=slot_ok, other=-1)
         qpos = tl.load(qpos_ptr + request)
-        global_positions = logical[:, None] * 128 + 2 * offsets_in_region[None, :] + RANK
+        global_positions = logical[:, None] * (2 * region_size) + 2 * offsets_in_region[None, :] + RANK
         visible = live[:, None] & (offsets_in_region[None, :] < valid[:, None])
         visible = visible & (global_positions <= qpos) & (qpos >= 0)
         if WINDOW > 0:
@@ -260,8 +263,13 @@ def _striped_hd192_partial_kernel(
 
 
 def partial(query,key,value,regions,counts,qpos,requests,table,*,rank,window=0,splits=1,
-            k_scale=1.,v_scale=1.,block_regions=1):
-    if rank not in (0,1) or window<0 or splits<1 or block_regions not in (1,2):
+            k_scale=1.,v_scale=1.,block_regions=None,global_region_size=128):
+    if global_region_size not in (8,128):
+        raise ValueError("only global regions8 and128 are implemented")
+    if block_regions is None:
+        block_regions=8 if global_region_size==8 else 1
+    allowed_blocks=(4,8) if global_region_size==8 else (1,2)
+    if rank not in (0,1) or window<0 or splits<1 or block_regions not in allowed_blocks:
         raise ValueError("invalid DCP2 prototype launch")
     nq,nh,hd=query.shape
     if nq<1 or key.ndim!=3 or value.ndim!=3:
@@ -290,7 +298,7 @@ def partial(query,key,value,regions,counts,qpos,requests,table,*,rank,window=0,s
     _pack_striped_regions[(triton.cdiv(regions.numel(),256),)](
         regions,counts,qpos,requests,table,packed,
         ROWS=regions.shape[0],TOPK=topk,QUERIES=nq,REQUESTS=table.shape[0],
-        TABLE_WIDTH=table.shape[1],PHYSICAL_PAGES=key.shape[0]//64,RANK=rank,BLOCK=256,num_warps=4)
+        TABLE_WIDTH=table.shape[1],PHYSICAL_PAGES=key.shape[0]//64,GLOBAL_REGION_SIZE=global_region_size,RANK=rank,BLOCK=256,num_warps=4)
     output=torch.empty((splits,nq,nh,hd),dtype=torch.float32,device=query.device)
     lse=torch.empty((splits,nq,nh),dtype=torch.float32,device=query.device)
     _striped_hd192_partial_kernel[(nq,groups,splits)](
@@ -300,7 +308,7 @@ def partial(query,key,value,regions,counts,qpos,requests,table,*,rank,window=0,s
         output.stride(0),output.stride(1),output.stride(2),
         lse.stride(0),lse.stride(1),hd**-.5*k_scale*1.4426950408889634,
         v_scale,1.,nq,topk=topk,heads_per_group=nh//groups,
-        region_size=64,slots_per_split=triton.cdiv(topk,splits),
+        region_size=global_region_size//2,slots_per_split=triton.cdiv(topk,splits),
         BLOCK_H=max(16,triton.next_power_of_2(nh//groups)),BLOCK_R=block_regions,
         DK=64,QK_FP8=False,PV_FP8=False,P_SCALE=256.,STORE_LSE=True,
         RANK=rank,WINDOW=window,num_warps=4,num_stages=1)
