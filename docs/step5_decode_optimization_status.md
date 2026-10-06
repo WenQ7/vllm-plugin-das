@@ -979,3 +979,66 @@ No norm-weight cast or rounding-stage removal is adopted. A custom fused
 norm/quant candidate must explicitly retain the BF16 stage and be checked
 against the compiled production norm before any model-level adoption.
 Evidence: bs64-capacity-20261007/lightop_gemma_fp8_semantics_probe.json.
+
+
+### Explicit-layout Gemma norm and FP8 activation quantization
+
+A new isolated source operator fuses FP32 Gemma normalization, the required
+BF16 narrowing, token amax/scale and E4M3FN conversion. It returns both BF16
+hidden and FP8 hidden, retains FP32 norm weights/residuals, and reuses the
+existing LightOp scaled GEMM. It is not wired into the model or enabled by
+the formal launcher; whole-model accuracy and runtime norm-profile routing
+remain pending.
+
+The initial ordinary Triton variants failed exact BF16 checks because
+their reduction layouts differed from the selected Inductor native norm.
+Changing warp count alone did not fix all batches. Explicit Gluon layouts
+matched the native profiles at all nine tested shapes, with five random
+norm trials per shape. A single-row/four-warp variant retains the per-row
+reduction order of the native two-row-warp profiles while increasing the
+small-batch grid, removing the first candidate's M4/M32 regressions.
+
+Actual layer0 TP2 rank0 QKV weights and output-MSE calibration then passed
+strict BF16 norm/scales, FP32 GEMM and six changing-input Graph replay
+checks at M1/4/16/32/64/128/256/512/6144. FP8 values are not universally
+byte-identical: differing values passed the independent FP64 oracle for
+adjacent E4M3FN midpoint rounding. No model-accuracy equivalence is claimed.
+The source custom-op tests passed11 cases, including input preservation,
+changing weights, partial row CTAs, dynamic fullgraph compilation, empty
+batches and dtype/configuration rejection. The operator is gfx938-only.
+
+The final operator pipeline screen uses identical input for both sides and
+includes norm + activation quantization + actual LightOp QKV GEMM. Each
+entry is one captured-Graph screen, not a model throughput measurement:
+
+| M | Native pipeline (us) | Fused pipeline (us) | Time reduction |
+| --- | --- | --- | --- |
+| 1 | 36.98 | 33.95 | 8.18% |
+| 4 | 37.76 | 33.77 | 10.56% |
+| 16 | 36.60 | 33.47 | 8.54% |
+| 32 | 39.77 | 36.22 | 8.92% |
+| 64 | 38.38 | 35.47 | 7.57% |
+| 128 | 48.67 | 46.78 | 3.89% |
+| 256 | 68.04 | 66.73 | 1.93% |
+| 512 | 86.92 | 87.83 | -1.06% |
+| 6144 | 861.04 | 845.98 | 1.75% |
+M512 is slightly slower, so global adoption is not justified. An earlier
+M4 baseline timing outlier is preserved but excluded from the final table.
+The measured-source SHA is checked against the current operator file.
+
+Reproduce on idle gfx938 GPUs:
+```bash
+python3 tests/kernels/qualify_step5_norm_quant.py \
+  --bf16-model /data/model/step-5-preview-0913-bf16 \
+  --runtime-model /data/model/step-5-preview-0913-fp8-per-channel \
+  --calibration /workspace/step5-attention-optimization/qkv-fp8-output-calibration-inputs-v1.pt \
+  --output /tmp/step5-norm-quant-qualification.json
+```
+
+The qualifier selects the actual compiled native norm profile and refuses
+unsupported layouts or active vLLM services. It does not infer model routing.
+
+Evidence: bs64-capacity-20261007/qkv_norm_gluon_native_configs_probe.json,
+qkv_norm_quant_source_rowwise_qualification.json and
+qkv_norm_quant_custom_op_final_tests.log. All six original optimization
+requirements remain in scope; this is progress on the small-M QKV item.
