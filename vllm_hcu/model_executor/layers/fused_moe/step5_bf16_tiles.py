@@ -62,6 +62,26 @@ def install_step5_bf16_tiles(target):
             or p.all2all_backend != "deepep_low_latency"):
             report_rejection(f"config type={cfg.model_config.hf_text_config.model_type}, TP={p.tensor_parallel_size}, DP={p.data_parallel_size}, backend={p.all2all_backend}")
             return original(*args, **kwargs)
+        if (os.environ.get("VLLM_STEP5_BF16_COMPACT_GRID", "0") == "1"
+            and A.shape[0] == 44
+            and not any(args[8:11] if len(args) > 10 else (
+                kwargs.get("use_fp8_w8a8", False),
+                kwargs.get("use_int8_w8a16", False),
+                kwargs.get("use_int4_w4a16", False),
+            ))):
+            from .step5_bf16_batched import invoke_step5_bf16_experts
+            C = args[2] if len(args) > 2 else kwargs["C"]
+            counts = args[3] if len(args) > 3 else kwargs["expert_num_tokens"]
+            config = args[11] if len(args) > 11 else kwargs["config"]
+            if not reported:
+                logger.info(
+                    "Step5 BF16 compact expert grid enabled: shape=%s, config=%s",
+                    tuple(A.shape), config,
+                )
+                reported = True
+            # Counts remain on the GPU. This also works during PIECEWISE
+            # compilation, where batch_descriptor is None.
+            return invoke_step5_bf16_experts(A, B, C, counts, config)
         desc = get_forward_context().batch_descriptor
         if desc is None or not 0 < desc.num_tokens <= 64:
             report_rejection(f"batch descriptor={desc}")

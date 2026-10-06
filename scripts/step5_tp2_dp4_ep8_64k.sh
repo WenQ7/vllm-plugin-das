@@ -46,6 +46,7 @@ if [[ "$stage" == prefill ]]; then
   compilation='{"cudagraph_mode":"NONE","cudagraph_copy_inputs":false,"mode":3}'
 else
   backend=deepep_low_latency; tokens=512; sequences=32; memory=0.92
+  export VLLM_STEP5_BF16_COMPACT_GRID="${VLLM_STEP5_BF16_COMPACT_GRID:-1}"
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=0 VLLM_STEP5_SP_LL_WORKSPACE=1 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=1
   compilation='{"cudagraph_mode":"PIECEWISE","cudagraph_copy_inputs":true,"mode":3,"cudagraph_capture_sizes":[4,8,16,32,64,128,256,512]}'
 fi
