@@ -140,3 +140,13 @@ def test_disabled_context_does_not_install(runtime, config, native, monkeypatch)
     with runtime.exact_graph_memory(config):
         assert not runtime._exact_profile.get()
     assert not hasattr(native, "_step5_exact_graph_memory_installed")
+
+
+def test_signed_full_deltas_preserve_whole_pool_measurement(runtime, config, native):
+    # Live ROCm capture can free a large eager workspace between descriptors.
+    # Signed per-FULL deltas must cancel without lowering the measured total.
+    samples = [-1113587712, -1130364928, -1113587712, -1109393408, -1109393408]
+    measured = 2952790016
+    with runtime.exact_graph_memory(config):
+        estimate = native._extrapolate_full_graph_memory(samples, len(samples))
+        assert measured - sum(samples) + estimate == measured

@@ -55,8 +55,8 @@ def install(module) -> None:
             if _exact_profile.get() and len(samples) == total_graphs:
                 from vllm.logger import init_logger
                 init_logger("vllm.hcu.step5_graph_memory").info(
-                    "Step5 exact FULL Graph memory: samples=%d; "
-                    "deltas=%s; total=%d bytes",
+                    "Step5 all-FULL Graph profile: samples=%d; "
+                    "signed deltas=%s; sum=%d bytes",
                     total_graphs, samples, sum(samples),
                 )
                 # All FULL descriptors were captured. Replacing the sampled

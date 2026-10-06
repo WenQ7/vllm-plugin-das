@@ -729,3 +729,41 @@ Eleven CPU policy tests passed, covering complete/partial samples, the native
 pool-accounting equation, exception cleanup, idempotent installation, real
 capture passthrough, model/parallel guards and thread isolation.
 Evidence: bs64-capacity-20261007/exact_graph_memory_policy_tests.log.
+
+
+### Reuse native SWA conversion storage from the MoE arena
+
+The512-token/maxseq16 v4 candidate captured all five target FULL profiling
+descriptors and retained the native whole-pool measurement2.75GiB. All eight
+workers reported1132513 effective KV tokens/DP. It then failed during real
+PIECEWISE capture while native FA allocated a192MiB temporary K tensor;
+there was no benchmark. Capacity alone is not sufficient startup evidence.
+Signed per-FULL deltas can be negative when eager storage is released:
+the exact-mode accounting cancels their sum and retains the positive
+whole-capture measurement. A regression test covers the observed signed
+samples; twelve CPU Graph-memory tests now pass.
+
+VLLM_STEP5_SWA_REUSE_WORKSPACE=1 opts Step5 BF16/HD192/NHD causal sliding
+prefill and ragged multi-query batches into native pagedkv_to_contiguouskv
+and native varlen_fwd, using the existing current_workspace_manager arena
+for K/V and cumulative lengths. It retains the vendor262144-token buffer
+floor. The builder's static tail bound replaces the device-length sum.
+Uniform1--4-query paged Decode, FP8 KV, sinks, softcap, PCP/DCP and other
+models retain the original path. Main and draft workspace lanes remain
+independent. Formal default is off pending whole-service qualification.
+
+Nine native GPU tests pass: one/four/sixteen requests, short ragged queries,
+32-query batches and512-query prefill with an empty request; output is exact
+against original FA. Graph replay changes queries, lengths and physical
+pages. Two layers reuse the arena with an intervening overwrite while
+preserving both outputs. Direct paged Decode routing is unchanged.
+
+At16 requests/512 queries, eager time changed0.38026 ->0.30769ms; isolated
+Graph time0.30459 ->0.30485ms is neutral. With an already allocated1.5GiB
+shared arena, additional capture-reserved memory changed406847488 ->
+4194304 bytes (388 ->4MiB); physical free-memory delta changed400 ->10MiB.
+Current allocated-byte deltas were only1KiB on both sides and cannot measure
+the private pool reservation. This is an operator/storage qualification,
+not an end-to-end Decode throughput result.
+Evidence: bs64-capacity-20261007/swa_workspace_gpu_tests.log and
+qualify_swa_shared_arena.json.
