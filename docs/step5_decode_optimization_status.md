@@ -396,3 +396,9 @@ Evidence: /tmp/step5_live_bf16_tiles_bench.json,
  /tmp/step5_bf16_tile_policy_capture_tests.log.
 The running service predates these tile and causal-skip changes; the next
 short service screen is needed before attributing an end-to-end gain.
+
+The formal Decode launcher now defaults to FULL_AND_PIECEWISE for the
+target model and enables grouped-head indexer scoring after the successful
+64K BS32 screen. STEP5_TARGET_GRAPH_MODE=PIECEWISE and
+VLLM_STEP5_GROUPED_HEAD_INDEXER=0 remain explicit fallback overrides.
+Prefill retains Graph NONE. This does not establish 64K BS64 capacity.
