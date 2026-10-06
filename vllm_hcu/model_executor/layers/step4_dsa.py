@@ -624,6 +624,76 @@ def _store_live_summary_rows(
 
 
 @triton.jit
+def _insert_decode_tokens_kernel(
+    key_dst_ptr,
+    z_dst_ptr,
+    key_src_ptr,
+    z_src_ptr,
+    heads_ptr,
+    dst_row_stride: tl.int64,
+    dst_region_stride: tl.int64,
+    dst_proxy_stride: tl.int64,
+    src_row_stride: tl.int64,
+    src_proxy_stride: tl.int64,
+    PROXY_DIM: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+) -> None:
+    """Write each decode token into its request's partial-region buffer.
+
+    PyTorch implements ``scatter_`` through TensorIterator's generic
+    scatter/gather assignment kernel. That kernel is safe in eager execution,
+    but its replayed launch was the faulting command when the Step5 target model
+    used a full decode CUDA graph on gfx938. This operation has a much simpler
+    contract than general scatter: one contiguous proxy vector per request and
+    exactly one destination row. Keeping that contract explicit gives graph
+    replay stable pointers and launch geometry.
+    """
+    row = tl.program_id(0)
+    proxy_offset = tl.arange(0, BLOCK_P)
+    mask = proxy_offset < PROXY_DIM
+    head = tl.load(heads_ptr + row).to(tl.int64)
+    src_offset = row * src_row_stride + proxy_offset * src_proxy_stride
+    dst_offset = (
+        row * dst_row_stride
+        + head * dst_region_stride
+        + proxy_offset * dst_proxy_stride
+    )
+    key = tl.load(key_src_ptr + src_offset, mask=mask)
+    z = tl.load(z_src_ptr + src_offset, mask=mask)
+    tl.store(key_dst_ptr + dst_offset, key, mask=mask)
+    tl.store(z_dst_ptr + dst_offset, z, mask=mask)
+
+
+def _insert_decode_tokens(
+    buffer_key: torch.Tensor,
+    buffer_z: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
+    heads: torch.Tensor,
+) -> None:
+    """Graph-stable specialized replacement for two decode ``scatter_`` calls."""
+    rows = heads.shape[0]
+    if rows == 0:
+        return
+    proxy = buffer_key.shape[-1]
+    _insert_decode_tokens_kernel[(rows,)](
+        buffer_key,
+        buffer_z,
+        index_k,
+        index_z,
+        heads,
+        buffer_key.stride(0),
+        buffer_key.stride(1),
+        buffer_key.stride(2),
+        index_k.stride(0),
+        index_k.stride(-1),
+        PROXY_DIM=proxy,
+        BLOCK_P=triton.next_power_of_2(proxy),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _store_kv_rows_kernel(
     k_dst_ptr,
     v_dst_ptr,
@@ -3363,11 +3433,13 @@ class Step4Indexer:
         buffer_key = torch.where(head_mask, pending_key[sched.pending_in], zero)
         buffer_z = torch.where(head_mask, pending_z[sched.pending_in], zero)
 
-        at_head = sched.head.view(num_decodes, 1, 1).expand(num_decodes, 1, proxy)
-        buffer_key.scatter_(
-            1, at_head, index_k[:num_decodes].view(num_decodes, 1, proxy)
+        _insert_decode_tokens(
+            buffer_key,
+            buffer_z,
+            index_k[:num_decodes],
+            index_z[:num_decodes],
+            sched.head,
         )
-        buffer_z.scatter_(1, at_head, index_z[:num_decodes].view(num_decodes, 1, proxy))
 
         _, summary_fp8 = csa_compress_regions(
             buffer_key.view(num_decodes * region, 1, proxy),

@@ -525,3 +525,71 @@ def test_fused_step5_prefill_metadata_matches_reference():
         kernels._radix_topk_threshold = original_threshold
         kernels.region_topk_ids = original_ids
         kernels.region_topk_pack = original_pack
+
+
+def test_decode_token_insert_matches_scatter_and_replays_graph():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers.step4_dsa import _insert_decode_tokens
+
+    rows, region, proxy = 17, 8, 256
+    torch.manual_seed(97)
+    initial_key = torch.randn(
+        (rows, region, proxy), dtype=torch.bfloat16, device="cuda"
+    )
+    initial_z = torch.randn_like(initial_key)
+    source_key = torch.randn(
+        (rows, 1, proxy), dtype=torch.bfloat16, device="cuda"
+    )
+    source_z = torch.randn_like(source_key)
+    heads = torch.arange(rows, dtype=torch.int64, device="cuda") % region
+
+    expected_key = initial_key.clone()
+    expected_z = initial_z.clone()
+    scatter_index = heads[:, None, None].expand(rows, 1, proxy)
+    expected_key.scatter_(1, scatter_index, source_key)
+    expected_z.scatter_(1, scatter_index, source_z)
+
+    actual_key = initial_key.clone()
+    actual_z = initial_z.clone()
+    _insert_decode_tokens(actual_key, actual_z, source_key, source_z, heads)
+    torch.testing.assert_close(actual_key, expected_key, rtol=0, atol=0)
+    torch.testing.assert_close(actual_z, expected_z, rtol=0, atol=0)
+
+    # Compile before capture, then verify that one captured launch accepts new
+    # data and destination rows without recording shape- or pointer-dependent
+    # state. This reproduces the target model's replay contract in isolation.
+    static_key = initial_key.clone()
+    static_z = initial_z.clone()
+    static_source_key = source_key.clone()
+    static_source_z = source_z.clone()
+    static_heads = heads.clone()
+    _insert_decode_tokens(
+        static_key, static_z, static_source_key, static_source_z, static_heads
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _insert_decode_tokens(
+            static_key, static_z, static_source_key, static_source_z, static_heads
+        )
+
+    for shift in (1, 5):
+        replay_heads = (heads + shift) % region
+        replay_key = source_key + shift
+        replay_z = source_z - shift
+        static_key.copy_(initial_key)
+        static_z.copy_(initial_z)
+        static_source_key.copy_(replay_key)
+        static_source_z.copy_(replay_z)
+        static_heads.copy_(replay_heads)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        expected_key = initial_key.clone()
+        expected_z = initial_z.clone()
+        scatter_index = replay_heads[:, None, None].expand(rows, 1, proxy)
+        expected_key.scatter_(1, scatter_index, replay_key)
+        expected_z.scatter_(1, scatter_index, replay_z)
+        torch.testing.assert_close(static_key, expected_key, rtol=0, atol=0)
+        torch.testing.assert_close(static_z, expected_z, rtol=0, atol=0)
