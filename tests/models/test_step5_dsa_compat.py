@@ -324,7 +324,8 @@ def test_native_radix_selector_gfx938_workaround():
         kernels.region_topk_pack = original_pack
 
 
-def test_flash_sparse_short_prefill_matches_triton():
+@pytest.mark.parametrize("queries", [16, 65, 96, 128])
+def test_flash_sparse_short_prefill_matches_triton(queries):
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP unavailable")
     from vllm_hcu.model_executor.layers.step4_dsa import _flash_attn_prefill
@@ -333,7 +334,7 @@ def test_flash_sparse_short_prefill_matches_triton():
     )
 
     torch.manual_seed(53)
-    queries, groups, heads, head_dim = 16, 2, 32, 192
+    groups, heads, head_dim = 2, 32, 192
     region_size, topk = 8, 32
     tokens = region_size * topk
     query = torch.randn(
@@ -734,3 +735,55 @@ def test_mtp_verification_schedule_matches_general_schedule():
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.parametrize("tokens,max_query,expected", [
+    (0, 4, False), (64, 64, True), (65, 4, True), (96, 3, True),
+    (127, 4, True), (128, 4, True), (129, 4, False),
+    (96, 0, False), (96, 5, False), (96, 96, False),
+])
+def test_short_query_routes_ragged_mtp_without_tensor_readback(
+    tokens, max_query, expected,
+):
+    from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
+        is_short_query_batch,
+    )
+    assert is_short_query_batch(tokens, max_query) is expected
+    assert is_short_query_batch(128, verification=True)
+    assert is_short_query_batch(128, capturing=True)
+
+
+@pytest.mark.parametrize("max_query,needs_logical", [(4, False), (96, True)])
+def test_ragged_mtp_selection_omits_unused_tiled_metadata(
+    monkeypatch, max_query, needs_logical,
+):
+    from vllm_hcu.model_executor.layers import step4_dsa as dsa
+    monkeypatch.setenv("VLLM_STEP5_DSA_SHORT_QUERY", "1")
+    monkeypatch.setattr(dsa, "PREFILL_QK_FP8", False)
+    monkeypatch.setattr(dsa, "PREFILL_PV_FP8", False)
+    tokens, groups = 96, 2
+    observed = []
+
+    def select(scores, positions, table, request_indices, **kwargs):
+        observed.append(kwargs["return_logical_ids"])
+        packed = torch.zeros(groups * tokens, 3, dtype=torch.int32)
+        counts = torch.ones(groups * tokens, dtype=torch.int32)
+        if kwargs["return_logical_ids"]:
+            return packed, counts, packed.clone()
+        return packed, counts
+
+    monkeypatch.setattr(dsa, "prefill_sparse_meta", select)
+    monkeypatch.setattr(dsa, "prefill_sparse_meta_fused", select, raising=False)
+    md = SimpleNamespace(
+        num_decodes=0, num_decode_tokens=0, num_prefills=32,
+        num_actual_tokens=tokens, positions=torch.arange(tokens),
+        block_table=torch.zeros(32, 2, dtype=torch.int32),
+        prefill_request_indices=torch.arange(32).repeat_interleave(3),
+        schedule=None, max_query_len=max_query,
+    )
+    plan = dsa.build_plan(
+        md, torch.zeros(groups * tokens, 16), None,
+        topk=2, num_kv_groups=groups, regions_per_page=8,
+    )
+    assert observed == [needs_logical]
+    assert (plan.prefill[2] is not None) is needs_logical

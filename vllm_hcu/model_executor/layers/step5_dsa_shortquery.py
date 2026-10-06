@@ -10,6 +10,20 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
     NEGATIVE_INFINITY, REGION_ID_MASK, REGION_VALID_SHIFT,
     _fit_block_regions, merge_split_states,
 )
+def is_short_query_batch(num_tokens, max_query_len=0, *, verification=False,
+                         capturing=False):
+    """Keep ragged MTP verification on the device-only attention path.
+
+    Total token count alone cannot distinguish an ordinary short prefill from
+    2--4 queries per request. The builder already knows the maximum query
+    length on the host, so this decision needs no tensor readback.
+    """
+    return 0 < num_tokens <= 64 or (
+        64 < num_tokens <= 128
+        and (verification or capturing or 0 < max_query_len <= 4)
+    )
+
+
 @triton.jit
 def _sparse_attn_short_prefill_hd192_kernel(
     q_ptr,

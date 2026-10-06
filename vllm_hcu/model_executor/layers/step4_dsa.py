@@ -50,6 +50,7 @@ from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
     sparse_attention_short_prefill,
     prefill_request_indices_device,
     short_query_num_splits,
+    is_short_query_batch,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -1404,6 +1405,7 @@ class Step4DSAMetadata:
     # eagerly on every step -- including the steps that are only a graph replay.
     schedule: Step4DSASchedule | None = None
     prefill_request_indices: torch.Tensor | None = None
+    max_query_len: int = 0
 
 
 class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
@@ -1491,6 +1493,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             positions=m.positions,
             max_seq_len=m.max_seq_len,
             block_size=self.block_size,
+            max_query_len=m.max_query_len,
             block_table_np=getattr(m, "block_table_np", None),
         )
 
@@ -1947,14 +1950,17 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
             # graph contains 128 tokens. Keep that whole verification range on
             # the device-only short path; the general prefill path constructs
             # query tiles on the host and cannot be recorded in a full graph.
-            # Ordinary 65--128 token prefills retain the tiled kernel.
+            # Ragged MTP batches also stay on the short path when every
+            # request has at most four queries. Ordinary 65--128 token
+            # prefills retain the tiled kernel.
             verification = bool(
                 attn_metadata.schedule is not None
                 and attn_metadata.schedule.verification
             )
-            short_query = 0 < prefill_tokens <= 64 or (
-                prefill_tokens <= 128
-                and (verification or torch.cuda.is_current_stream_capturing())
+            short_query = is_short_query_batch(
+                prefill_tokens, attn_metadata.max_query_len,
+                verification=verification,
+                capturing=torch.cuda.is_current_stream_capturing(),
             )
             prefill_kwargs = dict(
                 num_kv_groups=num_kv_groups,
@@ -2145,8 +2151,9 @@ def build_plan(
             torch.cuda.is_available()
             and torch.cuda.is_current_stream_capturing()
         )
-        short_query = 0 < prefill_tokens <= 64 or (
-            prefill_tokens <= 128 and (verification or capturing)
+        short_query = is_short_query_batch(
+            prefill_tokens, attn_metadata.max_query_len,
+            verification=verification, capturing=capturing,
         )
         need_logical_ids = not (
             os.environ.get("VLLM_STEP5_DSA_SHORT_QUERY", "0") == "1"
