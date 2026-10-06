@@ -868,3 +868,25 @@ qualification is reproducible via
 on idle gfx938 GPUs; CPU metadata uses Gloo, while dispatch/combine uses
 the real native GPU DeepEP buffer and Graph. Results are written to
 `STEP5_DEEPEP_ALIGNMENT_RESULT` (default `/tmp/step5-deepep-dispatch-alignment.json`).
+
+
+### 2026-10-07: BS64 target Graph and capacity gate passed
+
+The v9 candidate (source905666e, scheduler384, per-request prefill24,
+64-token LL alignment, target FULL_DECODE_ONLY, calibrated QKV FP8,
+1 GiB graph margin, memory utilization0.956) completed real target/draft
+Graph capture and became healthy. All four initialized capacities passed
+the unchanged page/draft and1% gates: DP0/1=1,168,645, DP2=1,168,586,
+DP3=1,168,349 tokens; the1% requirement is1,125,366 per DP.
+
+The single BS64/input65536/output4096 benchmark is running with all16
+requests/DP admitted and no waiting requests or preemptions in the live
+snapshot. No completed TPS result is claimed yet. Original prompts,
+sampling, timestamp window formula and completion checks are retained.
+
+An isolated small-M QKV candidate now fuses FP32 row scale reduction,
+E4M3FN activation conversion and per-channel scaled GEMM in one kernel.
+CPU-only gfx938 compilation found zero-scratch configurations for M4/64
+after reducing K tile and stages. It remains outside production pending
+native quantization/Graph correctness and timing against the actual
+LightOp QKV method. No GPU microtest was run during the long benchmark.
