@@ -321,3 +321,54 @@ def test_native_radix_selector_gfx938_workaround():
         kernels._radix_topk_threshold = original_threshold
         kernels.region_topk_ids = original_ids
         kernels.region_topk_pack = original_pack
+
+
+def test_flash_sparse_short_prefill_matches_triton():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers.step4_dsa import _flash_attn_prefill
+    from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
+        sparse_attention_short_prefill,
+    )
+
+    torch.manual_seed(53)
+    queries, groups, heads, head_dim = 16, 2, 32, 192
+    region_size, topk = 8, 32
+    tokens = region_size * topk
+    query = torch.randn(
+        queries, heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        tokens, groups, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    physical = torch.arange(topk, device="cuda", dtype=torch.int32)
+    packed = (
+        physical | (torch.full_like(physical, region_size) << 24)
+    ).repeat(groups * queries, 1).contiguous()
+    counts = torch.full(
+        (groups * queries,), topk, device="cuda", dtype=torch.int32
+    )
+
+    expected, expected_lse = sparse_attention_short_prefill(
+        query,
+        key,
+        value,
+        packed,
+        counts,
+        num_kv_groups=groups,
+        region_size=region_size,
+        num_splits=4,
+    )
+    actual, actual_lse = _flash_attn_prefill(
+        query,
+        key,
+        value,
+        packed,
+        counts,
+        num_kv_groups=groups,
+        region_size=region_size,
+        softmax_scale=head_dim**-0.5,
+    )
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+    torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=2e-5)

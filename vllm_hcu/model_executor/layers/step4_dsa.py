@@ -68,7 +68,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-if os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR") == "1":
+_STEP5_DSA_SELECTOR = os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR", "")
+if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}:
     from vllm_hcu.model_executor.layers.step5_dsa_selector import (
         install_native_radix_selectors,
     )
@@ -222,12 +223,17 @@ if BOLTOPS_STAGES - _BOLTOPS_STAGE_NAMES:
 # flash_attn under exactly the same two flags, so one launch config moves both
 # attention families together; ``VLLM_STEP4_DSA_FLASH_ATTN`` still overrides
 # explicitly (e.g. to stage prefill out while decode is validated).
-_FLASH_ATTN_STAGE_NAMES = frozenset({"decode", "prefill"})
+_FLASH_ATTN_STAGE_NAMES = frozenset({"decode", "prefill", "short_prefill"})
 _flash_attn_stages_raw = os.environ.get("VLLM_STEP4_DSA_FLASH_ATTN")
 if _flash_attn_stages_raw is not None:
     FLASH_ATTN_DSA_STAGES = frozenset(
         name.strip() for name in _flash_attn_stages_raw.split(",") if name.strip()
     )
+elif _STEP5_DSA_SELECTOR == "radix_flash":
+    # EngineCore startup only carries the established Step5 selector through
+    # its sanitized worker environment. Keep the alternate decode backend on
+    # the same selector so the model-loading process observes the choice.
+    FLASH_ATTN_DSA_STAGES = frozenset({"decode", "short_prefill"})
 else:
     import vllm_hcu.platforms.envs as _henvs
 
@@ -361,7 +367,10 @@ def _flash_attn_dsa_ops() -> tuple[Any, Any, Any, Any]:
     missing = [
         name
         for stage, name in required.items()
-        if stage in FLASH_ATTN_DSA_STAGES
+        if (
+            stage in FLASH_ATTN_DSA_STAGES
+            or (stage == "prefill" and "short_prefill" in FLASH_ATTN_DSA_STAGES)
+        )
         and not hasattr(flash_attn_interface, name)
     ]
     if missing:
@@ -1484,7 +1493,14 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 block_q=128,
                 block_regions=16,
             )
-            if "prefill" in FLASH_ATTN_DSA_STAGES:
+            use_flash_prefill = (
+                "prefill" in FLASH_ATTN_DSA_STAGES
+                or (
+                    "short_prefill" in FLASH_ATTN_DSA_STAGES
+                    and 0 < num_tokens - ndt <= 64
+                )
+            )
+            if use_flash_prefill:
                 # flash-attention-cutlass has no query-tiled prefill path, so
                 # logical_regions/q_positions/request_indices/block_q from
                 # prefill_kwargs are dropped by _flash_attn_prefill rather
