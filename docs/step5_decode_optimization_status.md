@@ -1064,8 +1064,12 @@ passed. These are not model-accuracy or throughput results.
 The ordinary-MTP3 candidate at norm-quant-model-20261007-v2 loaded all eight
 workers, completed actual Graph captures and passed health. A fixed100
 GSM8K evaluation uses the prior frozen inputs, prompts, sampling and native
-EvalScope scoring. Evaluation is pending; no full-model gain or accuracy
-equivalence is claimed. The first controller audit failed because worker
+EvalScope scoring. The candidate completed97/100, zero request errors and
+zero truncations, equal to the previous FP8 score. Independent per-item
+audit found no changed correctness labels and three changed extracted
+answers (all already incorrect). Same input bytes, prompts, targets and
+generation config were checked. This is fixed100 accuracy evidence, not
+full-dataset equivalence, a single-variable source A/B or throughput. The first controller audit failed because worker
 /proc environ was empty (all flags unavailable). Its failure was preserved.
 The resumed controller records that limitation instead of treating missing
 /proc data as proof the feature is disabled. Root launch environment, rank0
@@ -1091,3 +1095,37 @@ Evidence: bs64-capacity-20261007/qkv_norm_quant_integration_tests.log,
 qkv_norm_quant_launcher_checks.json; norm-quant-model-20261007-v2 runtime
 manifest/logs; dcp2-prototype-20261007/cpu_qualification.json.
 All six original optimization requirements remain active.
+
+
+### Native DCP2 partial Attention qualification
+
+The isolated prototype is now source-owned in vllm_hcu/ops/step5_dcp2.py.
+It is not enabled in the model and does not remove the launcher DCP1 guard.
+The source file is byte-identical to the native GPU-qualified prototype.
+
+Two gfx938 GPUs completed62 cases per rank against independent CPU FP64
+references, with64 Q heads/4 KV heads, HD192, query lengths1-4, lengths1,
+2,127,128,129,257 and65538, sparse/dense selection, SWA128, empty/padded
+queries, zero/tiny inputs and shuffled physical pages. Device packing was
+exact. Partial output and LSE remained FP32 through a real RCCL all-gather
+and global LSE merge; BF16 narrowing occurred afterward. Q and probability
+arithmetic retains the existing BF16 path. This is bounded-error proof,
+not byte equivalence to unstriped Attention.
+
+Actual communication Graphs at257 and65538 keys passed three changing-Q
+replays each. Retaining graphs caused native process-group destruction to
+remain pending after all checks; resetting and releasing the communication
+graphs before destruction fixed it. Both Graph cases passed again and
+both process groups destroyed cleanly. Initial evidence and exact owned
+test-tree cleanup were retained.
+
+The portable test is tests/kernels/qualify_step5_dcp2_partial.py, launched
+with torchrun --standalone --nproc-per-node=2 on idle GPUs. Result directory
+uses STEP5_DCP2_RESULT_DIR (default /tmp/step5-dcp2-qualification).
+FP8-cache variants have offline compilation only; their GPU qualification,
+full Step5 DCP2 integration, Prefill parity/cache write adaptation and
+model performance remain pending. All six optimization requirements remain
+active.
+
+Evidence: dcp2-prototype-20261007/gpu_qualification_summary.json,
+gpu_qualification-rank0/1.json.before-graph-reset, gpu_graph_lifecycle.log.
