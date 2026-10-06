@@ -714,6 +714,21 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
         activation_out_dim = self.adjust_N_for_activation(N, activation)
         workspace13 = (local_num_experts, max_tokens, max(K, activation_out_dim))
         workspace2 = (local_num_experts, max_tokens, max(N, K))
+        if (
+            getattr(self, "_step5_ll_tuning", False)
+            and os.getenv("VLLM_STEP5_LL_COMPACT_WORKSPACE", "0") == "1"
+            and not self.quant_config.use_int8_w8a8
+            and (local_num_experts, N, K) == (44, 3072, 4096)
+        ):
+            # apply() uses this buffer only for gate/up output [E, M, N].
+            # The down result aliases workspace13 through the native allocator,
+            # so that shared output arena must retain its K-sized bound.
+            workspace2 = (local_num_experts, max_tokens, N)
+            logger.info_once(
+                "Step5 masked FP8 compact workspace: gate/up width=%s "
+                "instead of%s; capacity=%s; experts=%s",
+                N, max(N, K), max_tokens, local_num_experts,
+            )
         output = (local_num_experts, max_tokens, K)
         return workspace13, workspace2, output
 

@@ -687,3 +687,23 @@ all running/waiting counters returned to zero, and the service was stopped.
 There was no preemption. Capacity remains proven; BS64 pure-Decode TPS does
 not. Preserve the original output4096 and measurement formula while improving
 scheduler/workspace capacity rather than relabeling this as valid BS64 TPS.
+
+
+### Bound masked FP8 gate/up workspace to its actual width
+
+VLLM_STEP5_LL_COMPACT_WORKSPACE=1 reduces workspace2 from [E,M,max(N,K)]
+to [E,M,N] only for the qualified Step5 gfx938 FP8 E44/N3072/K4096 LL path.
+The gate/up kernel and LightOP SiLU/clamp/FP8 quantization consume N3072;
+the down result still needs K4096. The native allocator aliases workspace13
+with down output, so that arena is retained rather than incorrectly claiming
+it as an unused allocation. BF16 workspace2 requires only activation N1536,
+so it does not erase this FP8 workspace2 saving in the shared pool.
+
+The saving is88MiB at expert capacity1024 and352MiB at capacity4096.
+The default is off. Twelve GPU tests passed: ten shape/precision guards,
+plus native packed masked DeepGEMM gate/up -> LightOP activation -> down
+application at capacities128/512. Changing counts under Graph replay covers
+empty experts, all-empty batches, full-capacity and skewed experts. Live
+output matches the original allocation exactly and output/workspace storage
+canaries remain intact. This is a storage-bound optimization; successful
+higher-scheduler startup and service throughput remain to be established.
