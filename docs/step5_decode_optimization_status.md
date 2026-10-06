@@ -303,3 +303,11 @@ by startup's free-memory check. Lowering dispatch capacity from 2048 to 1024
 by using a 256-token scheduler and smaller capture sizes worked, but 0.955
 still ran out of memory during Graph warmup. Neither candidate reached serving
 state or produced a performance result. Formal memory remains 0.92.
+
+Production FP8-pool scoring (including activation rounding) selected BK128,
+four warps and two stages. At 16 requests per DP, queries/request 1/2/3/4
+measured 0.20251/0.20279/0.20233/0.20023 ms on native and
+0.09926/0.10124/0.12289/0.12306 ms on grouped-head scoring. Every tested tile
+variant produced bit-identical scores. BK64 was slower than native for q=1/2,
+so the BF16-pool tile choice is not used for the production FP8 summary pool.
+These are operator results; service gains are still pending.

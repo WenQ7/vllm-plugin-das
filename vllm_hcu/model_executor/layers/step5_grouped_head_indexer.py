@@ -55,7 +55,7 @@ def _grouped_head_score(
 
 def grouped_head_indexer_logits(
     quantized_q, weights, summary, block_table, request_indices, positions, out,
-    *, regions_per_page, queries_per_request, region_size=8, block_k=64,
+    *, regions_per_page, queries_per_request, region_size=8, block_k=128,
     num_warps=4, num_stages=2,
 ):
     tokens, groups, heads, dim = quantized_q.shape
