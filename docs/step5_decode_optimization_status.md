@@ -7,7 +7,9 @@ and the same 64K decode topology unless a row explicitly says operator-only.
 ## Adopted
 
 - DeepGEMM uses the checked-in `E=44,N=1536,device_name=BW1101.json` tuning
-  file through `VLLM_TUNED_CONFIG_FOLDER`. The measured improvement is small
+  file through `VLLM_TUNED_CONFIG_FOLDER` for the Triton MoE path. It is not
+  the tile template for masked FP8 DeepGEMM; that path separately chooses
+  measured MODE=1101 for up to 512 global tokens. The measured improvement is small
   but repeatable: about 0.17% on short decode and 0.24% on the matching prefill
   comparison.
 - Short Step5 sparse attention uses the FlashAttention-style sparse path for
@@ -41,8 +43,14 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   output. The split-state merge also selects one wave for two splits and eight
   waves for four splits, reducing the complete direct-output path further to
   0.1313/0.2134/0.3620 ms while preserving the reference reduction result.
-- The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
-  kernel. It is the fastest installed implementation for this shape.
+- The formal `step5_tp2_dp4_ep8_64k.sh` profile currently keeps QKV in BF16:
+  it does not set `VLLM_STEP5_QKV_FP8_W8A8`, whose model default is 0. The
+  optional `step5_attention_8card.sh` profile enables output-MSE-calibrated
+  QKV FP8 and requires a calibration file. That path uses LightOP's
+  channel-wise FP8 hipBLASLt kernel, which was faster than the installed FP8
+  alternatives. Those optional-kernel results are not evidence that the
+  formal profile was running FP8 QKV. The 698.48 -> 806.07 BS64 comparison
+  below retained BF16 QKV on both sides.
 - MTP3 short-prefill indexer scoring is batched across requests and reads the
   summary pool directly through the block table. At 64K context, the per-layer
   score stage improved from 1.2004 ms to 0.3430 ms at total BS32 (3.50x), and
@@ -135,6 +143,36 @@ GPU execution across the three sampled steps (~19.6%); DeepEP combine took
 The profiled run was stopped after traces were collected and is not used
 for service throughput or correctness claims.
 
+## Implemented candidates pending long-context adoption
+
+### Full target-model graph
+
+The target model can now capture all six uniform MTP3 graph sizes. Its
+four-query DSA schedule keeps fixed addresses for compression, rollback
+prefixes, request indices, and score storage, and is bit-identical to the
+general scheduler. A 32-request drain test with staggered 16--78 token outputs
+completed 32/32 requests without a VM fault or worker failure.
+
+An earlier short-drain service A/B did not justify enabling it: the same synthetic workload
+took 9.56 seconds with `FULL_AND_PIECEWISE` and 6.67 seconds with `PIECEWISE`, a
+43.3% regression. The completion-drain interval was essentially unchanged
+(2.92 versus 2.94 seconds), so that workload did not establish a steady
+decode benefit and showed additional initial latency. The formal launcher therefore retains target
+`PIECEWISE`; the MTP draft keeps its verified full decode graph.
+
+After the live BF16 grid and ragged-query fixes, a matching warmed BS64,
+input1024/output512 synthetic run measured 806.0666 -> 817.3194 output token/s
+(+1.40%) and 57.8990 -> 56.9690 ms mean TPOT (-1.61%) when only the target
+Graph mode changed. Both runs completed 64 requests with exactly 11624 drafts,
+34872 draft tokens, and 21156 accepted tokens (60.6675843%). Real dispatcher
+metrics recorded FULL target execution, including padded shrinking batches;
+a fresh 32-request 16--78-token drain also completed every requested length.
+Result: `/tmp/step5_compact_full_graph_bench/openai-chat-infqps-concurrency64-step5-20261007-002440.json`.
+This single screening run shows a modest gain, not statistical significance or
+64K/4K performance. FULL at memory utilization 0.92 initialized 924376 tokens
+per DP (13.28 requests at 69632 tokens); BS64/DP4 requires 1114112 per DP.
+The candidate is therefore pending long-context capacity/performance checks.
+
 ## Rejected after measurement
 
 ### Small-M QKV alternatives
@@ -163,21 +201,6 @@ regressed: baseline/fused output throughput was 698.48/695.17 token/s and mean
 TPOT was 67.70/68.10 ms. Acceptance statistics were identical (60.6676%,
 21,156 accepted of 34,872 drafted tokens). The extra custom-op boundary erased
 the isolated gain, so the candidate was removed and is not enabled.
-
-### Full target-model graph
-
-The target model can now capture all six uniform MTP3 graph sizes. Its
-four-query DSA schedule keeps fixed addresses for compression, rollback
-prefixes, request indices, and score storage, and is bit-identical to the
-general scheduler. A 32-request drain test with staggered 16--78 token outputs
-completed 32/32 requests without a VM fault or worker failure.
-
-The one-run service A/B did not justify enabling it: the same synthetic workload
-took 9.56 seconds with `FULL_AND_PIECEWISE` and 6.67 seconds with `PIECEWISE`, a
-43.3% regression. The completion-drain interval was essentially unchanged
-(2.92 versus 2.94 seconds), so the full target graph did not improve steady
-decode and added initial latency. The formal launcher therefore retains target
-`PIECEWISE`; the MTP draft keeps its verified full decode graph.
 
 ### Projection and shared-expert fusion
 
@@ -242,8 +265,8 @@ cache layout and power-of-two dimensions, which do not match Step5's separate
 GQA K/V cache and 192-dimensional heads.
 
 For QKV, LightOP's small-M smooth-GEMM table has no tuned
-`N=6912,K=4096` entry. Its public channel-wise hipBLASLt path is already the
-production backend and remains faster than the installed AITER alternatives in
+`N=6912,K=4096` entry. Its public channel-wise hipBLASLt path is the optional
+FP8-QKV backend and remains faster than the installed AITER alternatives in
 the measurements above. Therefore none of the installed library kernels can
 replace the remaining Step5-specific decode stages without changing semantics
 or regressing the measured shape.

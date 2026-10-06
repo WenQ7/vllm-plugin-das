@@ -34,7 +34,7 @@ export VLLM_STEP5_GROUPED_MTP_INDEXER="${VLLM_STEP5_GROUPED_MTP_INDEXER:-1}"
 export VLLM_STEP5_TP2_HT_BF16_CHUNKS=0 VLLM_STEP5_DSA_FUSED_SELECTOR=1
 export VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH=0 VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE=0
 # These fused projection candidates regress the production TP2 shapes.
-# Keep the native LightOP FP8 QKV and native BF16 residual GEMM selection.
+# QKV stays BF16 unless the optional calibrated FP8 path is explicitly enabled.
 export VLLM_STEP5_FUSED_QK_NORM_ROPE=0
 export VLLM_STEP5_MERGED_ATTENTION_PROJECTION=0
 export VLLM_STEP5_FULL_MIXED_PROJECTION=0
