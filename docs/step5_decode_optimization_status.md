@@ -288,11 +288,15 @@ into one short-query GEMM, then preserves the original sequential FP32
 head accumulation. It retains the existing e4m3 activation rounding and
 native causal/region masks. The actual TP2 geometry is G=2,H=4,D=256;
 the initial G=1,H=8 prototype is not a production-geometry measurement.
-Twelve native-reference tests passed for queries/request 1--4, group-major
+Twenty-four native-reference tests passed with BF16 and production FP8 summary pools for queries/request 1--4, group-major
 strided outputs, page-shuffled summaries, and graph replay with changing
 positions, Q and weights. The feature remains opt-in pending a service check.
 Operator measurements including activation rounding are in
-`/tmp/step5_grouped_head_actual_geometry_bench.log`.
+`/tmp/step5_grouped_head_actual_geometry_bench.log` (BF16 pool) and
+`/tmp/step5_grouped_head_fp8_summary_bench.log` (production FP8 pool).
+The first service startup caught an FP8 masked-load fill type that BF16-only
+tests missed. The fill is now floating-point zero; the added FP8-pool graph
+tests cover it. That failed startup produced no benchmark result.
 
 The 64K full-graph capacity candidate at memory utilization 0.97 was rejected
 by startup's free-memory check. Lowering dispatch capacity from 2048 to 1024

@@ -7,10 +7,11 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(),
 
 
 @pytest.mark.parametrize("qpr", [1, 2, 3, 4])
+@pytest.mark.parametrize("summary_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("groups,heads,width", [(1, 8, 127), (2, 4, 8192),
                                               (4, 4, 128)])
 def test_grouped_heads_match_native_and_graph_replay(monkeypatch, qpr, groups,
-                                                    heads, width):
+                                                    heads, width, summary_dtype):
     monkeypatch.setenv("VLLM_STEP4_DSA_FP8_MATH", "off")
     monkeypatch.setenv("VLLM_STEP5_GROUPED_HEAD_INDEXER", "0")
     from vllm_hcu.model_executor.layers.step4_dsa import (
@@ -24,7 +25,7 @@ def test_grouped_heads_match_native_and_graph_replay(monkeypatch, qpr, groups,
                     device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(tokens, groups, heads, device="cuda", dtype=torch.float32)
     summary = torch.randn(requests_count * cols * 8, 256,
-                          device="cuda", dtype=torch.bfloat16)
+                          device="cuda", dtype=torch.bfloat16).to(summary_dtype)
     table = torch.randperm(requests_count * cols, device="cuda",
                           dtype=torch.int32).view(requests_count, cols)
     requests = torch.arange(requests_count, device="cuda",

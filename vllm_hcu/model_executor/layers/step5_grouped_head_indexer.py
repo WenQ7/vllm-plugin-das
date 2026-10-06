@@ -29,7 +29,7 @@ def _grouped_head_score(
     slot = page * REGIONS_PER_PAGE + key % REGIONS_PER_PAGE
     dim = tl.arange(0, DIM)
     k = tl.load(summary + slot[None, :] * stride_summary + dim[:, None],
-                key_ok[None, :], 0).to(q.dtype.element_ty)
+                key_ok[None, :], 0.0).to(q.dtype.element_ty)
     row = tl.arange(0, BQH)
     token = token_base + row % QPR
     q_group = row // (QPR * HEADS)
