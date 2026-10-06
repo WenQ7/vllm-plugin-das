@@ -26,6 +26,30 @@ def _is_gfx938(device):
     return getattr(torch.cuda.get_device_properties(device), "gcnArchName", "").startswith("gfx938")
 
 
+def small_batch_tile_config(config, context, dp_size):
+    """Select tiles using existing host scheduler counts, never GPU counts."""
+    if context is None:
+        return config
+    cache_key = "_step5_bf16_global_tokens"
+    if hasattr(context, cache_key):
+        total = getattr(context, cache_key)
+    else:
+        metadata = getattr(context, "dp_metadata", None)
+        counts = getattr(metadata, "num_tokens_across_dp_cpu", None)
+        total = None
+        if counts is not None and counts.device.type == "cpu":
+            total = sum(counts.tolist())
+        if total is None or total <= 0:
+            descriptor = getattr(context, "batch_descriptor", None)
+            if descriptor is not None:
+                total = int(descriptor.num_tokens) * dp_size
+        setattr(context, cache_key, total)
+    if total is not None and 0 < total <= 512:
+        return dict(config, BLOCK_SIZE_M=32, BLOCK_SIZE_N=64,
+                    BLOCK_SIZE_K=64, num_warps=4, num_stages=3)
+    return config
+
+
 def install_step5_bf16_tiles(target):
     original = target.invoke_moe_batched_triton_kernel
     if getattr(original, "_step5_bf16_tiles", False):
@@ -62,6 +86,9 @@ def install_step5_bf16_tiles(target):
             or p.all2all_backend != "deepep_low_latency"):
             report_rejection(f"config type={cfg.model_config.hf_text_config.model_type}, TP={p.tensor_parallel_size}, DP={p.data_parallel_size}, backend={p.all2all_backend}")
             return original(*args, **kwargs)
+        config = args[11] if len(args) > 11 else kwargs["config"]
+        context = get_forward_context()
+        tuned = small_batch_tile_config(config, context, p.data_parallel_size)
         if (os.environ.get("VLLM_STEP5_BF16_COMPACT_GRID", "0") == "1"
             and A.shape[0] == 44
             and not any(args[8:11] if len(args) > 10 else (
@@ -72,26 +99,20 @@ def install_step5_bf16_tiles(target):
             from .step5_bf16_batched import invoke_step5_bf16_experts
             C = args[2] if len(args) > 2 else kwargs["C"]
             counts = args[3] if len(args) > 3 else kwargs["expert_num_tokens"]
-            config = args[11] if len(args) > 11 else kwargs["config"]
             if not reported:
                 logger.info(
                     "Step5 BF16 compact expert grid enabled: shape=%s, config=%s",
-                    tuple(A.shape), config,
+                    tuple(A.shape), tuned,
                 )
                 reported = True
             # Counts remain on the GPU. This also works during PIECEWISE
             # compilation, where batch_descriptor is None.
-            return invoke_step5_bf16_experts(A, B, C, counts, config)
-        desc = get_forward_context().batch_descriptor
-        if desc is None or not 0 < desc.num_tokens <= 64:
-            report_rejection(f"batch descriptor={desc}")
+            return invoke_step5_bf16_experts(A, B, C, counts, tuned)
+        if tuned is config:
             return original(*args, **kwargs)
-        config = args[11] if len(args) > 11 else kwargs["config"]
-        tuned = dict(config, BLOCK_SIZE_M=32, BLOCK_SIZE_N=64,
-                     BLOCK_SIZE_K=64, num_warps=4, num_stages=2)
         if not reported:
-            logger.info("Step5 BF16 small-batch tiles enabled: graph_tokens=%d, M32 N64 K64, warps4 stages2",
-                        desc.num_tokens)
+            logger.info("Step5 BF16 small-batch tiles enabled: M32 N64 K64, "
+                        "warps4 stages3, using host token counts")
             reported = True
         if len(args) > 11:
             positional = list(args)

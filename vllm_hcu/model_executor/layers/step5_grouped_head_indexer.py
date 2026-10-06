@@ -22,6 +22,10 @@ def _grouped_head_score(
     query_ok = group_query < GROUPS * QPR
     position = tl.load(positions + token_base + query, query_ok, 0)
     visible = position // REGION_SIZE
+    # FULL graphs reserve the maximum context width. Skip score CTAs whose
+    # whole region tile is causally invisible, without any host count read.
+    if tl.program_id(1) * BK >= tl.max(visible, 0):
+        return
     key_ok = (key < tl.max(visible, 0)) & (key < WIDTH)
     request = tl.load(requests + token_base).to(tl.int64)
     page = tl.load(table + request * stride_table + key // REGIONS_PER_PAGE,

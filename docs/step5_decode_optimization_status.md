@@ -320,8 +320,7 @@ used the full target Graph and BF16 QKV. The operator's long-context gain did
 not become a material short-context service gain. The selected BK128 tests
 passed 24 cases again after service startup.
 Result: `/tmp/step5_grouped_head_v2_bench/openai-chat-infqps-concurrency64-step5-20261007-010820.json`.
-A single BS32 65536-input/4096-output screening run is now testing the intended
-long-context workload; no 64K throughput improvement is claimed yet.
+The completed BS32 65536-input/4096-output screen is recorded below.
 
 A native KV allocator cost audit also rejected treating the 20 padding-layer
 warning as an automatic 27.78% capacity gain. Full and sliding groups share a
@@ -336,10 +335,64 @@ The first BS32 long-context wrapper incorrectly imported the metadata adapter
 before setting its DP argument, so the adapter retained DP=1 and capacity
 preflight skipped the case. No measured 64K iteration ran in that attempt.
 The corrected wrapper explicitly sets DP=4, retains the 0.9 guard, reads all
-four current startup capacities, and is running one BS32 iteration:
+four startup capacities, and completed one BS32 iteration:
 `/tmp/step5_grouped_head_graph64k_bs32_v2_benchmark.py`.
 Result and per-iteration sidecar:
 `/tmp/step5_grouped_head_graph64k_bs32_v2_result.json` and
 `/tmp/step5_grouped_head_graph64k_bs32_v2_result.iterations.json`.
 The manifest also records preemption counters, so queued/preempted runs cannot
 be passed off as an unpreempted Decode comparison.
+
+
+### Completed 64K full-target-graph screen
+
+The grouped-head FP8-summary scorer and full target Decode Graph service
+completed 32/32 requests with 65536 input tokens and 4096 output tokens each.
+The valid common Decode window measured 859.36049 output token/s and mean
+ITL 101.11884 ms (p50 100.98841, p99 104.18955). Window coverage was 35.7349%,
+with 46827 output tokens over 54.49052 seconds. All four DP preemption
+counter deltas were zero. The request token hashes match the original
+random.Random(42 + request_index) input generator. QKV remained BF16.
+This is one measured iteration using the fixed synthetic MTP acceptance
+rates [0.838992, 0.598322, 0.362686], not an accuracy or natural-acceptance run.
+
+The historical matching BS32 64K/4K screen measured 575.90817 token/s and
+mean ITL 154.90923 ms, so cumulative throughput improved about 49.2% and ITL
+fell about 34.7%. Several kernels, target Graph, and all-reduce configuration
+changed; the historical run also had a separate long-context warmup while
+this run had a short-context warmup. This is not a sole-variable indexer A/B.
+The mixed prefill stage's 3214.38 token/s must not be reported as the
+standalone input64K/output1 Prefill benchmark.
+
+Evidence:
+- /tmp/step5_grouped_head_graph64k_bs32_v2_result.json
+- /tmp/step5_grouped_head_graph64k_bs32_v2_result.iterations.json
+- /tmp/step5_grouped_head_graph64k_bs32_v2_manifest.json
+- /workspace/step5-tp2-performance/tp2dp4-final-decode-synthetic-v4-final-single-round-v4-summary.json
+
+### Small live-batch tile selection
+
+The compact BF16 grid used to return before the existing small-batch tile
+selection, leaving M128/N128 even for small Decode batches. It now selects
+M32/N64/K64 for at most 512 global scheduler tokens, using already-present
+CPU DP counts cached once per forward. Capture falls back to its padded
+batch descriptor when dummy CPU counts are zero. It never copies expert
+counts or DP device counts back to the CPU.
+
+At E44/capacity2048, representative Decode counts changed compact up/down
+GEMM from 1.97433/0.99295 ms to 1.16736/0.58911 ms. Extreme one-expert
+skew prefers M128; this host-token policy does not claim to optimize skew.
+All five tested tile variants preserved reference output and padding
+bit-exactly. Six native-reference GPU tests include dynamic-count Graph
+replays; thirteen CPU tests cover host-count caching and both grid paths.
+The scorer also skips wholly invisible score tiles on-device, avoiding
+full-width summary work in short-context FULL captures. Its 24 native
+reference tests cover changing positions and empty regions under replay.
+Combined kernel/policy tests passed 42 cases, followed by the added zero
+dummy-count capture regression passing in the 13-case CPU policy run.
+
+Evidence: /tmp/step5_live_bf16_tiles_bench.json,
+ /tmp/step5_small_tiles_and_indexer_tests.log,
+ /tmp/step5_bf16_tile_policy_capture_tests.log.
+The running service predates these tile and causal-skip changes; the next
+short service screen is needed before attributing an end-to-end gain.
