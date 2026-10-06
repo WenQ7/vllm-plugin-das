@@ -6,8 +6,8 @@ and the same 64K decode topology unless a row explicitly says operator-only.
 
 ## Adopted
 
-- DeepGEMM uses the checked-in `E=44,N=1536,device_name=BW1101.json` tuning
-  file through `VLLM_TUNED_CONFIG_FOLDER` for the Triton MoE path. It is not
+- The Triton MoE helper loads the checked-in `E=44,N=1536,device_name=BW1101.json`
+  tuning file through `VLLM_TUNED_CONFIG_FOLDER`. It is not
   the tile template for masked FP8 DeepGEMM; that path separately chooses
   measured MODE=1101 for up to 512 global tokens. The measured improvement is small
   but repeatable: about 0.17% on short decode and 0.24% on the matching prefill
@@ -632,3 +632,24 @@ adds no claim of successful higher-memory startup. Sixteen requests/DP at
 tokens/DP; the0.92 FP8 profile's994709 tokens do not meet that bound.
 Higher-memory, cropped-workspace capacity must be verified by all four
 initialized DP capacities, successful Graph warmup and no runtime preemption.
+
+
+The0.963 capacity v1 candidate failed the startup free-memory check after
+communication initialization:137.72GiB free versus138.66GiB requested.
+It did not load the model or produce a performance measurement. The revised
+v2 candidate uses0.955,256 scheduler tokens and capture sizes through256,
+plus calibrated QKV FP8, norm/round fusion, SWA crop and explicit DSA reserve.
+It passed model startup and Graph warmup. All four DP engines initialized
+1205894 effective KV tokens (17.32 requests at69632), meeting1115136
+page/draft tokens and the explicit1% capacity guard. Each worker reserves
+1583996576 bytes for DSA side pools and fixed workspaces before KV allocation.
+A single BS64 input65536/output4096 benchmark is in progress; no new TPS
+result is claimed from the capacity proof.
+
+The benchmark retains the supplied common Decode window formula:
+max(first-token timestamps) to min(completed last-token timestamps).
+A window observer will terminate this owned benchmark only if a measured
+4096-token request finishes while another request is still queued, which
+proves that common window is empty. This avoids continuing a known invalid
+performance run; observation delays alone do not trigger a restart.
+Candidate source and runtime evidence are under the bs64-capacity directory.
