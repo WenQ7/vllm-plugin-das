@@ -280,3 +280,22 @@ MLA-specific fused kernels for incompatible head dimensions and cache
 semantics. Fusing the remaining stages therefore requires a new Step5-specific
 kernel rather than wiring an existing library operator into this backend.
 
+
+### Grouped provider/head scoring candidate
+
+`VLLM_STEP5_GROUPED_HEAD_INDEXER=1` folds provider groups and all index heads
+into one short-query GEMM, then preserves the original sequential FP32
+head accumulation. It retains the existing e4m3 activation rounding and
+native causal/region masks. The actual TP2 geometry is G=2,H=4,D=256;
+the initial G=1,H=8 prototype is not a production-geometry measurement.
+Twelve native-reference tests passed for queries/request 1--4, group-major
+strided outputs, page-shuffled summaries, and graph replay with changing
+positions, Q and weights. The feature remains opt-in pending a service check.
+Operator measurements including activation rounding are in
+`/tmp/step5_grouped_head_actual_geometry_bench.log`.
+
+The 64K full-graph capacity candidate at memory utilization 0.97 was rejected
+by startup's free-memory check. Lowering dispatch capacity from 2048 to 1024
+by using a 256-token scheduler and smaller capture sizes worked, but 0.955
+still ran out of memory during Graph warmup. Neither candidate reached serving
+state or produced a performance result. Formal memory remains 0.92.

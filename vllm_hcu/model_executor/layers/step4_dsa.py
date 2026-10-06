@@ -1325,6 +1325,18 @@ def short_prefill_indexer_logits(
         )
 
     quantized_q = round_activations_e4m3(index_q)
+    if (
+        os.environ.get("VLLM_STEP5_GROUPED_HEAD_INDEXER", "0") == "1"
+        and num_tokens <= 128 and groups in (1, 2, 4)
+        and heads_per_group in (4, 8) and proxy_dim == 256
+    ):
+        from .step5_grouped_head_indexer import grouped_head_indexer_logits
+        grouped_head_indexer_logits(
+            quantized_q, weights, summary, block_table, request_indices,
+            positions, out, regions_per_page=regions_per_page,
+            queries_per_request=queries_per_request, region_size=region_size,
+        )
+        return
     _short_prefill_indexer_logits_kernel[
         (num_tokens // queries_per_request, triton.cdiv(width, block_k), groups)
     ](
