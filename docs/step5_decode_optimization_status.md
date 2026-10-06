@@ -835,3 +835,36 @@ all 16 prompts/DP together, preserving a common BS64 Decode measurement
 window. All original request lengths, sampling and measurement gates remain
 unchanged. v8 is a candidate until actual startup, capacity, Graph replay
 and the single measured iteration pass.
+
+
+### 2026-10-07: qualified 64-token DeepEP dispatch alignment
+
+V8 completed all actual target/draft Graph captures and `/health` became
+ready. Initialized capacity was 1,123,585 tokens/DP, below the unchanged
+1% guard of 1,125,366. No BS64 benchmark was started. The idle service was
+stopped before native distributed qualification.
+
+`VLLM_STEP5_LL_DISPATCH_ALIGNMENT=64` is now an opt-in for qualified Step5
+SP LL topologies on gfx938. Default alignment remains 128. Every source of
+static capacity (MoE input, scheduler tokens, target Graph capture sizes,
+MTP request padding) remains covered. With scheduler384/capture256/seq16,
+this reduces the native per-rank bound from 256 to 192; TP2/DP4/EP8 and
+all request counts/lengths are unchanged. Invalid alignments and unqualified
+architectures fail before constructing a different buffer.
+
+Native EP8 validation used 352 experts, hidden4096, TopK8, BF16 and FP8
+per-token dispatch, worst-case full occupancy (1536 rows for one expert on
+every destination), live routing changes and inactive rows. Both eager and
+three Graph replays per quantization case matched expected outputs exactly.
+The exact 192-sized RDMA pool was validated, not just a larger pool: its
+size hint is 1,124,603,520 bytes vs 1,499,469,440 for256 (357.5 MiB less).
+BF16/FP8 receive allocations also fall by 176/88 MiB respectively for E44.
+These are allocation reductions, not a measured full-model TPS increase.
+
+26 CPU policy tests passed, covering capacity/padding, model/parallel/SP
+guards, config ownership, validation and architecture guards. Native
+qualification is reproducible via
+`torchrun --standalone --nproc-per-node=8 tests/kernels/qualify_step5_deepep_dispatch_alignment.py`
+on idle gfx938 GPUs; CPU metadata uses Gloo, while dispatch/combine uses
+the real native GPU DeepEP buffer and Graph. Results are written to
+`STEP5_DEEPEP_ALIGNMENT_RESULT` (default `/tmp/step5-deepep-dispatch-alignment.json`).

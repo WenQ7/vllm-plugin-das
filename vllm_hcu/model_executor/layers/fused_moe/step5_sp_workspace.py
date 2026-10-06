@@ -47,8 +47,21 @@ def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
     if full_tokens <= 0:
         raise ValueError("Step5 dispatch requires a positive token capacity")
     local_tokens = (full_tokens + moe_parallel.sp_size - 1) // moe_parallel.sp_size
-    # DeepEP low-latency kernels use 128-token tiles.
-    return ((local_tokens + 127) // 128) * 128
+    # Keep the original alignment unless the qualified gfx938 candidate is
+    # explicitly selected. HCU DeepEP supports 192-row dispatch: its receive
+    # storage need not be padded to 256 merely for the old 128-row bound.
+    raw_alignment = os.getenv("VLLM_STEP5_LL_DISPATCH_ALIGNMENT", "128")
+    if raw_alignment not in ("64", "128"):
+        raise ValueError("Step5 LL dispatch alignment must be 64 or 128")
+    alignment = int(raw_alignment)
+    if alignment == 64:
+        import torch
+        arch = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).gcnArchName.split(":")[0]
+        if arch != "gfx938":
+            raise ValueError("Step5 64-token LL dispatch alignment requires gfx938")
+    return ((local_tokens + alignment - 1) // alignment) * alignment
 
 def bound_sequence_parallel_workspace(moe_config, vllm_config):
     bound = sequence_parallel_dispatch_bound(moe_config, vllm_config)
