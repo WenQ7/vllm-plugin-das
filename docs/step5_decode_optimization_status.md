@@ -95,6 +95,25 @@ On an eight-card node the smallest valid DCP topology is TP8 + DP1 + DCP2,
 which loses DP4 and is a different performance target. The formal TP2 launcher
 fails early with this explanation when `STEP5_DCP_SIZE` is not 1.
 
+## LightOP and AITER kernel audit
+
+The installed LightOP and AITER packages were checked against the actual TP2
+Step5 geometry: 32 local Q heads, two local KV heads, head dimension 192, and
+`K=4096,N=6912` for QKV. AITER `fused_qk_rmsnorm_rope` and LightOP
+`split_qkv_rms_rotary_embedding_fuse_with_kv_store_quant` both reject this
+geometry because their reviewed paths require head dimension 128. LightOP's
+sparse-attention package exports index transforms and top-k helpers, but no
+sparse attention compute kernel. AITER's sparse MLA kernel requires its MLA
+cache layout and power-of-two dimensions, which do not match Step5's separate
+GQA K/V cache and 192-dimensional heads.
+
+For QKV, LightOP's small-M smooth-GEMM table has no tuned
+`N=6912,K=4096` entry. Its public channel-wise hipBLASLt path is already the
+production backend and remains faster than the installed AITER alternatives in
+the measurements above. Therefore none of the installed library kernels can
+replace the remaining Step5-specific decode stages without changing semantics
+or regressing the measured shape.
+
 ## Remaining kernel work
 
 Short MTP queries now batch scoring across requests, and the BS32 Q/K
