@@ -67,8 +67,15 @@ and the same 64K decode topology unless a row explicitly says operator-only.
 - Prefill radix selection now packs physical regions and appends the current
   causal region in the same kernel. At 64K/top-512 this reduces the selection
   metadata stage from 0.1184 ms to 0.1128 ms at BS32 (5.0%), and from 0.1537 ms
-  to 0.1470 ms at BS64 (4.5%), with identical packed slots, counts, and logical
-  IDs.
+  to 0.1470 ms at BS64 (4.5%). Short verification no longer allocates or writes
+  logical IDs that its untiled Attention kernel does not consume; at 8192
+  regions this reduces 32/64/128-row selection from
+  0.1130/0.1135/0.1481 ms to 0.1058/0.1060/0.1393 ms, with identical packed
+  slots and counts. Long tiled prefill still retains logical IDs.
+  A warmed BS32 check after combining the later exact indexer, direct-output,
+  merge-wave, and metadata changes kept identical MTP acceptance but measured
+  1593.50/527.73 total/output token/s versus 1598.64/529.43 immediately before
+  them (-0.32%), so no additional BS32 service-level gain is claimed.
 
 ## Rejected after measurement
 

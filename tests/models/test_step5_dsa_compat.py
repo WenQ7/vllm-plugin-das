@@ -538,6 +538,18 @@ def test_fused_step5_prefill_metadata_matches_reference():
         assert torch.equal(actual[0], expected[0])
         assert torch.equal(actual[1], expected[1])
         assert torch.equal(actual[2], expected[2])
+        packed_only = prefill_sparse_meta_fused(
+            scores,
+            positions,
+            block_table,
+            requests,
+            topk=topk,
+            region_size=8,
+            regions_per_page=regions_per_page,
+            return_logical_ids=False,
+        )
+        assert torch.equal(packed_only[0], expected[0])
+        assert torch.equal(packed_only[1], expected[1])
     finally:
         kernels._radix_topk_threshold = original_threshold
         kernels.region_topk_ids = original_ids

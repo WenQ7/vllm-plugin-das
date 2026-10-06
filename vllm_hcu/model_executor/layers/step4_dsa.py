@@ -2065,7 +2065,9 @@ class Step4SparsePlan:
     not interchangeable with those logical ids.
     """
 
-    prefill: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+    prefill: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor
+    ] | None = None
     decode: tuple[torch.Tensor, torch.Tensor] | None = None
     # The metadata this plan was built from. The impl compares it by identity:
     # the indexer and the attention layer are two separate ops in the compiled
@@ -2134,7 +2136,25 @@ def build_plan(
             if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}
             else prefill_sparse_meta
         )
-        packed, counts, logical_ids = prefill_meta(
+        prefill_tokens = attn_metadata.num_actual_tokens - ndt
+        verification = bool(
+            attn_metadata.schedule is not None
+            and attn_metadata.schedule.verification
+        )
+        capturing = (
+            torch.cuda.is_available()
+            and torch.cuda.is_current_stream_capturing()
+        )
+        short_query = 0 < prefill_tokens <= 64 or (
+            prefill_tokens <= 128 and (verification or capturing)
+        )
+        need_logical_ids = not (
+            os.environ.get("VLLM_STEP5_DSA_SHORT_QUERY", "0") == "1"
+            and short_query
+            and not PREFILL_QK_FP8
+            and not PREFILL_PV_FP8
+        )
+        selected = prefill_meta(
             prefill_logits,
             q_positions.repeat(num_kv_groups),
             attn_metadata.block_table,
@@ -2142,8 +2162,13 @@ def build_plan(
             topk=topk,
             region_size=REGION_BLOCK_SIZE,
             regions_per_page=regions_per_page,
-            return_logical_ids=True,
+            return_logical_ids=need_logical_ids,
         )
+        if need_logical_ids:
+            packed, counts, logical_ids = selected
+        else:
+            packed, counts = selected
+            logical_ids = None
         plan.prefill = (
             packed,
             counts,
