@@ -23,6 +23,15 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   score stage improved from 1.2004 ms to 0.3430 ms at total BS32 (3.50x), and
   from 2.3946 ms to 0.6778 ms at total BS64 (3.53x), with bit-identical fp32
   scores.
+- The MTP3 scorer now puts the four consecutive queries of each request into
+  one tensor-core M tile and reuses its summary K tile. The per-layer scorer at
+  total BS32 improved from 0.3723 ms to 0.1145 ms (3.25x); at BS64 it improved
+  from 0.7241 ms to 0.2096 ms (3.45x), with bit-identical scores including
+  groups that cross a region boundary. With synthetic acceptance fixed at
+  61.21%, the BS32 1024-to-512 service comparison improved total/output
+  throughput from 1557.44/515.79 to 1596.26/528.64 token/s (2.49%), reduced
+  mean TPOT from 50.24 to 48.74 ms, and reduced mean ITL from 141.51 to
+  137.27 ms.
 - Q/K indexer normalization and partial RoPE share one launch when a DP has at
   most 32 target-verification tokens. The BS32 shape improved from 0.01319 ms
   to 0.00966 ms (1.37x), bit-identically. At 64 tokens the joint grid is slower,

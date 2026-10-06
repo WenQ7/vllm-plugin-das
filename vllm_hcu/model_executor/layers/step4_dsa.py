@@ -928,6 +928,7 @@ def _short_prefill_indexer_logits_kernel(
     regions_per_page: tl.constexpr,
     region_size: tl.constexpr,
     query_dtype: tl.constexpr,
+    QUERIES_PER_REQUEST: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ) -> None:
@@ -939,61 +940,64 @@ def _short_prefill_indexer_logits_kernel(
     DSA layer at total BS32 or BS64 while retaining the same dot-product and
     head accumulation order.
     """
-    token = tl.program_id(0)
+    token_base = tl.program_id(0) * QUERIES_PER_REQUEST
     k_block = tl.program_id(1)
     group = tl.program_id(2)
 
     queries = tl.arange(0, BLOCK_Q)
+    tokens = token_base + queries
+    query_ok = (queries < QUERIES_PER_REQUEST) & (tokens < num_tokens)
     keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
     dims = tl.arange(0, proxy_dim)
-    request = tl.load(request_indices_ptr + token).to(tl.int64)
-    visible = tl.load(positions_ptr + token).to(tl.int32) // region_size
-    key_ok = keys < visible
+    request = tl.load(request_indices_ptr + token_base).to(tl.int64)
+    visible = (
+        tl.load(positions_ptr + tokens, mask=query_ok, other=0).to(tl.int32)
+        // region_size
+    )
+    max_visible = tl.max(visible, axis=0)
+    key_load_ok = keys < max_visible
 
     pages = tl.load(
         block_table_ptr
         + request * stride_bt_req
         + keys // regions_per_page,
-        mask=key_ok,
+        mask=key_load_ok,
         other=0,
     ).to(tl.int64)
     slots = pages * regions_per_page + keys % regions_per_page
     key_tile = tl.load(
         summary_ptr + slots[None, :] * stride_s_row + dims[:, None],
-        mask=key_ok[None, :],
+        mask=key_load_ok[None, :],
         other=0.0,
     ).to(query_dtype)
 
-    query_ok = queries < 1
     accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
     for head in tl.static_range(heads_per_group):
         query_tile = tl.load(
             index_q_ptr
-            + token * stride_q_token
+            + tokens[:, None] * stride_q_token
             + group * stride_q_group
             + head * stride_q_head
-            + dims[None, :]
-            + queries[:, None] * 0,
+            + dims[None, :],
             mask=query_ok[:, None],
             other=0.0,
         )
         head_weight = tl.load(
             weights_ptr
-            + token * stride_w_token
+            + tokens * stride_w_token
             + group * stride_w_group
-            + head
+            + head,
+            mask=query_ok,
+            other=0.0,
         ).to(tl.float32)
         scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
-        accumulator += tl.maximum(scores, 0.0) * head_weight
+        accumulator += tl.maximum(scores, 0.0) * head_weight[:, None]
 
-    row = group * num_tokens + token
+    rows = group * num_tokens + tokens
     tl.store(
-        out_ptr
-        + row * stride_out_row
-        + keys[None, :]
-        + queries[:, None] * 0,
+        out_ptr + rows[:, None] * stride_out_row + keys[None, :],
         accumulator,
-        mask=query_ok[:, None] & key_ok[None, :],
+        mask=query_ok[:, None] & (keys[None, :] < visible[:, None]),
     )
 
 
@@ -1009,10 +1013,19 @@ def short_prefill_indexer_logits(
     regions_per_page: int,
     region_size: int = REGION_BLOCK_SIZE,
     block_k: int = 128,
+    queries_per_request: int = 1,
 ) -> None:
-    """Batched request-aware indexer scoring for MTP verification queries."""
+    """Batched request-aware indexer scoring for MTP verification queries.
+
+    Each ``queries_per_request`` group must be contiguous and belong to one
+    request so its rows can reuse the same summary tile.
+    """
     num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
     width = out.shape[1]
+    if queries_per_request not in (1, 2, 3, 4):
+        raise ValueError("queries_per_request must be between one and four")
+    if num_tokens % queries_per_request:
+        raise ValueError("query count must be divisible by queries_per_request")
     if request_indices.numel() != num_tokens or positions.numel() != num_tokens:
         raise ValueError(
             "short-prefill indexer needs one request and position per query; "
@@ -1033,7 +1046,7 @@ def short_prefill_indexer_logits(
 
     quantized_q = round_activations_e4m3(index_q)
     _short_prefill_indexer_logits_kernel[
-        (num_tokens, triton.cdiv(width, block_k), groups)
+        (num_tokens // queries_per_request, triton.cdiv(width, block_k), groups)
     ](
         quantized_q,
         summary,
@@ -1058,6 +1071,7 @@ def short_prefill_indexer_logits(
         query_dtype=(
             tl.bfloat16 if quantized_q.dtype is torch.bfloat16 else tl.float16
         ),
+        QUERIES_PER_REQUEST=queries_per_request,
         BLOCK_Q=16,
         BLOCK_K=block_k,
     )
@@ -2408,6 +2422,13 @@ class Step4DSAState:
                 torch.zeros(num_tokens, dtype=torch.int32, device=device),
                 self._decode_logits[: groups * num_tokens, : self.graph_regions],
                 regions_per_page=self.regions_per_page,
+                queries_per_request=(
+                    4
+                    if os.environ.get(
+                        "VLLM_STEP5_GROUPED_MTP_INDEXER", "0"
+                    ) == "1"
+                    else 1
+                ),
             )
 
     def rope_tables(
@@ -3436,6 +3457,17 @@ class Step4Indexer:
         )
         if batched_short_prefill:
             assert md.positions is not None
+            common_qlen = prefill_plans[0].qlen if prefill_plans else 1
+            queries_per_request = (
+                common_qlen
+                if os.environ.get(
+                    "VLLM_STEP5_GROUPED_MTP_INDEXER", "0"
+                ) == "1"
+                and 1 <= common_qlen <= 4
+                and all(plan.qlen == common_qlen for plan in prefill_plans)
+                and num_prefill_tokens % common_qlen == 0
+                else 1
+            )
             short_prefill_indexer_logits(
                 index_q[num_decode_tokens:].contiguous(),
                 weights[num_decode_tokens:].contiguous(),
@@ -3445,6 +3477,7 @@ class Step4Indexer:
                 md.positions[num_decode_tokens:md.num_actual_tokens],
                 prefill_logits,
                 regions_per_page=state.regions_per_page,
+                queries_per_request=queries_per_request,
             )
 
         if DENSE_EQUIV:

@@ -459,6 +459,14 @@ def test_fused_step5_indexer_norm_and_batched_scoring_match_reference():
     )
     assert torch.equal(actual, expected)
 
+    grouped = torch.zeros_like(expected)
+    short_prefill_indexer_logits(
+        index_q, weights, summary, block_table, requests, score_positions, grouped,
+        regions_per_page=regions_per_page, queries_per_request=4,
+    )
+    assert torch.equal(grouped, expected)
+
+
 def test_fused_step5_prefill_metadata_matches_reference():
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP unavailable")
