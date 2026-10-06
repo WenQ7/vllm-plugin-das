@@ -83,7 +83,9 @@ class HcuGPUWorker(Worker):
     def determine_available_memory(self) -> int:
         from vllm_hcu.v1.step5_memory_lifecycle import trace_memory
         trace_memory(self, "before_profile")
-        available = super().determine_available_memory()
+        from vllm_hcu.v1.step5_graph_memory import exact_graph_memory
+        with exact_graph_memory(self.vllm_config):
+            available = super().determine_available_memory()
         trace_memory(self, "after_profile")
         from vllm_hcu.v1.step5_dsa_memory import reserve_step5_dsa_memory
         available = reserve_step5_dsa_memory(self, available)

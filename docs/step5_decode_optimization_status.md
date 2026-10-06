@@ -707,3 +707,25 @@ empty experts, all-empty batches, full-capacity and skewed experts. Live
 output matches the original allocation exactly and output/workspace storage
 canaries remain intact. This is a storage-bound optimization; successful
 higher-scheduler startup and service throughput remain to be established.
+
+
+### Measure all FULL Graphs during Step5 startup
+
+The1024-token capacity v3 service started and captured successfully, but
+initialized only895624--895791 effective KV tokens/DP, below1115136 required
+for16 requests at65536+4096 and four draft slots. No BS64 benchmark was run.
+The native two-sample FULL extrapolation reserved6.24GiB while real Graph
+capture consumed3.08--3.09GiB. This is observed estimation overhead, not
+proof that all of it can safely be reclaimed.
+
+VLLM_STEP5_EXACT_GRAPH_MEMORY=1 opts Step5 MRv2 startup into capturing all
+FULL descriptors in the native temporary profiling pool. Complete measured
+FULL deltas replace extrapolation; PIECEWISE/MTP contributions, native
+profiling cleanup and real capture/replay remain unchanged. Incomplete
+samples retain the original estimate. ContextVar limits the override to the
+owning startup context; normal captures and other threads keep native behavior.
+The formal default remains off until actual startup/capacity evidence.
+Eleven CPU policy tests passed, covering complete/partial samples, the native
+pool-accounting equation, exception cleanup, idempotent installation, real
+capture passthrough, model/parallel guards and thread isolation.
+Evidence: bs64-capacity-20261007/exact_graph_memory_policy_tests.log.
