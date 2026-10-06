@@ -242,8 +242,13 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     block_r = _fit_block_regions(
         min(8, triton.next_power_of_2(slots_per_split)), region_size=region_size,
         block_d=64, element_size=query.element_size())
-    widening_fp8 = key_cache.dtype == torch.float8_e4m3fn
-    stages = 1 if widening_fp8 or block_r < 8 else 2
+    # BW1101 loses occupancy when this HD192 kernel pipelines two K/V tiles:
+    # BLOCK_R=8 already consumes enough LDS that the second stage serializes
+    # waves instead of hiding memory latency. One stage is also faster for the
+    # smaller split windows used by M=1/4/16. At the production top-513 shape
+    # it is 1.06x faster at M=32, 1.80x at M=64, and 3.03x at M=128, with
+    # bit-identical output and LSE.
+    stages = 1
     out = torch.empty((num_splits, num_queries, num_heads, head_dim),
                       device=query.device, dtype=query.dtype)
     lse = torch.empty((num_splits, num_queries, num_heads),

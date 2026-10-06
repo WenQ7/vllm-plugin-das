@@ -10,12 +10,22 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   file through `VLLM_TUNED_CONFIG_FOLDER`. The measured improvement is small
   but repeatable: about 0.17% on short decode and 0.24% on the matching prefill
   comparison.
-- Short Step5 sparse attention uses the FlashAttention sparse path for one to
-  64 query tokens. At the production geometry, single-token decode improved
-  from 0.0892 ms to 0.0391 ms (2.28x), and the 16-token MTP shape improved
-  from 0.1680 ms to 0.0910 ms (1.85x). A BS32 service run improved decode from
-  689.32 to 696.27 token/s (about 1.0%). Long prefill remains on the tiled
-  Triton path.
+- Short Step5 sparse attention uses the FlashAttention-style sparse path for
+  one to 128 target-verification tokens. At the production geometry,
+  single-token decode improved from 0.0892 ms to 0.0391 ms (2.28x), and the
+  16-token MTP shape improved from 0.1680 ms to 0.0910 ms (1.85x). A BS32
+  service run improved decode from 689.32 to 696.27 token/s (about 1.0%). Long
+  prefill remains on the tiled Triton path.
+- The HD192 short-query kernel now uses one software-pipeline stage on BW1101.
+  The previous two-stage launch reduced occupancy because a second K/V tile
+  exceeded the useful LDS working set. At 64K/top-513 the per-layer Attention
+  time improved from 0.3086 to 0.2910 ms at M=32 (1.06x), 0.6106 to 0.3395 ms
+  at M=64 (1.80x), and 1.2131 to 0.4000 ms at M=128 (3.03x). M=1/4/16 and
+  effective region counts 64/256/513 also improved, with bit-identical output
+  and LSE in every comparison. The warmed total-BS32 synthetic service check
+  was neutral within run variance (1596.26/528.64 before versus
+  1586.73/525.49 total/output token/s after), as DP4 maps it to the smallest
+  M=32 target shape; total BS64 maps to the larger M=64 shape.
 - The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
   kernel. It is the fastest installed implementation for this shape.
 - MTP3 short-prefill indexer scoring is batched across requests and reads the
@@ -98,13 +108,15 @@ decode and added initial latency. The formal launcher therefore retains target
   BS32. It did not improve the fixed-acceptance service run: total/output
   throughput changed from 1596.26/528.64 to 1571.71/520.52 token/s and mean
   TPOT increased from 48.74 to 49.71 ms, so the standalone rounding pass stays.
-- Restricting the fused main QK-norm/RoPE kernel to rotary-64 sparse layers
-  was numerically close (maximum BF16 absolute difference 0.03125) and fast as
-  an isolated operator. The service-level difference changed MTP behavior:
-  total/output throughput fell from 1053.79/348.99 to 926.54/306.85 token/s,
-  acceptance fell from 29.82% to 23.94%, and mean ITL changed from 138.68 to
-  139.30 ms. The production profile therefore retains the compiled native
-  QK-norm/RoPE sequence.
+- The fused main QK-norm/RoPE candidate was compared with the deployed
+  Inductor path rather than only with eager PyTorch. Inductor carries FP32
+  normalized values through RoPE before the BF16 store, so eager PyTorch
+  differs by as much as 0.0625. The custom kernel matched compiled output
+  exactly at M=1 and M=32; across the other tested M=4/16/64 shapes only one to
+  three Q elements differed, by at most 0.0078125, and K was exact. It still
+  adds a custom-op boundary around work Inductor already fuses. The earlier
+  service run fell from 1053.79/348.99 to 926.54/306.85 total/output token/s,
+  so the production profile retains the compiled native QK-norm/RoPE sequence.
 - Early shared-expert launch on an auxiliary stream increased the 64K warm
   prefill maximum from 153.7 s to 324.4 s and reduced the observed active
   generation rate to 22.96 token/s. The existing token threshold does not
