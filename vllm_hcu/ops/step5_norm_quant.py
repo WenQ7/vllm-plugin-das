@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Step5 FP32 Gemma norm, explicit BF16 narrowing and E4M3 token quantization.
+"""Step5 Gemma norm, explicit BF16 narrowing and E4M3 token quantization.
 
-The layout is part of the qualified FP32 reduction order. Callers must match
-their native norm profile; these configurations are not automatic model routing.
+Explicit layouts preserve qualified per-row FP32 reduction orders. The auto
+profile chooses from tensor shape metadata; model adoption requires precision
+and performance qualification.
 The operator retains a BF16 hidden tensor for the indexer and gate, and leaves
-the FP32 residual and norm weight untouched. It is not enabled by the model yet.
+the FP32 residual and norm weight untouched. The model candidate is opt-in.
 """
 
 import math
@@ -34,11 +35,11 @@ def fused_norm_quant(X,W,H,Q,S,M:gl.constexpr,EPS:gl.constexpr,ROWS:gl.constexpr
     r=gl.arange(0,RBLOCK,layout=gl.SliceLayout(0,layout))
     acc=gl.full((ROWS,RBLOCK),0.,gl.float32,layout)
     for offset in range(0,4096,RBLOCK):
-        x=gl.load(X+row[:,None]*4096+offset+r[None,:],row[:,None]<M,other=0.)
+        x=gl.load(X+row[:,None]*4096+offset+r[None,:],row[:,None]<M,other=0.).to(gl.float32)
         acc=gl.where(row[:,None]<M,acc+x*x,acc)
     variance=gl.sum(acc,1)/4096.
     i=gl.arange(0,4096,layout=gl.SliceLayout(0,layout))
-    x=gl.load(X+row[:,None]*4096+i[None,:],row[:,None]<M,other=0.)
+    x=gl.load(X+row[:,None]*4096+i[None,:],row[:,None]<M,other=0.).to(gl.float32)
     w=gl.load(W+i)
     n=(x*gl.rsqrt(variance[:,None]+EPS))*(w[None,:]+1.)
     h=n.to(gl.bfloat16)
@@ -55,15 +56,15 @@ def fused_norm_quant(X,W,H,Q,S,M:gl.constexpr,EPS:gl.constexpr,ROWS:gl.constexpr
 def _validate(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, layout: int
 ) -> None:
-    if layout < 0 or layout >= len(_LAYOUTS):
+    if layout < -1 or layout >= len(_LAYOUTS):
         raise ValueError("Unqualified Step5 norm/quant layout")
     if not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError("Step5 norm epsilon must be finite and positive")
     if (
-        x.ndim != 2 or x.shape[1] != 4096 or x.dtype != torch.float32
+        x.ndim != 2 or x.shape[1] != 4096 or x.dtype not in (torch.float32, torch.bfloat16)
         or not x.is_contiguous() or not x.is_cuda
     ):
-        raise ValueError("Step5 norm/quant requires contiguous FP32 GPU [M,4096]")
+        raise ValueError("Step5 norm/quant requires contiguous FP32/BF16 GPU [M,4096]")
     if (
         weight.shape != (4096,) or weight.dtype != torch.float32
         or not weight.is_contiguous() or weight.device != x.device
@@ -91,6 +92,9 @@ def _impl(
         raise ValueError("Step5 explicit-layout norm/quant is qualified only on gfx938")
     h, q, scale = _fake(x, weight, epsilon, layout)
     if x.shape[0]:
+        if layout == -1:
+            # Shape metadata only; no device count or tensor value is read.
+            layout = 4 if x.shape[0] == 4 or 16 < x.shape[0] <= 256 else 0
         rows, rblock, spt, wrow, warps = _LAYOUTS[layout]
         fused_norm_quant[(triton.cdiv(x.shape[0], rows),)](
             x, weight, h, q, scale, x.shape[0], epsilon, rows, rblock, spt, wrow, warps,
@@ -108,10 +112,12 @@ direct_register_custom_op(
 
 
 def step5_gemma_norm_fp8_quant(
-    x: torch.Tensor, weight: torch.Tensor, epsilon: float, layout: int
+    x: torch.Tensor, weight: torch.Tensor, epsilon: float, layout: int = -1
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 hidden, E4M3FN hidden and FP32 [M,1] scales.
 
+    Layout -1 chooses the small-M or large-M profile from host shape metadata.
+    BF16 draft inputs are promoted inside the kernel; norm weights remain FP32.
     Layout IDs 0/1/2/3 match respectively rows1/R2048, rows1/R4096,
     rows2/R2048 and rows4/R2048 native norm profiles. Layout4 retains
     the per-row order of profiles2/3 with one row and four warps per CTA,

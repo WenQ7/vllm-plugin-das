@@ -38,6 +38,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
+from vllm_hcu.ops.step5_norm_quant import step5_gemma_norm_fp8_quant
 from vllm.model_executor.layers.activation import SiluAndMul, SwigluStepAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import (
@@ -92,6 +93,7 @@ from vllm_hcu.model_executor.layers.step5_projection import (
 from vllm_hcu.model_executor.layers.step5_qkv_fp8 import Step5QKVFp8LinearMethod
 
 logger = init_logger(__name__)
+norm_quant_logger = init_logger("vllm.hcu.step5.norm_quant")
 
 # Checkpoint tensors that belong to the DSA indexer. Only consulted when DSA is
 # switched off: the dense-equivalent path does not allocate them, and they are
@@ -486,10 +488,25 @@ class Step5Attention(nn.Module):
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor,
+        qkv_quantized: torch.Tensor | None = None,
+        qkv_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         projected_index = None
         projected_gate = None
-        if getattr(self, "step5_full_projection_ready", False):
+        if (qkv_quantized is None) != (qkv_scale is None):
+            raise ValueError("Step5 prequantized QKV requires both values and scales")
+        if qkv_quantized is not None:
+            if (
+                not self.qkv_fp8_w8a8 or self.merge_attention_projection
+                or getattr(self, "step5_full_projection_ready", False)
+                or self.qkv_proj.gather_output
+            ):
+                raise ValueError("Step5 norm/quant fusion requires local FP8 QKV")
+            bias = self.qkv_proj.bias if not self.qkv_proj.skip_bias_add else None
+            qkv = self.qkv_proj.quant_method.apply_prequantized(
+                self.qkv_proj, qkv_quantized, qkv_scale, bias
+            )
+        elif getattr(self, "step5_full_projection_ready", False):
             from vllm_hcu.model_executor.layers.step5_full_projection import full_projection
             qkv, projected_index, projected_gate = full_projection(self, hidden_states)
         elif self.merge_attention_projection:
@@ -777,6 +794,28 @@ class Step5DecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.prefix = prefix
+        fusion = os.environ.get("VLLM_STEP5_QKV_NORM_FP8_FUSION", "0")
+        if fusion not in {"0", "1"}:
+            raise ValueError("VLLM_STEP5_QKV_NORM_FP8_FUSION must be 0 or 1")
+        self.fused_input_norm_fp8 = fusion == "1"
+        if self.fused_input_norm_fp8:
+            if (
+                not self.fp32_residual_connection
+                or self.compute_dtype != torch.bfloat16 or self.hidden_size != 4096
+                or not self.self_attn.qkv_fp8_w8a8
+                or self.self_attn.merge_attention_projection
+                or os.environ.get("VLLM_STEP5_FULL_MIXED_PROJECTION", "0") == "1"
+                or self.self_attn.qkv_proj.gather_output
+            ):
+                raise ValueError(
+                    "Step5 norm/FP8 fusion requires BF16 compute, FP32 norms, "
+                    "4096 hidden size and local FP8 QKV without merged projections"
+                )
+            norm_quant_logger.info_once(
+                "Step5 fused input norm/FP8 candidate enabled; BF16 hidden is "
+                "retained for indexer/gate; prequantized QKV uses LightOp GEMM.",
+                scope="local",
+            )
 
     def _feed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.use_moe:
@@ -801,10 +840,19 @@ class Step5DecoderLayer(nn.Module):
         # input dtype, so an fp32 input yields an fp32 norm output that has to be
         # narrowed explicitly before the GEMMs.
         residual = hidden_states
-        hidden = self.input_layernorm(residual).to(self.compute_dtype)
-        residual = (
-            residual + self.self_attn(positions=positions, hidden_states=hidden).float()
-        )
+        if self.fused_input_norm_fp8:
+            hidden, quantized, scale = step5_gemma_norm_fp8_quant(
+                residual, self.input_layernorm.weight,
+                self.input_layernorm.variance_epsilon,
+            )
+            attention = self.self_attn(
+                positions=positions, hidden_states=hidden,
+                qkv_quantized=quantized, qkv_scale=scale,
+            )
+        else:
+            hidden = self.input_layernorm(residual).to(self.compute_dtype)
+            attention = self.self_attn(positions=positions, hidden_states=hidden)
+        residual = residual + attention.float()
         hidden = self.post_attention_layernorm(residual).to(self.compute_dtype)
         return residual + self._feed_forward(hidden).float()
 

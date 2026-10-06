@@ -52,6 +52,22 @@ esac
 export VLLM_STEP5_FUSED_QK_NORM_ROPE=0
 export VLLM_STEP5_MERGED_ATTENTION_PROJECTION=0
 export VLLM_STEP5_FULL_MIXED_PROJECTION=0
+# Candidate only; formal default remains disabled pending model qualification.
+export VLLM_STEP5_QKV_NORM_FP8_FUSION="${VLLM_STEP5_QKV_NORM_FP8_FUSION:-0}"
+case "$VLLM_STEP5_QKV_NORM_FP8_FUSION" in
+  0) ;;
+  1)
+    [[ "${VLLM_STEP5_QKV_FP8_W8A8:-0}" == 1 ]] || {
+      echo "Norm/FP8 fusion requires VLLM_STEP5_QKV_FP8_W8A8=1" >&2
+      exit 2
+    }
+    [[ "${VLLM_HCU_USE_CUSTOM_OPS:-1}" == 1 && "${VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM:-1}" == 1 ]] || {
+      echo "Norm/FP8 fusion requires the LightOp quantization/GEMM path" >&2
+      exit 2
+    }
+    ;;
+  *) echo "VLLM_STEP5_QKV_NORM_FP8_FUSION must be 0 or 1" >&2; exit 2;;
+esac
 export VLLM_SERVER_DEV_MODE=1 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600
 unset NCCL_TOPO_FILE VLLM_STEP5_HOST_REQUEST_INDICES
 if [[ "$stage" == prefill ]]; then

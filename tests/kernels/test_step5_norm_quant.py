@@ -61,7 +61,7 @@ def test_compiled_dynamic_custom_op_and_empty():
 
 
 @pytest.mark.parametrize("layout,epsilon", [
-    (-1, 1e-5), (5, 1e-5), (0, 0.), (0, float("nan")),
+    (-2, 1e-5), (5, 1e-5), (0, 0.), (0, float("nan")),
 ])
 def test_invalid_configuration(layout, epsilon):
     x = torch.empty((1, 4096), device="cuda", dtype=torch.float32)
@@ -77,3 +77,48 @@ def test_rejects_bf16_norm_weight_and_noncontiguous_input():
         step5_gemma_norm_fp8_quant(x, w.bfloat16(), 1e-5, 0)
     with pytest.raises(ValueError):
         step5_gemma_norm_fp8_quant(x.t().contiguous().t(), w, 1e-5, 0)
+
+@pytest.mark.parametrize("m", [1, 4, 8, 16, 32, 64, 128, 256, 384])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_auto_profile_fp64_norm_oracle(m, dtype):
+    torch.manual_seed(4747 + m)
+    x = torch.randn((m, 4096), device="cuda", dtype=dtype)
+    weight = torch.randn((4096,), device="cuda", dtype=torch.float32) * 0.03
+    before = x.clone()
+    hidden, quantized, scale = step5_gemma_norm_fp8_quant(x, weight, 1e-5)
+    # Preserve the required FP32 Gamma addition, then independently evaluate
+    # variance/rsqrt/products in FP64. No loose BF16 relative tolerance.
+    gamma = (weight + 1.).double()
+    exact = x.double() * torch.rsqrt(
+        x.double().square().mean(-1, keepdim=True) + 1e-5
+    ) * gamma
+    nearest = exact.bfloat16()
+    mask = hidden != nearest
+    if mask.any():
+        # Only adjacent BF16 values near an independently computed midpoint
+        # are permitted for FP32 normalization reassociation.
+        a = hidden.view(torch.int16)[mask].int()
+        b = nearest.view(torch.int16)[mask].int()
+        assert ((a - b).abs() == 1).all()
+        midpoint = (hidden.double()[mask] + nearest.double()[mask]) * 0.5
+        assert ((exact[mask] - midpoint).abs() <=
+                8 * torch.finfo(torch.float32).eps *
+                exact[mask].abs().clamp_min(1e-30)).all()
+    torch.testing.assert_close(x, before, rtol=0, atol=0)
+    expected_scale = (hidden.double().abs().amax(-1, keepdim=True) / 448.).float()
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+    # Compare FP8 rounding to an independent exact scale, permitting only
+    # adjacent E4M3 representatives at their midpoint.
+    exact_q = hidden.double() * 448. / hidden.double().abs().amax(
+        -1, keepdim=True
+    )
+    nearest_q = exact_q.float().to(torch.float8_e4m3fn)
+    mask_q = quantized.float() != nearest_q.float()
+    if mask_q.any():
+        a = quantized.view(torch.uint8)[mask_q].int()
+        b = nearest_q.view(torch.uint8)[mask_q].int()
+        assert ((a - b).abs() == 1).all()
+        mid = (quantized.double()[mask_q] + nearest_q.double()[mask_q]) * .5
+        assert ((exact_q[mask_q] - mid).abs() <=
+                8 * torch.finfo(torch.float32).eps *
+                exact_q[mask_q].abs().clamp_min(1e-30)).all()

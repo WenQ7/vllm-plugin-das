@@ -22,7 +22,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTokenSym,
     kFp8StaticChannelSym,
 )
-from vllm_hcu.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
 logger = init_logger(__name__)
 
@@ -237,4 +237,36 @@ class Step5QKVFp8LinearMethod(UnquantizedLinearMethod):
             A=quantized, B=layer.weight, As=scale, Bs=layer.weight_scale,
             out_dtype=torch.bfloat16, bias=bias,
             output_shape=[*original_shape[:-1], layer.weight.shape[1]],
+        )
+
+
+    def apply_prequantized(
+        self, layer: nn.Module, quantized: torch.Tensor, scale: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the existing GEMM without requantizing the fused norm output."""
+        if (
+            self.kernel is None or not self.use_lightop_quant
+            or getattr(type(self.kernel), "_hcu_fp8_backend", None) != "lightop"
+        ):
+            raise RuntimeError("Step5 prequantized QKV requires finalized LightOp FP8")
+        if (
+            quantized.ndim != 2 or quantized.dtype != torch.float8_e4m3fn
+            or quantized.shape[1] != layer.weight.shape[0]
+            or not quantized.is_contiguous()
+            or scale.shape != (quantized.shape[0], 1)
+            or scale.dtype != torch.float32 or not scale.is_contiguous()
+            or quantized.device != layer.weight.device
+            or scale.device != quantized.device
+        ):
+            raise ValueError("Invalid Step5 prequantized QKV activations or scales")
+        if quantized.shape[0] == 0:
+            return torch.empty(
+                (0, layer.weight.shape[1]), device=quantized.device,
+                dtype=torch.bfloat16,
+            )
+        return self.kernel.apply_scaled_mm(
+            A=quantized, B=layer.weight, As=scale, Bs=layer.weight_scale,
+            out_dtype=torch.bfloat16, bias=bias,
+            output_shape=[quantized.shape[0], layer.weight.shape[1]],
         )
