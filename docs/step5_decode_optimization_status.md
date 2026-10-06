@@ -1129,3 +1129,26 @@ active.
 
 Evidence: dcp2-prototype-20261007/gpu_qualification_summary.json,
 gpu_qualification-rank0/1.json.before-graph-reset, gpu_graph_lifecycle.log.
+
+
+### Native E44 LL mode/CU screen
+
+A single native operator screen completed240 cases: gate/up E44/N3072/K4096
+and down E44/N4096/K1536, the actual packed GEMM dimensions for intermediate
+width1536; global token buckets32/64/128/256/512, uniform/skewed routing,
+native modes1100/1101/1102 and launchCU32/64/128/256. Physical deviceCU=64,
+native default launchCU=256; static per-expert capacity1536 matches the
+selected BS64 profile. All variants passed active-output checks and Graph
+replay after device routing counts changed, against mode1101/defaultCU.
+Selected expert rows also passed an independent unpacked FP32 GEMM oracle.
+
+Mode1101 remains the best family. CU128 showed small changes, generally
+0-3%, so no new CU override is adopted from this single ordered screen.
+The native low_latency_grouped_gemm wrapper exposes MODE and cu; arbitrary
+tile/warps/stages JSON entries are ignored on that path. Dedicated native
+tile-family work remains pending. This is native operator evidence, not a
+model TPS gain, and does not turn the legacy E44/N1536 MoE helper config into
+native LL tile tuning.
+
+Evidence: bs64-capacity-20261007/native_step5_ll_modes_cu_screen.json,
+native_step5_ll_modes_cu_decision.json and screen_native_step5_ll_modes_cu.py.
