@@ -222,6 +222,23 @@ def _sparse_attn_short_prefill_hd192_kernel(
     )
 
 
+
+def short_query_num_splits(num_queries: int, num_kv_groups: int, topk: int) -> int:
+    """BW1101 split policy for the stage-1 HD192 verification kernel."""
+    rows = num_queries * num_kv_groups
+    if rows <= 8:
+        splits = 32
+    elif rows <= 32:
+        splits = 16
+    elif rows <= 128:
+        splits = 4
+    elif rows <= 256:
+        splits = 2
+    else:
+        splits = 1
+    # Each split must still own at least two BLOCK_R=8 region tiles.
+    return max(1, min(splits, topk // 16))
+
 def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions,
                                   region_counts, *, num_kv_groups, region_size=8,
                                   softmax_scale=None, num_splits=1,

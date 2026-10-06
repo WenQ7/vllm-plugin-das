@@ -26,6 +26,14 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   was neutral within run variance (1596.26/528.64 before versus
   1586.73/525.49 total/output token/s after), as DP4 maps it to the smallest
   M=32 target shape; total BS64 maps to the larger M=64 shape.
+- The stage-1 short-query kernel uses a BW1101-specific split schedule instead
+  of stopping as soon as its grid fills the 64 CUs. At top-513 this reduces
+  M=32 from 0.2910 to 0.1344 ms (2.17x), M=64 from 0.3394 to 0.2179 ms
+  (1.56x), and M=128 from 0.4002 to 0.3693 ms (1.08x). Against the immediately
+  preceding stage-1 service run, with identical synthetic MTP acceptance and
+  per-position accepted-token counts, total/output throughput improved from
+  1586.73/525.49 to 1598.64/529.43 token/s (+0.75%), mean TPOT fell from
+  49.56 to 49.17 ms, and mean ITL fell from 135.35 to 134.26 ms.
 - The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
   kernel. It is the fastest installed implementation for this shape.
 - MTP3 short-prefill indexer scoring is batched across requests and reads the

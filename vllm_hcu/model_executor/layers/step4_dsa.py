@@ -49,6 +49,7 @@ from vllm_hcu.model_executor.layers.step5_dsa_norm_rope import (
 from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
     sparse_attention_short_prefill,
     prefill_request_indices_device,
+    short_query_num_splits,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -2016,9 +2017,16 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                     and not PREFILL_QK_FP8
                     and not PREFILL_PV_FP8
                 ):
-                    splits = _decode_num_splits(
-                        prefill_tokens * num_kv_groups, packed.shape[1]
-                    )
+                    if os.environ.get(
+                        "VLLM_STEP5_DSA_TUNED_SHORT_SPLITS", "0"
+                    ) == "1":
+                        splits = short_query_num_splits(
+                            prefill_tokens, num_kv_groups, packed.shape[1]
+                        )
+                    else:
+                        splits = _decode_num_splits(
+                            prefill_tokens * num_kv_groups, packed.shape[1]
+                        )
                     out_p, lse_p = sparse_attention_short_prefill(
                         query[ndt:num_tokens], k_flat, v_flat, packed, counts,
                         num_kv_groups=num_kv_groups,
