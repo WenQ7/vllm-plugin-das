@@ -331,3 +331,15 @@ per-request bound from 2622750720 to 2694316032 bytes in the native calculator
 (+2.73%). Smaller exact groups add substantial scheduler/group overhead.
 No speculative KV regrouping change was adopted. Audit:
 `/tmp/step5_kv_group_cost_audit.py`, `/tmp/step5_kv_group_cost_audit.log`.
+
+The first BS32 long-context wrapper incorrectly imported the metadata adapter
+before setting its DP argument, so the adapter retained DP=1 and capacity
+preflight skipped the case. No measured 64K iteration ran in that attempt.
+The corrected wrapper explicitly sets DP=4, retains the 0.9 guard, reads all
+four current startup capacities, and is running one BS32 iteration:
+`/tmp/step5_grouped_head_graph64k_bs32_v2_benchmark.py`.
+Result and per-iteration sidecar:
+`/tmp/step5_grouped_head_graph64k_bs32_v2_result.json` and
+`/tmp/step5_grouped_head_graph64k_bs32_v2_result.iterations.json`.
+The manifest also records preemption counters, so queued/preempted runs cannot
+be passed off as an unpreempted Decode comparison.
