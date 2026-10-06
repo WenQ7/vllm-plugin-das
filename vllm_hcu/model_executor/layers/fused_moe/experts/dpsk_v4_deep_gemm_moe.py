@@ -34,6 +34,7 @@ from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExpert
 from vllm_hcu.model_executor.layers.fused_moe.step5_ht_workspace import (
     compact_aligned_rows,
     compact_moe_permute,
+    compact_workspace_parallelism_supported,
     prepare_compact_metadata,
     Step5HTTokensMetadata,
 )
@@ -188,8 +189,10 @@ class DeepEPDeepGemmContiguousExperts(TritonExperts):
             and self.WEIGHT_LAYOUT == "contiguous"
             and "Step5ForConditionalGeneration"
             in (config.model_config.hf_config.architectures or [])
-            and config.parallel_config.tensor_parallel_size == 1
-            and config.parallel_config.data_parallel_size == 8
+            and compact_workspace_parallelism_supported(
+                config.parallel_config.tensor_parallel_size,
+                config.parallel_config.data_parallel_size,
+            )
             and not quant_config.use_int8_w8a8
         )
         if self._compact_step5_ht:

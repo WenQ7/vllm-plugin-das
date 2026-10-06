@@ -37,13 +37,17 @@ def test_fresh_dispatch_counts_and_fallbacks():
      calls.append(True);return oracle(ids,local,map)
     names={"Step5HTTokensMetadata","Step5HTDispatchTokensMetadata",
      "mark_fresh_dispatch_metadata","_dispatch_counts_match_local_map",
-     "_tensor_version","prepare_compact_metadata","aligned_expert_rows"}
+     "_tensor_version","prepare_compact_metadata","aligned_expert_rows",
+     "compact_workspace_parallelism_supported"}
     tree=ast.parse(source.read_text())
     nodes=[n for n in tree.body if isinstance(n,(ast.ClassDef,ast.FunctionDef)) and n.name in names]
     scope={"torch":TorchProxy(),"dataclass":dataclass,"ExpertTokensMetadata":ExpertTokensMetadata,"count_expert_num_tokens":recount}
     exec(compile(ast.Module(body=nodes,type_ignores=[]),str(source),"exec"),scope)
     mark=scope["mark_fresh_dispatch_metadata"];prepare=scope["prepare_compact_metadata"]
     rows=[]
+    supported=scope["compact_workspace_parallelism_supported"]
+    assert supported(1,8) and supported(2,4)
+    assert not supported(4,2) and not supported(8,1)
     def setup(offset=4):
      ids=torch.tensor([[4,5,0,-1],[6,7,0,-1],[4,7,0,-1]],dtype=torch.int64)
      map=torch.full((12,),-1,dtype=torch.int32);map[offset:offset+4]=torch.arange(4,dtype=torch.int32)
