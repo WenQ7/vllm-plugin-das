@@ -61,6 +61,21 @@ quantization. AITER has no `BW200B/BW1101-GEMM-A8W8` tuning file in the
 installed package. LightOP W8A16 was also slower, so retaining an extra BF16
 weight copy for a shape switch would add memory without a decode gain.
 
+### Full target-model graph
+
+The target model can now capture all six uniform MTP3 graph sizes. Its
+four-query DSA schedule keeps fixed addresses for compression, rollback
+prefixes, request indices, and score storage, and is bit-identical to the
+general scheduler. A 32-request drain test with staggered 16--78 token outputs
+completed 32/32 requests without a VM fault or worker failure.
+
+The one-run service A/B did not justify enabling it: the same synthetic workload
+took 9.56 seconds with `FULL_AND_PIECEWISE` and 6.67 seconds with `PIECEWISE`, a
+43.3% regression. The completion-drain interval was essentially unchanged
+(2.92 versus 2.94 seconds), so the full target graph did not improve steady
+decode and added initial latency. The formal launcher therefore retains target
+`PIECEWISE`; the MTP draft keeps its verified full decode graph.
+
 ### Projection and shared-expert fusion
 
 - The TP2 merged projection service comparison regressed decode from the
@@ -99,26 +114,6 @@ weight copy for a shape switch would add memory without a decode gain.
   overlap DeepEP in the required MTP3 graph-enabled profile.
 
 ## Constraints that cannot be enabled by a flag
-
-### Full target-model graph
-
-The current fixed-address DSA schedule correctly captures one-token decode.
-MTP3 target verification is a four-query prefill-shaped step. It can cross a
-compression-region boundary and must preserve up to two rollback prefixes.
-Changing the backend declaration from `UNIFORM_SINGLE_TOKEN_DECODE` to
-`UNIFORM_BATCH` would freeze pending-row assignments and sparse score widths
-from the capture step, producing wrong attention after replay. A correct full
-target graph needs a persistent four-query schedule, a batched request/query
-indexer scorer, and graph-stable rollback buffers. It also needs the vLLM Eagle
-path to allow the draft model while the target uses a full graph. A persistent
-four-query schedule and fixed-width scorer were prototyped and
-passed operator-equivalence tests. Service tests still hit an HSA VM fault when
-requests completed and the per-DP batch drained, both with padded graph replay
-and with exact 4-token capture sizes. The target therefore stays `PIECEWISE`;
-the MTP draft keeps its verified `FULL_DECODE_ONLY` graph. The short-prefill
-scorer no longer specializes on the live token count and is compiled during
-startup warmup, avoiding runtime Triton compilation on the first target step or
-as the batch shrinks.
 
 ### TP2 + DP4 + DCP2
 

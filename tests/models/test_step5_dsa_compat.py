@@ -2,6 +2,7 @@
 import struct
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
@@ -593,3 +594,115 @@ def test_decode_token_insert_matches_scatter_and_replays_graph():
         expected_z.scatter_(1, scatter_index, replay_z)
         torch.testing.assert_close(static_key, expected_key, rtol=0, atol=0)
         torch.testing.assert_close(static_z, expected_z, rtol=0, atol=0)
+
+
+def test_mtp_verification_schedule_matches_general_schedule():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers.step4_dsa import (
+        Step4DSAGeometry,
+        Step4DSAMetadata,
+        Step4DSAState,
+        Step4Indexer,
+    )
+
+    torch.manual_seed(113)
+    heads = list(range(8))
+    seq_lens_cpu = torch.tensor([head + 4 for head in heads], dtype=torch.int32)
+    query_start_cpu = torch.arange(0, 33, 4, dtype=torch.int32)
+    block_table = torch.stack(
+        [torch.tensor([req + 1, req + 9], dtype=torch.int32) for req in range(8)]
+    ).cuda()
+    metadata = Step4DSAMetadata(
+        num_decodes=0,
+        num_prefills=8,
+        num_decode_tokens=0,
+        num_prefill_tokens=32,
+        num_actual_tokens=32,
+        block_table=block_table,
+        slot_mapping=torch.arange(32, device="cuda", dtype=torch.long),
+        seq_lens=seq_lens_cpu.cuda(),
+        query_start_loc=query_start_cpu.cuda(),
+        query_start_loc_cpu=query_start_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        positions=torch.cat(
+            [torch.arange(head, head + 4) for head in heads]
+        ).cuda(),
+        max_seq_len=11,
+        block_size=64,
+        block_table_np=block_table.cpu().numpy().astype(np.int32),
+    )
+    initial_key = torch.randn(
+        (8, 8, 256), device="cuda", dtype=torch.bfloat16
+    )
+    initial_z = torch.randn_like(initial_key)
+    index_k = torch.randn((32, 1, 256), device="cuda", dtype=torch.bfloat16)
+    index_z = torch.randn_like(index_k)
+
+    def make_state():
+        state = Step4DSAState(
+            num_layers=1,
+            geometry=Step4DSAGeometry(),
+            max_pending=64,
+            dtype=torch.bfloat16,
+            max_num_reqs=8,
+            max_model_len=128,
+            num_speculative_tokens=3,
+        )
+        state.num_kv_groups = 2
+        state.heads_per_group = 4
+        cache = torch.zeros(
+            (2, 24, 64, 2, 192), device="cuda", dtype=torch.bfloat16
+        )
+        state.ensure_allocated(cache, torch.device("cuda"))
+        for req, head in enumerate(heads):
+            if head:
+                slot = int(block_table[req, 0]) * state.regions_per_page
+                row = state.pending.acquire(slot)
+                state.pending_key[0, row, :head] = initial_key[req, :head]
+                state.pending_z[0, row, :head] = initial_z[req, :head]
+        return state
+
+    def make_indexer(state):
+        obj = Step4Indexer.__new__(Step4Indexer)
+        obj.state = state
+        obj.geometry = state.geometry
+        obj.slot = 0
+        obj.num_kv_groups = 2
+        return obj
+
+    reference_state = make_state()
+    graph_state = make_state()
+    reference = make_indexer(reference_state)
+    graph = make_indexer(graph_state)
+    reference_schedule = reference_state._general_schedule(metadata)
+    reference._update_summaries(reference_schedule, index_k, index_z)
+    schedule = graph_state._verification_schedule(metadata, persistent=True)
+    graph._update_summaries(schedule, index_k, index_z)
+    torch.cuda.synchronize()
+
+    assert schedule.verification
+    assert schedule.request_indices.tolist() == [i for i in range(8) for _ in range(4)]
+    assert torch.equal(reference_state.summary, graph_state.summary)
+    assert torch.equal(reference_state.pending_key, graph_state.pending_key)
+    assert torch.equal(reference_state.pending_z, graph_state.pending_z)
+
+    index_q = torch.randn(
+        (32, 2, 4, 256), device="cuda", dtype=torch.bfloat16
+    )
+    weights = torch.randn((32, 2, 4), device="cuda", dtype=torch.float32)
+    reference_logits, _, reference_width = reference._score(
+        metadata, reference_schedule, index_q, weights
+    )
+    graph_logits, _, _ = graph._score(metadata, schedule, index_q, weights)
+    assert reference_logits is not None
+    width = max(reference_width, 1)
+    columns = torch.arange(width, device="cuda").unsqueeze(0)
+    score_positions = metadata.positions.repeat(graph_state.num_kv_groups)
+    visible = columns < score_positions.unsqueeze(1) // graph_state.geometry.region_size
+    torch.testing.assert_close(
+        graph_logits[:, :width][visible],
+        reference_logits[visible],
+        rtol=0,
+        atol=0,
+    )

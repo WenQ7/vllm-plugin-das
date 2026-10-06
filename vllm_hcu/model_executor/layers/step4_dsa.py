@@ -694,6 +694,214 @@ def _insert_decode_tokens(
 
 
 @triton.jit
+def _assemble_verification_tokens_kernel(
+    key_out_ptr,
+    z_out_ptr,
+    key_pending_ptr,
+    z_pending_ptr,
+    key_src_ptr,
+    z_src_ptr,
+    heads_ptr,
+    pending_in_ptr,
+    prefix_lengths_ptr,
+    out_row_stride: tl.int64,
+    out_token_stride: tl.int64,
+    out_proxy_stride: tl.int64,
+    pending_row_stride: tl.int64,
+    pending_token_stride: tl.int64,
+    pending_proxy_stride: tl.int64,
+    src_row_stride: tl.int64,
+    src_proxy_stride: tl.int64,
+    REGION: tl.constexpr,
+    QUERIES: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+) -> None:
+    """Assemble two fixed compression regions for one MTP verification row."""
+    row = tl.program_id(0)
+    token_pos = tl.program_id(1)
+    proxy_offset = tl.arange(0, BLOCK_P)
+    proxy_mask = proxy_offset < PROXY_DIM
+
+    head = tl.load(heads_ptr + row).to(tl.int64)
+    pending_row = tl.load(pending_in_ptr + row).to(tl.int64)
+    prefix_total = (
+        tl.load(prefix_lengths_ptr + 2 * row)
+        + tl.load(prefix_lengths_ptr + 2 * row + 1)
+    )
+    live = prefix_total > 0
+    from_pending = live & (token_pos < head)
+    source_token = tl.maximum(0, tl.minimum(QUERIES - 1, token_pos - head))
+    from_source = live & (token_pos >= head) & (token_pos < head + QUERIES)
+
+    pending_offset = (
+        pending_row * pending_row_stride
+        + token_pos * pending_token_stride
+        + proxy_offset * pending_proxy_stride
+    )
+    source_offset = (
+        (row * QUERIES + source_token) * src_row_stride
+        + proxy_offset * src_proxy_stride
+    )
+    key_pending = tl.load(
+        key_pending_ptr + pending_offset,
+        mask=proxy_mask & from_pending,
+        other=0.0,
+    )
+    z_pending = tl.load(
+        z_pending_ptr + pending_offset,
+        mask=proxy_mask & from_pending,
+        other=0.0,
+    )
+    key_source = tl.load(
+        key_src_ptr + source_offset,
+        mask=proxy_mask & from_source,
+        other=0.0,
+    )
+    z_source = tl.load(
+        z_src_ptr + source_offset,
+        mask=proxy_mask & from_source,
+        other=0.0,
+    )
+    key = tl.where(from_source, key_source, key_pending)
+    z = tl.where(from_source, z_source, z_pending)
+    out_offset = (
+        row * out_row_stride
+        + token_pos * out_token_stride
+        + proxy_offset * out_proxy_stride
+    )
+    tl.store(key_out_ptr + out_offset, key, mask=proxy_mask)
+    tl.store(z_out_ptr + out_offset, z, mask=proxy_mask)
+
+
+def _assemble_verification_tokens(
+    pending_key: torch.Tensor,
+    pending_z: torch.Tensor,
+    index_k: torch.Tensor,
+    index_z: torch.Tensor,
+    heads: torch.Tensor,
+    pending_in: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    *,
+    queries_per_request: int,
+    region_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build graph-stable two-region K/Z buffers for MTP target verification."""
+    rows = heads.shape[0]
+    proxy = index_k.shape[-1]
+    buffer_key = torch.empty(
+        (rows, 2 * region_size, proxy), dtype=index_k.dtype, device=index_k.device
+    )
+    buffer_z = torch.empty_like(buffer_key)
+    if rows == 0:
+        return buffer_key, buffer_z
+    _assemble_verification_tokens_kernel[(rows, 2 * region_size)](
+        buffer_key,
+        buffer_z,
+        pending_key,
+        pending_z,
+        index_k,
+        index_z,
+        heads,
+        pending_in,
+        prefix_lengths,
+        buffer_key.stride(0),
+        buffer_key.stride(1),
+        buffer_key.stride(2),
+        pending_key.stride(0),
+        pending_key.stride(1),
+        pending_key.stride(2),
+        index_k.stride(0),
+        index_k.stride(-1),
+        REGION=region_size,
+        QUERIES=queries_per_request,
+        PROXY_DIM=proxy,
+        BLOCK_P=triton.next_power_of_2(proxy),
+        num_warps=4,
+    )
+    return buffer_key, buffer_z
+
+
+@triton.jit
+def _store_verification_prefixes_kernel(
+    key_dst_ptr,
+    z_dst_ptr,
+    key_src_ptr,
+    z_src_ptr,
+    rows_ptr,
+    prefix_lengths_ptr,
+    dst_row_stride: tl.int64,
+    dst_token_stride: tl.int64,
+    dst_proxy_stride: tl.int64,
+    src_row_stride: tl.int64,
+    src_token_stride: tl.int64,
+    src_proxy_stride: tl.int64,
+    REGION: tl.constexpr,
+    PROXY_DIM: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+) -> None:
+    """Store every rollback prefix without indexed PyTorch assignments."""
+    region_row = tl.program_id(0)
+    token_offset = tl.program_id(1)
+    prefix = tl.load(prefix_lengths_ptr + region_row)
+    live = token_offset < prefix
+    proxy_offset = tl.arange(0, BLOCK_P)
+    mask = (proxy_offset < PROXY_DIM) & live
+    dst_row = tl.load(rows_ptr + region_row).to(tl.int64)
+    request = region_row // 2
+    within_request = (region_row % 2) * REGION + token_offset
+    src_offset = (
+        request * src_row_stride
+        + within_request * src_token_stride
+        + proxy_offset * src_proxy_stride
+    )
+    dst_offset = (
+        dst_row * dst_row_stride
+        + token_offset * dst_token_stride
+        + proxy_offset * dst_proxy_stride
+    )
+    key = tl.load(key_src_ptr + src_offset, mask=mask)
+    z = tl.load(z_src_ptr + src_offset, mask=mask)
+    tl.store(key_dst_ptr + dst_offset, key, mask=mask)
+    tl.store(z_dst_ptr + dst_offset, z, mask=mask)
+
+
+def _store_verification_prefixes(
+    pending_key: torch.Tensor,
+    pending_z: torch.Tensor,
+    buffer_key: torch.Tensor,
+    buffer_z: torch.Tensor,
+    rows: torch.Tensor,
+    prefix_lengths: torch.Tensor,
+    *,
+    region_size: int,
+) -> None:
+    """Write the one or two prefixes that MTP rejection may reopen."""
+    region_rows = rows.shape[0]
+    if region_rows == 0:
+        return
+    proxy = buffer_key.shape[-1]
+    _store_verification_prefixes_kernel[(region_rows, region_size)](
+        pending_key,
+        pending_z,
+        buffer_key,
+        buffer_z,
+        rows,
+        prefix_lengths,
+        pending_key.stride(0),
+        pending_key.stride(1),
+        pending_key.stride(2),
+        buffer_key.stride(0),
+        buffer_key.stride(1),
+        buffer_key.stride(2),
+        REGION=region_size,
+        PROXY_DIM=proxy,
+        BLOCK_P=triton.next_power_of_2(proxy),
+        num_warps=4,
+    )
+
+
+@triton.jit
 def _store_kv_rows_kernel(
     k_dst_ptr,
     v_dst_ptr,
@@ -1198,18 +1406,10 @@ class Step4DSAMetadata:
 
 
 class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
-    # Decode-only steps are capturable; steps with a prefill row are not, which
-    # is what this level means. Three things used to rule capture out, all of
-    # them inside the indexer op: a per-request Python loop, a device-to-host
-    # read of the block table, and a score tensor whose width followed the
-    # longest context in the batch. build() below now does the first two, into
-    # buffers whose addresses outlive the capture, and the width is pinned to
-    # Step4DSAState.graph_regions. A prefill row still sizes its logits by its
-    # own query length, so mixed and prefill steps stay on the piecewise path
-    # where the op runs eagerly -- see _require_splitting_op.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
+    # Single-token decode and uniform MTP target verification both use
+    # persistent schedules. Mixed batches and ordinary prefills remain on the
+    # piecewise path where the indexer op runs eagerly.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     # Pull single-token queries to the front so the batch splits cleanly into
     # the reference implementation's two paths: decode reads one query per
@@ -1293,37 +1493,48 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             block_table_np=getattr(m, "block_table_np", None),
         )
 
+        # Build graph schedules here rather than in the indexer op. The builder
+        # runs eagerly before every replay and writes current metadata into the
+        # fixed addresses captured by the target model graph.
+        state = self._dsa_state()
+        sched = None
         if (
-            os.environ.get("VLLM_STEP5_DEVICE_REQUEST_INDICES", "0") == "1"
+            state is not None
+            and state.graph_decode
+            and state.summary is not None  # first warmup allocates the pools
+        ):
+            if num_prefills == 0 and num_decodes > 0:
+                sched = state._decode_schedule(md, persistent=True)
+            elif num_decodes == 0 and num_prefills > 0 and state.num_speculative_tokens:
+                queries = state.num_speculative_tokens + 1
+                qlens = (
+                    m.query_start_loc_cpu[1 : num_prefills + 1]
+                    - m.query_start_loc_cpu[:num_prefills]
+                )
+                uniform_verification = bool(
+                    torch.all((qlens == queries) | (qlens == 0)).item()
+                    and md.num_actual_tokens == num_prefills * queries
+                )
+                if uniform_verification:
+                    sched = state._verification_schedule(md, persistent=True)
+                    md.prefill_request_indices = sched.request_indices
+
+        if (
+            md.prefill_request_indices is None
+            and os.environ.get("VLLM_STEP5_DEVICE_REQUEST_INDICES", "0") == "1"
             and num_prefills > 0
         ):
-            # Share one device-built integer map across all DSA layers. Supplying
-            # the known row count avoids repeat_interleave's device-to-host sync.
+            # Ordinary prefills keep the device-built ragged map. Uniform MTP
+            # verification instead uses the persistent fixed-address map above.
             md.prefill_request_indices = prefill_request_indices_device(
                 m.query_start_loc, num_decodes, num_prefills, num_prefill_tokens,
             )
 
-        # Build the decode schedule here rather than in the indexer op. It is
-        # the only part of the DSA step that has host control flow and a
-        # device-to-host read in it, and this is the last point that still runs
-        # on every step -- once the decode path is captured, the op's Python
-        # runs at capture only, and a graph replay reaches the kernels with
-        # whatever these buffers hold. Writing them in place, from here, is what
-        # makes the replay see the current step.
-        state = self._dsa_state()
-        if (
-            state is not None
-            and state.graph_decode
-            and state.summary is not None  # not yet allocated: first forward
-            and num_prefills == 0
-            and num_decodes > 0
-        ):
-            sched = state._decode_schedule(md, persistent=True)
+        if sched is not None:
             sched.builder_owned = True
             md.schedule = sched
-            # Adopt it now, so that end_step() on the *next* build releases this
-            # step's rows even if no layer ever calls finish_layer -- which is
-            # exactly what happens when the step is a graph replay.
+            # Adopt it now, so end_step() on the next build releases the prior
+            # step even when the model forward itself was only a graph replay.
             state._schedule_key = md
             state._schedule = sched
             state._layers_done = 0
@@ -1728,6 +1939,21 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         if attn_metadata.num_prefills > 0:
             packed, counts, logical_ids, request_indices = plan.prefill
             q_positions = attn_metadata.positions[ndt:num_tokens].to(torch.int32)
+            prefill_tokens = num_tokens - ndt
+            # The decode launcher captures up to max_num_seqs=32 target rows.
+            # MTP3 verifies four queries per row, so the largest uniform target
+            # graph contains 128 tokens. Keep that whole verification range on
+            # the device-only short path; the general prefill path constructs
+            # query tiles on the host and cannot be recorded in a full graph.
+            # Ordinary 65--128 token prefills retain the tiled kernel.
+            verification = bool(
+                attn_metadata.schedule is not None
+                and attn_metadata.schedule.verification
+            )
+            short_query = 0 < prefill_tokens <= 64 or (
+                prefill_tokens <= 128
+                and (verification or torch.cuda.is_current_stream_capturing())
+            )
             prefill_kwargs = dict(
                 num_kv_groups=num_kv_groups,
                 region_size=REGION_BLOCK_SIZE,
@@ -1742,7 +1968,7 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 "prefill" in FLASH_ATTN_DSA_STAGES
                 or (
                     "short_prefill" in FLASH_ATTN_DSA_STAGES
-                    and 0 < num_tokens - ndt <= 64
+                    and short_query
                 )
             )
             if use_flash_prefill:
@@ -1778,20 +2004,20 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 # per-query kernel consumes the same causal region metadata
                 # without building a large union bitmap on the host.
                 if (
-                    0 < num_tokens - ndt <= 64
+                    short_query
                     and not PREFILL_QK_FP8
                     and not PREFILL_PV_FP8
                 ):
                     prefill_kwargs["logical_regions"] = None
                 if (
                     os.environ.get("VLLM_STEP5_DSA_SHORT_QUERY", "0") == "1"
-                    and 0 < num_tokens - ndt <= 64
+                    and short_query
                     and self.head_size == 192
                     and not PREFILL_QK_FP8
                     and not PREFILL_PV_FP8
                 ):
                     splits = _decode_num_splits(
-                        (num_tokens - ndt) * num_kv_groups, packed.shape[1]
+                        prefill_tokens * num_kv_groups, packed.shape[1]
                     )
                     out_p, lse_p = sparse_attention_short_prefill(
                         query[ndt:num_tokens], k_flat, v_flat, packed, counts,
@@ -2158,6 +2384,17 @@ class Step4DSASchedule:
     # eager behaviour.
     graph_regions: int = 0
 
+    # -- speculative target-verification fast path ------------------------
+    # MTP3 verifies four consecutive queries per request. A four-query run can
+    # cross at most two 8-token compression regions, so this schedule uses two
+    # fixed region records per request and keeps every replayed pointer stable.
+    verification: bool = False
+    queries_per_request: int = 0
+    num_requests: int = 0
+    request_indices: torch.Tensor | None = None  # [num_requests * q] int32
+    pending_rows: torch.Tensor | None = None  # [num_requests * 2] int64
+    prefix_lengths: torch.Tensor | None = None  # [num_requests * 2] int32
+
 
 # --------------------------------------------------------------------------
 # Model-side DSA state
@@ -2247,6 +2484,7 @@ class Step4DSAState:
         self._stage = 0
         self._stage_ev: list[torch.cuda.Event] = []
         self._decode_logits: torch.Tensor | None = None
+        self._verification_logits: torch.Tensor | None = None
 
         self._rope: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
         self._schedule_key: object | None = None
@@ -2279,6 +2517,7 @@ class Step4DSAState:
         self._stage = 0
         self._stage_ev = []
         self._decode_logits = None
+        self._verification_logits = None
         self._schedule_key = None
         self._schedule = None
         self._layers_done = 0
@@ -2366,6 +2605,7 @@ class Step4DSAState:
 
         nr = self.max_num_reqs
         i64 = dict(dtype=torch.int64, device=device)
+        verify_q = self.num_speculative_tokens + 1
         self._buf = {
             "head": torch.zeros(nr, **i64),
             "tail": torch.zeros(nr, **i64),
@@ -2376,6 +2616,25 @@ class Step4DSAState:
             "counts": torch.zeros(nr, dtype=torch.int32, device=device),
             "starts": torch.arange(nr, dtype=torch.int32, device=device) * region,
             "live": torch.zeros(nr, dtype=torch.bool, device=device),
+            "verification_head": torch.zeros(nr, **i64),
+            "verification_pending_in": torch.zeros(nr, **i64),
+            "verification_starts": (
+                torch.arange(2 * nr, dtype=torch.int32, device=device) * region
+            ),
+            "verification_counts": torch.zeros(
+                2 * nr, dtype=torch.int32, device=device
+            ),
+            "verification_slots": torch.zeros(2 * nr, **i64),
+            "verification_live": torch.zeros(
+                2 * nr, dtype=torch.bool, device=device
+            ),
+            "verification_pending_rows": torch.zeros(2 * nr, **i64),
+            "verification_prefix_lengths": torch.zeros(
+                2 * nr, dtype=torch.int32, device=device
+            ),
+            "verification_request_indices": torch.arange(
+                nr, dtype=torch.int32, device=device
+            ).repeat_interleave(max(verify_q, 1)),
         }
         # Staged on pinned host memory so the per-step upload of the pending
         # rows is one async copy rather than two torch.tensor(list) round trips.
@@ -2389,12 +2648,18 @@ class Step4DSAState:
         # events make reuse wait for the copy that last read the slot, so the
         # depth is a bound rather than a bet on how far ahead the host runs.
         pin = torch.cuda.is_available()
+        host_lengths = {
+            "pending_in": nr,
+            "pending_out": nr,
+            "verification_pending_in": nr,
+            "verification_pending_rows": 2 * nr,
+        }
         self._host = {
-            k: [
-                torch.zeros(nr, dtype=torch.int64, pin_memory=pin)
+            name: [
+                torch.zeros(length, dtype=torch.int64, pin_memory=pin)
                 for _ in range(_STAGING_DEPTH)
             ]
-            for k in ("pending_in", "pending_out")
+            for name, length in host_lengths.items()
         }
         self._stage = 0
         self._stage_ev = (
@@ -2409,7 +2674,14 @@ class Step4DSAState:
             dtype=torch.float32,
             device=device,
         )
-        mib = self._decode_logits.numel() * 4 / 2 ** 20
+        self._verification_logits = torch.empty(
+            (self.num_kv_groups * nr * max(verify_q, 1), self.graph_regions),
+            dtype=torch.float32,
+            device=device,
+        )
+        mib = (
+            self._decode_logits.numel() + self._verification_logits.numel()
+        ) * 4 / 2 ** 20
         logger.info(
             "step4 DSA: decode graph width %d regions (max_model_len %d, "
             "region %d), %d x %d fp32 score pool = %.1f MiB. The region selector "
@@ -2725,6 +2997,231 @@ class Step4DSAState:
                     "reindexed or committed out of order."
                 )
         return out
+
+    def _verification_schedule(
+        self, md: Step4DSAMetadata, *, persistent: bool = False
+    ) -> Step4DSASchedule:
+        """Fixed two-region schedule for uniform MTP target verification.
+
+        MTP3 contributes four consecutive queries per request. With an
+        eight-token compression region, ``head + 4`` spans at most two regions.
+        Two records per request therefore cover every completion and every
+        rollback prefix with graph-constant shapes. The metadata builder fills
+        these persistent tensors before each target graph replay.
+        """
+        if md.num_decodes:
+            raise RuntimeError("MTP verification schedule requires a uniform batch")
+        queries = self.num_speculative_tokens + 1
+        if queries <= 1 or queries > self.geometry.region_size:
+            raise RuntimeError(
+                "Step5 verification schedule expects 2..region_size queries, "
+                f"got {queries}"
+            )
+        num_requests = md.num_prefills
+        expected_tokens = num_requests * queries
+        if md.num_actual_tokens != expected_tokens:
+            raise RuntimeError(
+                "Step5 full target graph requires a padded uniform verification "
+                f"batch ({num_requests} requests x {queries} queries), got "
+                f"{md.num_actual_tokens} tokens"
+            )
+        if persistent and num_requests > self.max_num_reqs:
+            raise RuntimeError(
+                f"Step5 verification batch {num_requests} exceeds max_num_reqs "
+                f"{self.max_num_reqs}"
+            )
+
+        region = self.geometry.region_size
+        rpp = self.regions_per_page
+        device = md.block_table.device
+        buf = self._buf if persistent else {}
+        qlens = (
+            md.query_start_loc[1 : num_requests + 1]
+            - md.query_start_loc[:num_requests]
+        ).to(torch.int64)
+        seq_lens = md.seq_lens[:num_requests].to(torch.int64)
+        real = (qlens == queries) & (seq_lens > 0)
+        past = (seq_lens - qlens).clamp_min(0)
+        head = past % region
+        first_region = torch.div(past, region, rounding_mode="floor")
+        region_ids = first_region[:, None] + torch.arange(
+            2, dtype=torch.int64, device=device
+        )[None, :]
+        page_columns = torch.div(region_ids, rpp, rounding_mode="floor").clamp(
+            max=md.block_table.shape[1] - 1
+        )
+        pages = torch.gather(
+            md.block_table[:num_requests].to(torch.int64), 1, page_columns
+        )
+        real = real & (pages[:, 0] > 0)
+        used = torch.stack(
+            (real, real & (head + queries > region)), dim=1
+        )
+        slots = torch.where(
+            used,
+            pages * rpp + region_ids % rpp,
+            -torch.ones_like(region_ids),
+        )
+        closes_first = real & (head + queries >= region)
+        live = torch.stack((closes_first, torch.zeros_like(closes_first)), dim=1)
+        counts = torch.where(
+            live,
+            torch.full_like(region_ids, region),
+            torch.zeros_like(region_ids),
+        ).to(torch.int32)
+        head = torch.where(real, head, torch.zeros_like(head))
+        nscore = torch.where(
+            real,
+            torch.div(past + queries - 1, region, rounding_mode="floor"),
+            torch.zeros_like(past),
+        ).to(torch.int32)
+
+        # Every region that can be reopened after rejecting up to three draft
+        # tokens retains its prefix. For MTP3, the first region can be dropped
+        # only at head==7; the second exists only at head>=5.
+        nbuf = head + queries
+        earliest = torch.div(
+            (nbuf - self.num_speculative_tokens).clamp_min(0),
+            region,
+            rounding_mode="floor",
+        )
+        prefix_first = torch.where(
+            real & (earliest == 0),
+            torch.minimum(nbuf, torch.full_like(nbuf, region)),
+            torch.zeros_like(nbuf),
+        )
+        prefix_second = torch.where(
+            used[:, 1] & (earliest <= 1),
+            nbuf - region,
+            torch.zeros_like(nbuf),
+        )
+        prefix_lengths = torch.stack((prefix_first, prefix_second), dim=1).to(
+            torch.int32
+        )
+
+        sched = Step4DSASchedule(
+            verification=True,
+            queries_per_request=queries,
+            num_requests=num_requests,
+            buf_len=num_requests * 2 * region,
+        )
+
+        def out(name: str, value: torch.Tensor) -> torch.Tensor:
+            dst = buf.get(name)
+            if dst is None:
+                return value
+            view = dst[: value.numel()].view(value.shape)
+            view.copy_(value)
+            return view
+
+        sched.starts = (
+            buf["verification_starts"][: 2 * num_requests]
+            if buf
+            else torch.arange(
+                2 * num_requests, dtype=torch.int32, device=device
+            ) * region
+        )
+        sched.counts = out("verification_counts", counts.flatten())
+        sched.slots = out("verification_slots", slots.flatten())
+        sched.live = out("verification_live", live.flatten())
+        sched.head = out("verification_head", head)
+        sched.nscore = nscore
+        sched.prefix_lengths = out(
+            "verification_prefix_lengths", prefix_lengths.flatten()
+        )
+        if buf:
+            sched.request_indices = buf["verification_request_indices"][:expected_tokens]
+        else:
+            sched.request_indices = torch.arange(
+                num_requests, dtype=torch.int32, device=device
+            ).repeat_interleave(queries)
+
+        qlens_np = np.diff(
+            md.query_start_loc_cpu[: num_requests + 1].numpy()
+        ).astype(np.int64, copy=False)
+        seq_np = md.seq_lens_cpu[:num_requests].numpy().astype(np.int64, copy=False)
+        past_np = np.maximum(seq_np - qlens_np, 0)
+        head_np = past_np % region
+        first_np = past_np // region
+        table_np = md.block_table_np
+        if table_np is not None and table_np.shape[0] >= num_requests:
+            region_np = first_np[:, None] + np.arange(2, dtype=np.int64)[None, :]
+            columns_np = np.minimum(region_np // rpp, table_np.shape[1] - 1)
+            pages_np = table_np[np.arange(num_requests)[:, None], columns_np].astype(
+                np.int64, copy=False
+            )
+            used_np = np.stack(
+                (
+                    (qlens_np == queries) & (seq_np > 0) & (pages_np[:, 0] > 0),
+                    (qlens_np == queries)
+                    & (seq_np > 0)
+                    & (pages_np[:, 0] > 0)
+                    & (head_np + queries > region),
+                ),
+                axis=1,
+            )
+            slots_np = np.where(
+                used_np, pages_np * rpp + region_np % rpp, -1
+            )
+        else:
+            slots_np = np.asarray(slots.tolist(), dtype=np.int64)
+
+        self.end_step()
+        self.pending.begin_step()
+        trash = self.pending_trash_row
+        rows_in = np.full(num_requests, trash, dtype=np.int64)
+        pending_rows = np.full((num_requests, 2), trash, dtype=np.int64)
+        widest = 0
+        for row in range(num_requests):
+            if qlens_np[row] != queries or slots_np[row, 0] < 0:
+                continue
+            head_row = int(head_np[row])
+            if head_row:
+                rows_in[row] = self.pending.get(int(slots_np[row, 0]))
+            nbuf_row = head_row + queries
+            nregions = 1 + int(nbuf_row > region)
+            earliest_row = max(
+                0, (nbuf_row - self.num_speculative_tokens) // region
+            )
+            for region_index in range(earliest_row, nregions):
+                pending_rows[row, region_index] = self.pending.acquire(
+                    int(slots_np[row, region_index])
+                )
+            widest = max(widest, int((past_np[row] + queries - 1) // region))
+
+        if buf:
+            stage = self._stage
+            self._stage = (stage + 1) % _STAGING_DEPTH
+            ev = self._stage_ev[stage] if self._stage_ev else None
+            if ev is not None:
+                ev.synchronize()
+            host_in = self._host["verification_pending_in"][stage]
+            host_rows = self._host["verification_pending_rows"][stage]
+            host_in.numpy()[:num_requests] = rows_in
+            host_rows.numpy()[: 2 * num_requests] = pending_rows.reshape(-1)
+            sched.pending_in = buf["verification_pending_in"][:num_requests]
+            sched.pending_rows = buf["verification_pending_rows"][: 2 * num_requests]
+            sched.pending_in.copy_(host_in[:num_requests], non_blocking=ev is not None)
+            sched.pending_rows.copy_(
+                host_rows[: 2 * num_requests], non_blocking=ev is not None
+            )
+            if ev is not None:
+                ev.record()
+        else:
+            sched.pending_in = torch.tensor(rows_in, dtype=torch.int64, device=device)
+            sched.pending_rows = torch.tensor(
+                pending_rows.reshape(-1), dtype=torch.int64, device=device
+            )
+
+        sched.max_nscore = widest
+        if persistent:
+            if widest > self.graph_regions:
+                raise RuntimeError(
+                    f"Step5 verification needs {widest} region scores but graph "
+                    f"width is {self.graph_regions}"
+                )
+            sched.graph_regions = self.graph_regions
+        return sched
 
     def _decode_schedule(
         self, md: Step4DSAMetadata, *, persistent: bool = False
@@ -3343,6 +3840,9 @@ class Step4Indexer:
         the streaming result identical to the batched one rather than merely
         close to it.
         """
+        if sched.verification:
+            self._update_summaries_verification(sched, index_k, index_z)
+            return
         if sched.decode:
             self._update_summaries_decode(sched, index_k, index_z)
             return
@@ -3400,7 +3900,49 @@ class Step4Indexer:
                 end - plan.tail : end, 0
             ]
 
-    # -- stage 2b: summaries, decode-only fast path -------------------------
+    # -- stage 2b: summaries, graph-captured MTP verification ---------------
+
+    def _update_summaries_verification(
+        self, sched: Step4DSASchedule, index_k: torch.Tensor, index_z: torch.Tensor
+    ) -> None:
+        """Compress and retain a fixed two-region MTP verification buffer."""
+        state = self.state
+        region = self.geometry.region_size
+        num_requests = sched.num_requests
+        pending_key = state.pending_key[self.slot]
+        pending_z = state.pending_z[self.slot]
+        buffer_key, buffer_z = _assemble_verification_tokens(
+            pending_key,
+            pending_z,
+            index_k[: num_requests * sched.queries_per_request],
+            index_z[: num_requests * sched.queries_per_request],
+            sched.head,
+            sched.pending_in,
+            sched.prefix_lengths,
+            queries_per_request=sched.queries_per_request,
+            region_size=region,
+        )
+        _, summary_fp8 = csa_compress_regions(
+            buffer_key.view(num_requests * 2 * region, 1, self.geometry.proxy_dim),
+            buffer_z.view(num_requests * 2 * region, 1, self.geometry.proxy_dim),
+            sched.starts,
+            sched.counts,
+            region_size=region,
+        )
+        _store_live_summary_rows(
+            state.summary[self.slot], summary_fp8, sched.slots, sched.live
+        )
+        _store_verification_prefixes(
+            pending_key,
+            pending_z,
+            buffer_key,
+            buffer_z,
+            sched.pending_rows,
+            sched.prefix_lengths,
+            region_size=region,
+        )
+
+    # -- stage 2c: summaries, decode-only fast path -------------------------
 
     def _update_summaries_decode(
         self, sched: Step4DSASchedule, index_k: torch.Tensor, index_z: torch.Tensor
@@ -3491,6 +4033,8 @@ class Step4Indexer:
         device = index_q.device
         summary = state.summary[self.slot]
 
+        if sched.verification:
+            return self._score_verification(md, sched, index_q, weights)
         if sched.decode:
             return self._score_decode(md, sched, index_q, weights)
 
@@ -3586,6 +4130,42 @@ class Step4Indexer:
                 )
 
         return prefill_logits, decode_logits, max(width_decode, width_prefill)
+
+    def _score_verification(
+        self,
+        md: Step4DSAMetadata,
+        sched: Step4DSASchedule,
+        index_q: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, int]:
+        """Score a fixed-width uniform MTP batch through graph-stable buffers."""
+        state = self.state
+        num_tokens = sched.num_requests * sched.queries_per_request
+        rows = self.num_kv_groups * num_tokens
+        if sched.graph_regions:
+            width = sched.graph_regions
+            prefill_logits = state._verification_logits[:rows, :width]
+        else:
+            width = sched.max_nscore
+            prefill_logits = torch.empty(
+                (rows, max(width, 1)), dtype=torch.float32, device=index_q.device
+            )
+        if DENSE_EQUIV or width == 0:
+            prefill_logits.zero_()
+            return prefill_logits, None, width
+        assert md.positions is not None
+        short_prefill_indexer_logits(
+            index_q[:num_tokens].contiguous(),
+            weights[:num_tokens].contiguous(),
+            state.summary[self.slot],
+            md.block_table[: sched.num_requests],
+            sched.request_indices,
+            md.positions[:num_tokens],
+            prefill_logits,
+            regions_per_page=state.regions_per_page,
+            queries_per_request=sched.queries_per_request,
+        )
+        return prefill_logits, None, width
 
     def _score_decode(
         self,
