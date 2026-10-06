@@ -3,9 +3,21 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+
+def short_index_query_rounding_enabled(num_tokens, proxy_dim, dtype):
+    """Only fold the indexer's deployed E4M3 rounding into short BF16 norms."""
+    return (
+        os.environ.get("VLLM_STEP5_INDEXER_ROUND_IN_NORM", "0") == "1"
+        and 0 < num_tokens <= 128
+        and proxy_dim == 256
+        and dtype == torch.bfloat16
+    )
 
 
 @triton.jit
@@ -29,6 +41,7 @@ def _fused_indexer_qk_norm_rope_kernel(
     head_dim: tl.constexpr,
     rotary_dim: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
+    ROUND_Q_E4M3: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ) -> None:
@@ -74,10 +87,20 @@ def _fused_indexer_qk_norm_rope_kernel(
     bias = tl.where(is_k, k_bias, 0.0)
     normalized = (values - mean) * rstd * scale + bias
 
+    # Preserve the two deployed casts: normalized/RoPE output first rounds
+    # to BF16, then to E4M3 and back. K remains unrounded for CSA compression.
+    if ROUND_Q_E4M3:
+        unrotated_q = (
+            normalized.to(q_out_ptr.dtype.element_ty)
+            .to(tl.float8e4nv)
+            .to(q_out_ptr.dtype.element_ty)
+        )
+    else:
+        unrotated_q = normalized.to(q_out_ptr.dtype.element_ty)
     unrotated = dim_ok & (dims >= 2 * rotary_dim)
     tl.store(
         q_out_ptr + token * stride_q_out_token + q_head * head_dim + dims,
-        normalized.to(q_out_ptr.dtype.element_ty),
+        unrotated_q,
         mask=unrotated & ~is_k,
     )
     tl.store(
@@ -146,10 +169,24 @@ def _fused_indexer_qk_norm_rope_kernel(
     rotated_real = real * cos - imag * sin
     rotated_imag = real * sin + imag * cos
 
+    if ROUND_Q_E4M3:
+        q_rotated_real = (
+            rotated_real.to(q_out_ptr.dtype.element_ty)
+            .to(tl.float8e4nv)
+            .to(q_out_ptr.dtype.element_ty)
+        )
+        q_rotated_imag = (
+            rotated_imag.to(q_out_ptr.dtype.element_ty)
+            .to(tl.float8e4nv)
+            .to(q_out_ptr.dtype.element_ty)
+        )
+    else:
+        q_rotated_real = rotated_real
+        q_rotated_imag = rotated_imag
     q_base = q_out_ptr + token * stride_q_out_token + q_head * head_dim
     k_base = k_out_ptr + token * stride_k_out_token
-    tl.store(q_base + half, rotated_real, mask=half_ok & ~is_k)
-    tl.store(q_base + rotary_dim + half, rotated_imag, mask=half_ok & ~is_k)
+    tl.store(q_base + half, q_rotated_real, mask=half_ok & ~is_k)
+    tl.store(q_base + rotary_dim + half, q_rotated_imag, mask=half_ok & ~is_k)
     tl.store(k_base + half, rotated_real, mask=half_ok & is_k)
     tl.store(k_base + rotary_dim + half, rotated_imag, mask=half_ok & is_k)
 
@@ -168,7 +205,10 @@ def fused_indexer_qk_norm_rope(
     num_q_heads: int,
     rotary_dim: int,
     eps: float = 1e-6,
+    round_q_e4m3: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if round_q_e4m3 and index_q.dtype != torch.bfloat16:
+        raise ValueError("Fused indexer E4M3 rounding requires BF16 queries")
     if index_k.shape[1] != head_dim:
         raise ValueError(
             "Step5 fused indexer norm expects exactly one K head; "
@@ -196,6 +236,7 @@ def fused_indexer_qk_norm_rope(
         head_dim=head_dim,
         rotary_dim=rotary_dim,
         NUM_Q_HEADS=num_q_heads,
+        ROUND_Q_E4M3=round_q_e4m3,
         BLOCK_D=triton.next_power_of_2(head_dim),
         BLOCK_R=triton.next_power_of_2(rotary_dim),
         # One wave is enough for the 256-wide reduction and avoids the

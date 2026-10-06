@@ -45,6 +45,7 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
 )
 from vllm_hcu.model_executor.layers.step5_dsa_norm_rope import (
     fused_indexer_qk_norm_rope,
+    short_index_query_rounding_enabled,
 )
 from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
     sparse_attention_short_prefill,
@@ -1294,6 +1295,7 @@ def short_prefill_indexer_logits(
     region_size: int = REGION_BLOCK_SIZE,
     block_k: int = 128,
     queries_per_request: int = 1,
+    q_is_e4m3_rounded: bool = False,
 ) -> None:
     """Batched request-aware indexer scoring for MTP verification queries.
 
@@ -1324,7 +1326,9 @@ def short_prefill_indexer_logits(
             f"{regions_per_page} regions the block table can address"
         )
 
-    quantized_q = round_activations_e4m3(index_q)
+    if q_is_e4m3_rounded and index_q.dtype != torch.bfloat16:
+        raise ValueError("Pre-rounded indexer queries must be BF16")
+    quantized_q = index_q if q_is_e4m3_rounded else round_activations_e4m3(index_q)
     if (
         os.environ.get("VLLM_STEP5_GROUPED_HEAD_INDEXER", "0") == "1"
         and num_tokens <= 128 and groups in (1, 2, 4)
@@ -3841,6 +3845,9 @@ class Step4Indexer:
                 num_q_heads=self.num_heads,
                 rotary_dim=cos.shape[1],
                 eps=self.eps,
+                round_q_e4m3=short_index_query_rounding_enabled(
+                    num_tokens, proxy, index_q.dtype,
+                ),
             )
         else:
             index_q, index_k, index_z = indexer_norm_rope(
@@ -4148,6 +4155,9 @@ class Step4Indexer:
                 prefill_logits,
                 regions_per_page=state.regions_per_page,
                 queries_per_request=queries_per_request,
+                q_is_e4m3_rounded=short_index_query_rounding_enabled(
+                    md.num_actual_tokens, self.geometry.proxy_dim, index_q.dtype,
+                ),
             )
 
         if DENSE_EQUIV:
@@ -4218,6 +4228,9 @@ class Step4Indexer:
             prefill_logits,
             regions_per_page=state.regions_per_page,
             queries_per_request=sched.queries_per_request,
+            q_is_e4m3_rounded=short_index_query_rounding_enabled(
+                md.num_actual_tokens, self.geometry.proxy_dim, index_q.dtype,
+            ),
         )
         return prefill_logits, None, width
 

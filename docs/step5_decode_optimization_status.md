@@ -529,3 +529,38 @@ Checkpoint shape inspection confirms Q/K/V rows 12288/768/768 at both SWA
 and full Attention, including MTP: TP2 QKV width is N6912 in either case.
 A separate N3840 SWA hypothesis was incorrect and is not used as a basis
 for precision selection. The formal QKV precision remains BF16.
+
+
+### Fold indexer E4M3 query rounding into short Q/K norm + RoPE
+
+The indexer requires BF16 -> E4M3 -> BF16 activation rounding before its
+score GEMM. Moving that stage into the grouped scorer regressed long
+contexts because every key CTA repeated the conversion. The new candidate
+instead rounds Q exactly once while the joint norm/RoPE kernel stores it.
+It preserves the BF16 store boundary before E4M3 conversion and keeps K
+unrounded for CSA compression. Both short-score entry points explicitly
+skip their standalone rounding when projection has already performed it.
+The opt-in VLLM_STEP5_INDEXER_ROUND_IN_NORM=1 applies only to 1--128 tokens,
+proxy_dim256 and BF16; longer Prefill and other dtypes keep the old path.
+The formal default is still off pending a full-model screen.
+
+The isolated reference combines the existing fused norm/RoPE and deployed
+Torch casts; both timings include CUDA Graph launches. At M32/64/128,
+rotary_pairs16, the complete operator improved from
+0.01161/0.01334/0.01700 to 0.00412/0.00523/0.00748 ms. Rotary_pairs64
+showed the same trend. Thirty-six random, zero-row and overflow-weight
+cases preserved Q bits/NaN masks, K bits and signed zero. Graph replays
+with changing inputs/positions also matched. Ten production tests passed,
+including actual Step4Indexer projection -> verification-score integration
+for queries/request1--4, partial/full rotation and long8192-region scores.
+A poison cast verifies that the optimized scorer omits its redundant stage.
+No full-service throughput improvement is inferred from this microbenchmark.
+
+The formal BF16-QKV service, full target Decode Graph and ordinary MTP3,
+completed the frozen 100-question zero-shot GSM8K screen at 96/100, with
+no request errors or output truncations (max_tokens8192). Temperature1,
+top_p0.95, seed42 and EvalScope1.12.0 native rule scoring were fixed.
+This provides ordinary inference evidence for the current Graph/tile
+profile; it is not a full-dataset accuracy guarantee. The calibrated-QKV
+FP8 pair remains pending. Evidence is preserved at
+/workspace/step5-tp2-performance/fullgraph-qkv-ordinary-20261007.
