@@ -211,6 +211,198 @@ def pack_regions_fused(logical, q_positions, block_table, request_indices, *,
     return output
 
 
+@triton.jit
+def _prefill_sparse_meta_fused_kernel(
+    logits_ptr,
+    q_positions_ptr,
+    block_table_ptr,
+    request_ptr,
+    out_ptr,
+    logical_out_ptr,
+    counts_ptr,
+    seq_regions,
+    stride_logits_row,
+    stride_table_row,
+    stride_out_row,
+    stride_logical_row,
+    topk: tl.constexpr,
+    region_size: tl.constexpr,
+    regions_per_page: tl.constexpr,
+    WRITE_LOGICAL_IDS: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+) -> None:
+    """Select, pack, and append the query's current region in one launch."""
+    row = tl.program_id(0)
+    q_position = tl.load(q_positions_ptr + row).to(tl.int32)
+    request = tl.load(request_ptr + row).to(tl.int32)
+    current_region = tl.maximum(q_position // region_size, 0)
+    visible = tl.minimum(current_region, seq_regions)
+    budget = tl.minimum(topk, visible)
+
+    slots = tl.arange(0, BLOCK_TOPK)
+    tl.store(
+        out_ptr + row * stride_out_row + slots,
+        -1,
+        mask=slots < topk + 1,
+    )
+    if WRITE_LOGICAL_IDS:
+        tl.store(
+            logical_out_ptr + row * stride_logical_row + slots,
+            -1,
+            mask=slots < topk + 1,
+        )
+
+    if visible > 0:
+        threshold, remaining = _radix_topk_threshold_gfx938(
+            logits_ptr,
+            row,
+            stride_logits_row,
+            visible,
+            budget,
+            seq_regions,
+            BLOCK_R=BLOCK_R,
+        )
+        cursor = 0
+        ties_taken = 0
+        for base in tl.range(0, seq_regions, BLOCK_R):
+            regions = base + tl.arange(0, BLOCK_R)
+            live = regions < visible
+            scores = tl.load(
+                logits_ptr + row * stride_logits_row + regions,
+                mask=live,
+                other=0.0,
+            )
+            keys = _ordered_float_key_gfx938(scores)
+            greater = live & (keys > threshold)
+            tied = live & (keys == threshold)
+            tied_rank = ties_taken + tl.cumsum(tied.to(tl.int32), axis=0) - 1
+            selected = greater | (tied & (tied_rank < remaining))
+            positions = cursor + tl.cumsum(selected.to(tl.int32), axis=0) - 1
+            safe_regions = tl.where(selected, regions, 0)
+            pages = tl.load(
+                block_table_ptr
+                + request * stride_table_row
+                + safe_regions // regions_per_page,
+                mask=selected,
+                other=0,
+            )
+            physical = pages * regions_per_page + safe_regions % regions_per_page
+            valid_tokens = tl.minimum(
+                tl.maximum(q_position + 1 - safe_regions * region_size, 0),
+                region_size,
+            )
+            packed = physical | (valid_tokens << 24)
+            packed = tl.where(pages >= 0, packed, -1)
+            tl.store(
+                out_ptr + row * stride_out_row + positions,
+                packed,
+                mask=selected & (positions < topk),
+            )
+            if WRITE_LOGICAL_IDS:
+                tl.store(
+                    logical_out_ptr + row * stride_logical_row + positions,
+                    regions,
+                    mask=selected & (positions < topk),
+                )
+            cursor += tl.sum(selected.to(tl.int32))
+            ties_taken += tl.sum(tied.to(tl.int32))
+
+    history_count = tl.minimum(current_region, topk)
+    page = tl.load(
+        block_table_ptr
+        + request * stride_table_row
+        + current_region // regions_per_page
+    )
+    physical = page * regions_per_page + current_region % regions_per_page
+    valid_tokens = tl.minimum(
+        tl.maximum(q_position + 1 - current_region * region_size, 0),
+        region_size,
+    )
+    packed = physical | (valid_tokens << 24)
+    tl.store(
+        out_ptr + row * stride_out_row + history_count,
+        tl.where(page >= 0, packed, -1),
+    )
+    if WRITE_LOGICAL_IDS:
+        tl.store(
+            logical_out_ptr + row * stride_logical_row + history_count,
+            tl.where(page >= 0, current_region, -1),
+        )
+    tl.store(counts_ptr + row, history_count + 1)
+
+
+def prefill_sparse_meta_fused(
+    logits,
+    q_positions,
+    block_table,
+    request_indices=None,
+    *,
+    topk,
+    region_size=8,
+    regions_per_page,
+    return_logical_ids=False,
+):
+    """Build exact Step5 short-prefill selection metadata in one kernel."""
+    rows, width = logits.shape
+    topk = int(topk)
+    if width <= 1:
+        from .step4_dsa_kernels import prefill_sparse_meta
+
+        return prefill_sparse_meta(
+            logits,
+            q_positions,
+            block_table,
+            request_indices,
+            topk=topk,
+            region_size=region_size,
+            regions_per_page=regions_per_page,
+            return_logical_ids=return_logical_ids,
+        )
+    if request_indices is None:
+        request_indices = torch.zeros(
+            rows, device=logits.device, dtype=torch.int32
+        )
+    if request_indices.numel() != rows or q_positions.numel() != rows:
+        raise ValueError(
+            "fused prefill metadata needs one request and position per score row"
+        )
+    if block_table.stride(1) != 1:
+        raise ValueError("selector block-table columns must be contiguous")
+
+    packed = torch.empty(
+        (rows, topk + 1), device=logits.device, dtype=torch.int32
+    )
+    logical_ids = (
+        torch.empty_like(packed) if return_logical_ids else None
+    )
+    counts = torch.empty(rows, device=logits.device, dtype=torch.int32)
+    table_stride = 0 if block_table.shape[0] == 1 else block_table.stride(0)
+    _prefill_sparse_meta_fused_kernel[(rows,)](
+        logits,
+        q_positions,
+        block_table,
+        request_indices,
+        packed,
+        packed if logical_ids is None else logical_ids,
+        counts,
+        width,
+        logits.stride(0),
+        table_stride,
+        packed.stride(0),
+        packed.stride(0) if logical_ids is None else logical_ids.stride(0),
+        topk=topk,
+        region_size=int(region_size),
+        regions_per_page=int(regions_per_page),
+        WRITE_LOGICAL_IDS=return_logical_ids,
+        BLOCK_R=min(2048, triton.next_power_of_2(width)),
+        BLOCK_TOPK=triton.next_power_of_2(topk + 1),
+    )
+    if return_logical_ids:
+        return packed, counts, logical_ids
+    return packed, counts
+
+
 _native_region_topk_ids = None
 _native_region_topk_pack = None
 

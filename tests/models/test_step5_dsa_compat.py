@@ -458,3 +458,62 @@ def test_fused_step5_indexer_norm_and_batched_scoring_match_reference():
         regions_per_page=regions_per_page,
     )
     assert torch.equal(actual, expected)
+
+def test_fused_step5_prefill_metadata_matches_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers import step4_dsa_kernels as kernels
+    from vllm_hcu.model_executor.layers.step5_dsa_selector import (
+        install_native_radix_selectors,
+        prefill_sparse_meta_fused,
+    )
+
+    original_threshold = kernels._radix_topk_threshold
+    original_ids = kernels.region_topk_ids
+    original_pack = kernels.region_topk_pack
+    try:
+        install_native_radix_selectors()
+        torch.manual_seed(71)
+        rows, width, topk, regions_per_page = 4, 2049, 512, 8
+        scores = torch.randn(rows, width, device="cuda", dtype=torch.float32)
+        scores[:, ::13] = 0.0
+        positions = torch.tensor(
+            [7, 4095, 8191, width * 8 - 1],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        requests = torch.tensor([0, 1, 0, 1], device="cuda", dtype=torch.int32)
+        pages = (width + 1 + regions_per_page - 1) // regions_per_page
+        block_table = (
+            torch.arange(2 * pages, device="cuda", dtype=torch.int32)
+            .reshape(2, pages)
+            + 1
+        )
+
+        expected = kernels.prefill_sparse_meta(
+            scores,
+            positions,
+            block_table,
+            requests,
+            topk=topk,
+            region_size=8,
+            regions_per_page=regions_per_page,
+            return_logical_ids=True,
+        )
+        actual = prefill_sparse_meta_fused(
+            scores,
+            positions,
+            block_table,
+            requests,
+            topk=topk,
+            region_size=8,
+            regions_per_page=regions_per_page,
+            return_logical_ids=True,
+        )
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+        assert torch.equal(actual[2], expected[2])
+    finally:
+        kernels._radix_topk_threshold = original_threshold
+        kernels.region_topk_ids = original_ids
+        kernels.region_topk_pack = original_pack

@@ -27,6 +27,11 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   most 32 target-verification tokens. The BS32 shape improved from 0.01319 ms
   to 0.00966 ms (1.37x), bit-identically. At 64 tokens the joint grid is slower,
   so BS64 and prefill retain the reference two-launch path.
+- Prefill radix selection now packs physical regions and appends the current
+  causal region in the same kernel. At 64K/top-512 this reduces the selection
+  metadata stage from 0.1184 ms to 0.1128 ms at BS32 (5.0%), and from 0.1537 ms
+  to 0.1470 ms at BS64 (4.5%), with identical packed slots, counts, and logical
+  IDs.
 
 ## Rejected after measurement
 

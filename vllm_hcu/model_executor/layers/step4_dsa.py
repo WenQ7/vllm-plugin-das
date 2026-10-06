@@ -75,6 +75,7 @@ _STEP5_DSA_SELECTOR = os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR", "")
 if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}:
     from vllm_hcu.model_executor.layers.step5_dsa_selector import (
         install_native_radix_selectors,
+        prefill_sparse_meta_fused,
     )
 
     install_native_radix_selectors()
@@ -1806,7 +1807,12 @@ def build_plan(
                 (starts[nd + 1 :] - starts[nd:-1]).to(positions.device),
             )
         group_request_indices = req_of_token.repeat(num_kv_groups)
-        packed, counts, logical_ids = prefill_sparse_meta(
+        prefill_meta = (
+            prefill_sparse_meta_fused
+            if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}
+            else prefill_sparse_meta
+        )
+        packed, counts, logical_ids = prefill_meta(
             prefill_logits,
             q_positions.repeat(num_kv_groups),
             attn_metadata.block_table,
