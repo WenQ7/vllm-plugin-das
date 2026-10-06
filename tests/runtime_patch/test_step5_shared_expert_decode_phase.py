@@ -20,11 +20,13 @@ def test_missing_descriptor_does_not_enable_overlap():
     assert not is_short_uniform_decode(None)
     assert not is_short_uniform_decode(NS(batch_descriptor=None))
 
-@pytest.mark.parametrize("uniform,expected", [
-    (False,SharedExpertsOrder.NO_OVERLAP),
-    (True,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
+@pytest.mark.parametrize("uniform,can_mk,expected", [
+    (False,True,SharedExpertsOrder.MK_INTERNAL_OVERLAPPED),
+    (False,False,SharedExpertsOrder.NO_OVERLAP),
+    (True,True,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
+    (True,False,SharedExpertsOrder.MULTI_STREAM_OVERLAPPED),
 ])
-def test_prefill_guard_cannot_be_bypassed_by_mk_internal(monkeypatch,uniform,expected):
+def test_phase_guard_limits_aux_stream_and_preserves_native_mk(monkeypatch,uniform,can_mk,expected):
     from vllm_hcu.model_executor.layers.fused_moe import shared_experts as module
     import vllm.forward_context
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS","1")
@@ -39,7 +41,7 @@ def test_prefill_guard_cannot_be_bypassed_by_mk_internal(monkeypatch,uniform,exp
     torch.nn.Module.__init__(item)
     item._step5_decode_only=True
     item._stream=object()
-    item._mk_can_overlap_shared_experts=lambda:True
+    item._mk_can_overlap_shared_experts=lambda:can_mk
     item._moe_config=NS(moe_parallel_config=NS(enable_eplb=False,use_fi_nvl_two_sided_kernels=False))
     assert item._determine_shared_experts_order(torch.empty(64,8))==expected
 
@@ -130,3 +132,69 @@ def test_mixed_attention_groups_do_not_enable_overlap():
     long=NS(query_start_loc_cpu=torch.tensor([0,128,256]),max_query_len=128,num_actual_tokens=256)
     ctx=NS(batch_descriptor=None,attn_metadata={"short":short,"long":long})
     assert not is_short_uniform_decode(ctx)
+
+@pytest.mark.parametrize('blocked', ['eplb', 'two_sided'])
+def test_nonshort_fallback_respects_native_overlap_restrictions(monkeypatch,blocked):
+    import vllm.forward_context
+    monkeypatch.setenv('VLLM_HCU_USE_CUSTOM_OPS','1')
+    monkeypatch.setenv('VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE','1')
+    monkeypatch.setattr(vllm.forward_context,'is_forward_context_available',lambda:True)
+    monkeypatch.setattr(vllm.forward_context,'get_forward_context',lambda:NS(
+        batch_descriptor=BatchDescriptor(512,16,False)))
+    item=SharedExperts.__new__(SharedExperts)
+    torch.nn.Module.__init__(item)
+    item._step5_decode_only=True
+    item._stream=object()
+    item._mk_can_overlap_shared_experts=lambda:True
+    item._moe_config=NS(moe_parallel_config=NS(
+        enable_eplb=blocked=='eplb',all2all_backend='deepep_low_latency',
+        use_fi_nvl_two_sided_kernels=blocked=='two_sided'))
+    assert item._determine_shared_experts_order(torch.empty(512,8))==SharedExpertsOrder.NO_OVERLAP
+
+
+def test_native_async_finalize_computes_shared_before_receive(monkeypatch):
+    import vllm.forward_context
+    from vllm_hcu.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernelModularImpl
+    monkeypatch.setenv('VLLM_HCU_USE_CUSTOM_OPS','1')
+    monkeypatch.setenv('VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE','1')
+    monkeypatch.setattr(vllm.forward_context,'is_forward_context_available',lambda:True)
+    monkeypatch.setattr(vllm.forward_context,'get_forward_context',lambda:NS(
+        batch_descriptor=BatchDescriptor(512,16,False)))
+    events=[]
+    class Layer(torch.nn.Module):
+        def forward(self,x):
+            events.append('shared_compute')
+            return x*2
+    item=SharedExperts.__new__(SharedExperts)
+    torch.nn.Module.__init__(item)
+    item._step5_decode_only=True
+    item._stream=object()  # Any aux-stream use would fail on this CPU test.
+    item._mk_can_overlap_shared_experts=lambda:True
+    item._moe_config=NS(moe_parallel_config=NS(
+        enable_eplb=False,use_fi_nvl_two_sided_kernels=False))
+    item._layer=Layer()
+    item.enable_dbo=False
+    item._output=[None,None]
+    item._output_pending_on_stream=[False,False]
+    class PrepareFinalize:
+        def supports_async(self):return True
+        def finalize_async(self,output,fused_out,*args):
+            events.append('combine_launched')
+            def hook():
+                assert item._output[0] is not None
+                events.append('recv_hook')
+            def receiver():
+                events.append('recv_complete')
+                output.copy_(fused_out)
+            return hook,receiver
+    impl=object.__new__(FusedMoEKernelModularImpl)
+    impl.prepare_finalize=PrepareFinalize()
+    impl.fused_experts=NS(finalize_weight_and_reduce_impl=lambda:None)
+    x=torch.randn(64,8)
+    fused=x+1
+    output=torch.empty_like(x)
+    impl._finalize(output,fused,x,torch.ones(64,1),torch.zeros(64,1,dtype=torch.int32),
+                   False,item,x)
+    assert events==['combine_launched','shared_compute','recv_hook','recv_complete']
+    torch.testing.assert_close(output,fused,rtol=0,atol=0)
+    torch.testing.assert_close(item.output,x*2,rtol=0,atol=0)

@@ -483,9 +483,10 @@ Evidence: /workspace/step5-tp2-performance/qkv-small-m-and-decode-overlap-202610
 
 STEP5_SHARED_EXPERT_OVERLAP=decode now enables an opt-in profile whose
 shared-expert aux stream is gated by the scheduler's host BatchDescriptor:
-uniform batches with 1--4 queries/request are eligible; missing, mixed,
-nonuniform, or large query chunks stay serial, including the MK-internal
-fallback. The decision is cached once per ForwardContext without reading
+uniform batches with 1--4 queries/request are eligible. The initial
+candidate made missing, mixed, nonuniform or large chunks serial, including
+the MK-internal fallback. The follow-up repair below preserves native MK
+overlap while restricting only the added aux-stream schedule. The decision is cached once per ForwardContext without reading
 a GPU count. This avoids relying only on the padded hidden-state shape,
 which allowed the previous overlap candidate to compete with Prefill.
 The formal default stays off and the standalone Prefill profile rejects
@@ -562,5 +563,39 @@ no request errors or output truncations (max_tokens8192). Temperature1,
 top_p0.95, seed42 and EvalScope1.12.0 native rule scoring were fixed.
 This provides ordinary inference evidence for the current Graph/tile
 profile; it is not a full-dataset accuracy guarantee. The calibrated-QKV
-FP8 pair remains pending. Evidence is preserved at
+FP8 pair subsequently completed as recorded below. Evidence is preserved at
 /workspace/step5-tp2-performance/fullgraph-qkv-ordinary-20261007.
+
+
+### Ordinary full-Graph QKV pair and native MK overlap repair
+
+The calibrated-QKV FP8 service completed the same frozen100 zero-shot
+GSM8K screen at 97/100 versus BF16's 96/100. Both sides used ordinary
+MTP3, full target Decode Graph, identical CLI, question IDs, prompt
+messages, input token counts, sampling parameters and EvalScope rules.
+Both completed without request errors or truncation. The new norm/round
+fusion was disabled on both sides to isolate QKV precision. Custom-op
+and quantization-GEMM settings were explicit true for FP8 and default true
+for BF16, as checked against the installed env defaults. Worker model
+inspection samples one DP's two TP workers; it is not an all-eight-worker
+audit. The per-question comparison records all grade transitions.
+This fixed100 result does not prove better FP8 accuracy or full-dataset
+noninferiority, and the matching64K/4K FP8 service performance is unverified.
+Formal QKV remains BF16 pending the performance decision.
+
+The rejected v2 aux-stream guard also disabled the baseline MK-internal
+shared/combine schedule on non-short batches. Native DeepEP-LL reports
+supports_async=True, and the modular finalizer starts combine, runs shared
+experts, then executes the receive hook. The revised guard limits only the
+new aux stream: non-short batches retain MK-internal overlap when supported,
+or remain serial when unsupported/native restrictions apply. EPLB and
+two-sided-backend restrictions are preserved. A native-finalizer ordering
+test confirms shared compute remains before receive completion. The new
+candidate has not yet been service-benchmarked; no recovery percentage is
+claimed from the code repair alone. Twenty-eight CPU tests and four native
+aux-stream/Graph GPU tests passed after the repair.
+
+The original vllm_hcu logger inherits WARNING and drops the candidate's
+INFO mode diagnostics. It now uses vllm.hcu.shared_experts, whose effective
+level is INFO, so the next full-model screen can verify the selected mode.
+Evidence and test logs are preserved in the fullgraph-qkv-ordinary directory.

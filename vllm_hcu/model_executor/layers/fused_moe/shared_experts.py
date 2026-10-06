@@ -26,7 +26,7 @@ from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.hcu.shared_experts")
 
 
 class SharedExpertsOrder(IntEnum):
@@ -150,6 +150,9 @@ class SharedExperts(torch.nn.Module):
         # Disable shared expert overlap if:
         #   - we are using eplb with non-default backend, because of correctness issues
         #   - we are using flashinfer with DP, since there nothing to gain
+        return self._baseline_disables_overlap()
+
+    def _baseline_disables_overlap(self) -> bool:
         parallel_config = self._moe_config.moe_parallel_config
         return (
             parallel_config.enable_eplb
@@ -167,11 +170,6 @@ class SharedExperts(torch.nn.Module):
                 or henvs.VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE
             )
         )
-        if force_stream and self._stream is None:
-            raise RuntimeError(
-                "HCU shared-expert stream mode was explicitly enabled, but no "
-                "CUDA-alike auxiliary stream is available"
-            )
         if getattr(self, "_step5_decode_only", False):
             from vllm.forward_context import (
                 get_forward_context, is_forward_context_available,
@@ -181,9 +179,23 @@ class SharedExperts(torch.nn.Module):
                 get_forward_context() if is_forward_context_available() else None
             )
             if not is_short_uniform_decode(context):
-                # Also prevent the MK-internal path from re-enabling overlap
-                # during chunked Prefill. Padding size alone is not a phase.
+                # Restrict only the new aux-stream schedule. Preserve native
+                # shared/combine overlap when the async backend supports it.
+                if (
+                    not self._baseline_disables_overlap()
+                    and self._mk_can_overlap_shared_experts()
+                ):
+                    logger.info_once(
+                        "Step5 non-short batch retains MK-internal shared/combine overlap",
+                        scope="local",
+                    )
+                    return SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
                 return SharedExpertsOrder.NO_OVERLAP
+        if force_stream and self._stream is None:
+            raise RuntimeError(
+                "HCU shared-expert stream mode was explicitly enabled, but no "
+                "CUDA-alike auxiliary stream is available"
+            )
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
 
