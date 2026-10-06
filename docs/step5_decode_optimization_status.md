@@ -784,3 +784,19 @@ CPU tests pass, including complete/partial/signed samples and margin guards.
 A v6 candidate uses512MiB extra Graph headroom and memory utilization0.956;
 all four actual capacities, successful real capture and native free-memory
 checks must still pass. The one-percent/page/draft benchmark guard is retained.
+
+
+### 2026-10-07: target Decode-only graph candidate
+
+The launcher now accepts `STEP5_TARGET_GRAPH_MODE=FULL_DECODE_ONLY` as an
+explicit opt-in. Native vLLM keeps FULL graphs for Decode and uses eager
+execution for prefill/mixed batches. The default remains FULL_AND_PIECEWISE.
+This does not disable the target model's complete Decode graph.
+
+The BS64 v6 candidate passed initialized KV capacity (1,127,489 tokens/DP;
+required page/draft bound 1,115,136 and 1% guard 1,125,366), but actual
+PIECEWISE capture failed in native TP all_gather allocation. No benchmark
+was started. Its service/controller were stopped after preserving the OOM
+stack and shutdown manifest. A Decode-only candidate will test whether
+removing the mixed-batch graph pool leaves sufficient real capture headroom;
+it is not yet a verified BS64 throughput result.

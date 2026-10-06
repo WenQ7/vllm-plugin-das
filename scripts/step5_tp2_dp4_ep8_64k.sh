@@ -62,10 +62,12 @@ else
   backend=deepep_low_latency; tokens=512; sequences=32; memory=0.92
   export VLLM_STEP5_BF16_COMPACT_GRID="${VLLM_STEP5_BF16_COMPACT_GRID:-1}"
   export VLLM_STEP5_GROUPED_HEAD_INDEXER="${VLLM_STEP5_GROUPED_HEAD_INDEXER:-1}"
+  # FULL_DECODE_ONLY keeps complete Decode graphs and runs mixed batches
+  # without PIECEWISE graphs; useful when the long-context KV budget is tight.
   target_graph_mode="${STEP5_TARGET_GRAPH_MODE:-FULL_AND_PIECEWISE}"
   case "$target_graph_mode" in
-    FULL_AND_PIECEWISE|PIECEWISE) ;;
-    *) echo "STEP5_TARGET_GRAPH_MODE must be FULL_AND_PIECEWISE or PIECEWISE" >&2; exit 2;;
+    FULL_AND_PIECEWISE|FULL_DECODE_ONLY|PIECEWISE) ;;
+    *) echo "STEP5_TARGET_GRAPH_MODE must be FULL_AND_PIECEWISE, FULL_DECODE_ONLY or PIECEWISE" >&2; exit 2;;
   esac
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=0 VLLM_STEP5_SP_LL_WORKSPACE=1 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=1
   compilation='{"cudagraph_mode":"'"$target_graph_mode"'","cudagraph_copy_inputs":true,"mode":3,"cudagraph_capture_sizes":[4,8,16,32,64,128,256,512]}'
