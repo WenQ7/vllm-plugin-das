@@ -58,11 +58,31 @@ weight copy for a shape switch would add memory without a decode gain.
   225.46 token/s QKV-FP8 reference to 220.26 token/s. The mixed FP8/BF16
   projection kernel was also 15.5% slower than the two native GEMMs at the
   TP2 four-token sparse shape. These paths remain disabled.
+- Merging only the four indexer projections reduced their M=32 operator time
+  from 0.0407 ms to 0.0244 ms, but changed BF16 GEMM rounding from M=8 upward.
+  In the identical 1024-to-512 BS32 service check, total throughput fell from
+  1053.79 to 793.94 token/s and MTP acceptance fell from 29.82% to 23.38%.
+  LightOP grouped BF16 GEMM cannot replace it because the installed gfx938
+  wheel lacks its grouped-GEMM HSACO. AITER grouped GEMM requires N divisible
+  by 128 (the gate projection has N=8); grouping the other three projections
+  was about 0.66--0.77 ms versus 0.036--0.040 ms for native separate GEMMs.
+- Fusing the attention head sigmoid gate into the output projection was also
+  rejected. The prototype took 0.100--0.117 ms for M=4--64, more than twice
+  the 0.046--0.062 ms native gate-plus-GEMM path, and was not bit-exact.
+- Restricting the fused main QK-norm/RoPE kernel to rotary-64 sparse layers
+  was numerically close (maximum BF16 absolute difference 0.03125) and fast as
+  an isolated operator. The service-level difference changed MTP behavior:
+  total/output throughput fell from 1053.79/348.99 to 926.54/306.85 token/s,
+  acceptance fell from 29.82% to 23.94%, and mean ITL changed from 138.68 to
+  139.30 ms. The production profile therefore retains the compiled native
+  QK-norm/RoPE sequence.
 - Early shared-expert launch on an auxiliary stream increased the 64K warm
   prefill maximum from 153.7 s to 324.4 s and reduced the observed active
   generation rate to 22.96 token/s. The existing token threshold does not
   remove contention at the production decode shape, so the formal profile
-  keeps the shared-expert stream disabled.
+  keeps the shared-expert stream disabled. vLLM also rejects dual-batch
+  overlap when speculative decoding or CUDA graphs are enabled, so DBO cannot
+  overlap DeepEP in the required MTP3 graph-enabled profile.
 
 ## Constraints that cannot be enabled by a flag
 
