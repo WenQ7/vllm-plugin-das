@@ -38,7 +38,9 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   omits the unused final LSE, eliminating one output copy per sparse layer.
   Including that copy, the isolated M=32/64/128 paths improve from
   0.1377/0.2218/0.3744 ms to 0.1342/0.2178/0.3681 ms, with bit-identical
-  output.
+  output. The split-state merge also selects one wave for two splits and eight
+  waves for four splits, reducing the complete direct-output path further to
+  0.1313/0.2134/0.3620 ms while preserving the reference reduction result.
 - The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
   kernel. It is the fastest installed implementation for this shape.
 - MTP3 short-prefill indexer scoring is batched across requests and reads the

@@ -3249,6 +3249,10 @@ def merge_split_states(
         if write_lse else None
     )
     lse_arg = lse if lse is not None else partial_lse
+    # Keep the reduction order used by the reference while matching wave count
+    # to the small split axis on BW1101. Two splits fit one wave; four splits
+    # expose more head-dimension parallelism with eight waves.
+    merge_warps = 1 if num_splits <= 2 else (8 if num_splits <= 4 else 4)
     _merge_split_states_kernel[(tokens, num_heads)](
         partial_out,
         partial_lse,
@@ -3267,6 +3271,8 @@ def merge_split_states(
         BLOCK_S=triton.next_power_of_2(num_splits),
         BLOCK_D=triton.next_power_of_2(head_dim),
         WRITE_LSE=write_lse,
+        num_warps=merge_warps,
+        num_stages=1,
     )
     return out, lse
 
