@@ -653,3 +653,37 @@ A window observer will terminate this owned benchmark only if a measured
 proves that common window is empty. This avoids continuing a known invalid
 performance run; observation delays alone do not trigger a restart.
 Candidate source and runtime evidence are under the bs64-capacity directory.
+
+
+### Fused fixed-address SWA window metadata
+
+VLLM_STEP5_FUSED_WINDOW_METADATA=1 replaces the builder's separate length,
+offset, gather, mask and staging-copy operations with one Triton kernel.
+It writes directly into the existing contiguous tables, one persistent table
+per width, and persistent length buffers. It preserves every table element
+including invisible trailing cells, accepts strided input metadata, reads
+no device count on the CPU and keeps Graph replay addresses stable.
+Cascade, noncausal and unsupported parallel/window cases retain native guards.
+The default remains off pending a full-model performance decision.
+
+Eight CPU policy tests passed (vendor FA dependency isolated for CPU testing),
+and nineteen native GPU tests passed: queries1/4/512, window1/64/512, strided
+inputs, changing sequences/pages/query offsets, persistent builder addresses
+and exact production BF16 GQA Attention under Graph replay. The independent
+qualification adds fifteen metadata geometries, three replays each and three
+native Attention replays with long/ragged/padded requests. All outputs match
+the old path exactly.
+At the measured eight-request shape, old/new metadata time including staging
+was0.06372/0.00819ms eager and0.03792/0.00190ms in an isolated Graph.
+This removes builder overhead outside the model's FULL Graph; it is not yet
+an end-to-end throughput result. Evidence: bs64-capacity-20261007.
+
+The256-token BS64 capacity candidate did not produce a valid Decode window.
+A4096-token main request completed on every DP while nine requests/DP were
+still queued. Thus min(completed last token) precedes max(first token) and
+the supplied benchmark's common64-request window is necessarily empty.
+The owned benchmark was terminated after this proof, clients disconnected,
+all running/waiting counters returned to zero, and the service was stopped.
+There was no preemption. Capacity remains proven; BS64 pure-Decode TPS does
+not. Preserve the original output4096 and measurement formula while improving
+scheduler/workspace capacity rather than relabeling this as valid BS64 TPS.

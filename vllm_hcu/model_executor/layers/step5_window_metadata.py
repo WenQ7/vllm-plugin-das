@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import os
 
 import torch
 
@@ -79,6 +80,13 @@ class Step5WindowMetadataBuilder(FlashAttentionMetadataBuilder):
         )
         if not self._step5_window_enabled or self._step5_window <= 0:
             return metadata
+        if (
+            os.getenv("VLLM_STEP5_FUSED_WINDOW_METADATA", "0") == "1"
+            and not metadata.use_cascade
+            and metadata.causal is True
+            and metadata.block_table.shape[1] > 0
+        ):
+            return self._stage_fused_tail_metadata(metadata)
         tail = truncate_window_metadata(
             metadata, block_size=self.block_size, window=self._step5_window
         )
@@ -86,10 +94,9 @@ class Step5WindowMetadataBuilder(FlashAttentionMetadataBuilder):
             return metadata
         return self._stage_tail_metadata(tail)
 
-    def _stage_tail_metadata(self, metadata):
+    def _tail_buffers(self, rows, columns):
         # The builder runs before every replay. Stage into fixed addresses so
         # recorded attention kernels see this step's lengths and physical pages.
-        rows, columns = metadata.block_table.shape
         if rows > self._step5_tail_table.shape[0] or columns > self._step5_tail_table.shape[1]:
             raise RuntimeError("Step5 sliding-window metadata exceeds its scheduler capacity")
         # Vendor paged attention indexes rows by the table width, without a
@@ -106,6 +113,29 @@ class Step5WindowMetadataBuilder(FlashAttentionMetadataBuilder):
             )
         table = self._step5_tail_tables[columns][:rows]
         lengths = self._step5_tail_lens[:rows]
+        return table, lengths
+
+    def _stage_fused_tail_metadata(self, metadata):
+        from .step5_window_metadata_kernel import fused_tail_into
+        max_tail = metadata.max_query_len + self._step5_window - 1 + self.block_size - 1
+        rows = metadata.block_table.shape[0]
+        columns = min(
+            metadata.block_table.shape[1],
+            (max_tail + self.block_size - 1) // self.block_size,
+        )
+        table, lengths = self._tail_buffers(rows, columns)
+        fused_tail_into(
+            metadata.seq_lens, metadata.query_start_loc, metadata.block_table,
+            lengths, table, self._step5_window, self.block_size,
+        )
+        result = copy.copy(metadata)
+        result.block_table = table
+        result.seq_lens = lengths
+        result.max_seq_len = max_tail
+        return result
+
+    def _stage_tail_metadata(self, metadata):
+        table, lengths = self._tail_buffers(*metadata.block_table.shape)
         table.copy_(metadata.block_table)
         lengths.copy_(metadata.seq_lens)
         result = copy.copy(metadata)
