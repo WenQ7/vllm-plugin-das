@@ -78,6 +78,11 @@ weight copy for a shape switch would add memory without a decode gain.
 - Fusing the attention head sigmoid gate into the output projection was also
   rejected. The prototype took 0.100--0.117 ms for M=4--64, more than twice
   the 0.046--0.062 ms native gate-plus-GEMM path, and was not bit-exact.
+- Folding the indexer Q e4m3 rounding into fused QK-norm/RoPE was
+  bit-identical and reduced the isolated norm-plus-scorer pipeline by 9.5% at
+  BS32. It did not improve the fixed-acceptance service run: total/output
+  throughput changed from 1596.26/528.64 to 1571.71/520.52 token/s and mean
+  TPOT increased from 48.74 to 49.71 ms, so the standalone rounding pass stays.
 - Restricting the fused main QK-norm/RoPE kernel to rotary-64 sparse layers
   was numerically close (maximum BF16 absolute difference 0.03125) and fast as
   an isolated operator. The service-level difference changed MTP behavior:
