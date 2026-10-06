@@ -800,3 +800,38 @@ was started. Its service/controller were stopped after preserving the OOM
 stack and shutdown manifest. A Decode-only candidate will test whether
 removing the mixed-batch graph pool leaves sufficient real capture headroom;
 it is not yet a verified BS64 throughput result.
+
+
+### 2026-10-07: native GEMM/combine overlap interface audit
+
+The installed HCU DeepEP exposes SBO combine arguments (`packed_recv_count`,
+`comp_signal`, `block_m`, `threshold`, `num_sms`). Its native validation
+requires a contiguous 1-D int32 signal of size
+`local_experts * ceil(num_ranks * max_dispatch_tokens / 64)`, receive counts,
+explicit launch settings and `return_recv_hook=True`. This alone does not
+prove compatibility with a GEMM producer or its release ordering.
+
+The exact installed Step5 FP8 down-GEMM path (`deepgemm.m_grouped_fp8_gemm_nt_masked`
+-> `low_latency_grouped_gemm`, E44/M64/K1536/N4096, valid six-dimensional
+packed weights, float8_e4m3fn) successfully executed with overlap disabled.
+With the same valid inputs and `enable_overlap=True`, it raised
+`RuntimeError: low_latency_grouped_gemm does not support overlap`. The API
+parameter cannot currently enable routed-expert GEMM/combine overlap.
+The installed ASM wrapper separately rejects its removed overlap mode.
+
+Evidence: `bs64-capacity-20261007/native_deepgemm_overlap_rejection.json`.
+A native producer implementation or a separately verified ready-tile
+kernel is still required. Existing MK combine/shared-expert overlap remains
+available; the additional shared-expert stream remains disabled after its
+measured regression. This item is incomplete, not counted as adopted.
+
+The v7 Decode-only graph candidate reduced profiled graph memory from
+2.58 to 2.22 GiB and reported 1,137,011 KV tokens/DP. Actual FULL warmup
+still failed on a 704 MiB native BF16 MTP DeepEP receive allocation. No
+benchmark ran. v8 tests a smaller scheduler bound (384 scheduled tokens; the existing
+128-token dispatch alignment still rounds 192 SP rows to 256 per rank), 1 GiB explicit graph headroom, and a native
+24-token per-request long-prefill limit. The limit aims to admit and advance
+all 16 prompts/DP together, preserving a common BS64 Decode measurement
+window. All original request lengths, sampling and measurement gates remain
+unchanged. v8 is a candidate until actual startup, capacity, Graph replay
+and the single measured iteration pass.
