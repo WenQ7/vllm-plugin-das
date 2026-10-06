@@ -68,7 +68,16 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-if os.environ.get("VLLM_STEP5_DSA_TORCH_SELECTOR") == "1":
+if os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR") == "1":
+    from vllm_hcu.model_executor.layers.step5_dsa_selector import (
+        install_native_radix_selectors,
+    )
+
+    install_native_radix_selectors()
+    logger.info(
+        "Step5 DSA: native radix selectors enabled with gfx938 workaround"
+    )
+elif os.environ.get("VLLM_STEP5_DSA_TORCH_SELECTOR") == "1":
     from vllm_hcu.model_executor.layers.step5_dsa_compat import install_torch_selectors
 
     install_torch_selectors()

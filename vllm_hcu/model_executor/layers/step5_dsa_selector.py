@@ -8,6 +8,72 @@ import torch
 from vllm.triton_utils import triton, tl
 
 
+@triton.jit
+def _ordered_float_key_gfx938(scores):
+    bits = scores.to(tl.int32, bitcast=True).to(tl.int64) & 0xFFFFFFFF
+    return tl.where(
+        scores < 0.0,
+        (~bits) & 0xFFFFFFFF,
+        bits | 0x80000000,
+    )
+
+
+@triton.jit
+def _radix_topk_threshold_gfx938(
+    logits_ptr,
+    row,
+    stride_logits_row,
+    visible,
+    budget,
+    seq_regions,
+    BLOCK_R: tl.constexpr,
+):
+    """Step4 radix threshold with the DTK scalar/vector workaround.
+
+    DTK's gfx938 backend assigns ``remaining`` to an SGPR pair when the
+    caller compares it with a vector after multiple region tiles. Broadcast
+    both return values here so the caller receives VGPR operands. The radix
+    arithmetic and tie semantics are otherwise identical to the vendored
+    kernel.
+    """
+    threshold = budget.to(tl.int64) * 0
+    remaining = budget
+    bucket_ids = tl.arange(0, 256)
+    for radix_pass in tl.static_range(4):
+        shift = 32 - 8 * (radix_pass + 1)
+        histogram = tl.zeros((256,), dtype=tl.int32)
+        for base in tl.range(0, seq_regions, BLOCK_R):
+            regions = base + tl.arange(0, BLOCK_R)
+            live = regions < visible
+            scores = tl.load(
+                logits_ptr + row * stride_logits_row + regions,
+                mask=live,
+                other=0.0,
+            )
+            keys = _ordered_float_key_gfx938(scores)
+            if radix_pass == 0:
+                matches = live
+            else:
+                high = shift + 8
+                matches = live & ((keys >> high) == (threshold >> high))
+            buckets = tl.where(
+                matches, ((keys >> shift) & 255).to(tl.int32), 0
+            )
+            counts = tl.histogram(buckets, 256)
+            parked = tl.sum((~matches).to(tl.int32))
+            histogram += counts - tl.where(bucket_ids == 0, parked, 0)
+        total = tl.sum(histogram)
+        above = total - tl.cumsum(histogram, axis=0)
+        chosen = tl.min(tl.where(above < remaining, bucket_ids, 256))
+        remaining -= tl.sum(tl.where(bucket_ids > chosen, histogram, 0))
+        threshold |= chosen.to(tl.int64) << shift
+    lanes = tl.arange(0, BLOCK_R)
+    return (
+        threshold + lanes.to(tl.int64) * 0,
+        remaining.to(tl.int32) + lanes * 0,
+    )
+
+
 @triton.jit(do_not_specialize=["width", "stride_row", "stride_col"])
 def _make_ranks(logits, lengths, ranks, width,
                 stride_row, stride_col,
@@ -143,3 +209,74 @@ def pack_regions_fused(logical, q_positions, block_table, request_indices, *,
         region_size, regions_per_page, SINGLE_REQUEST=single,
         BLOCK=256, num_warps=4)
     return output
+
+
+_native_region_topk_ids = None
+_native_region_topk_pack = None
+
+
+def _region_topk_ids_radix(logits, lengths, *, topk, block_r=2048):
+    # BLOCK_R=1 is scalarized again by DTK and hits the same register-class
+    # compiler bug. It is an early-request corner with no performance value.
+    if logits.shape[1] <= 1:
+        from .step5_dsa_compat import region_topk_ids
+
+        return region_topk_ids(logits, lengths, topk=topk, block_r=block_r)
+    return _native_region_topk_ids(
+        logits, lengths, topk=topk, block_r=block_r
+    )
+
+
+def _region_topk_pack_radix(
+    logits,
+    lengths,
+    q_positions,
+    block_table,
+    request_indices=None,
+    *,
+    topk,
+    region_size=8,
+    regions_per_page,
+    block_r=2048,
+    _logical_out=None,
+):
+    if logits.shape[1] <= 1:
+        from .step5_dsa_compat import region_topk_pack
+
+        return region_topk_pack(
+            logits,
+            lengths,
+            q_positions,
+            block_table,
+            request_indices,
+            topk=topk,
+            region_size=region_size,
+            regions_per_page=regions_per_page,
+            block_r=block_r,
+            _logical_out=_logical_out,
+        )
+    return _native_region_topk_pack(
+        logits,
+        lengths,
+        q_positions,
+        block_table,
+        request_indices,
+        topk=topk,
+        region_size=region_size,
+        regions_per_page=regions_per_page,
+        block_r=block_r,
+        _logical_out=_logical_out,
+    )
+
+
+def install_native_radix_selectors():
+    """Enable the exact Triton radix selector with the gfx938 workaround."""
+    global _native_region_topk_ids, _native_region_topk_pack
+    from . import step4_dsa_kernels as kernels
+
+    if _native_region_topk_ids is None:
+        _native_region_topk_ids = kernels.region_topk_ids
+        _native_region_topk_pack = kernels.region_topk_pack
+    kernels._radix_topk_threshold = _radix_topk_threshold_gfx938
+    kernels.region_topk_ids = _region_topk_ids_radix
+    kernels.region_topk_pack = _region_topk_pack_radix

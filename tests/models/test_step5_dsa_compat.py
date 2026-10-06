@@ -237,3 +237,87 @@ def test_shared_block_table_ignores_request_index():
         regions_per_page=2,
     )
     assert out.tolist() == [[10 | (8 << 24), 11 | (8 << 24)]]
+
+
+def test_native_radix_selector_gfx938_workaround():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers import step4_dsa_kernels as kernels
+    from vllm_hcu.model_executor.layers.step5_dsa_selector import (
+        install_native_radix_selectors,
+    )
+
+    original_threshold = kernels._radix_topk_threshold
+    original_ids = kernels.region_topk_ids
+    original_pack = kernels.region_topk_pack
+    try:
+        install_native_radix_selectors()
+        torch.manual_seed(41)
+        rows, width, topk = 4, 2049, 512
+        scores = torch.randn(rows, width, device="cuda", dtype=torch.float32)
+        scores[:, ::11] = 0.0
+        lengths = torch.tensor(
+            [0, 1, 2048, width], device="cuda", dtype=torch.int32
+        )
+        positions = lengths * 8 + 3
+        table = torch.arange(
+            2 * 1030, device="cuda", dtype=torch.int32
+        ).reshape(2, 1030)
+        requests = torch.arange(rows, device="cuda", dtype=torch.int32) % 2
+
+        expected_ids = region_topk_ids(scores, lengths, topk=topk)
+        actual_ids = kernels.region_topk_ids(scores, lengths, topk=topk)
+        expected_logical = torch.empty_like(expected_ids)
+        actual_logical = torch.empty_like(expected_ids)
+        expected_pack, expected_logical = region_topk_pack(
+            scores, lengths, positions, table, requests,
+            topk=topk, regions_per_page=2,
+            _logical_out=expected_logical,
+        )
+        actual_pack, actual_logical = kernels.region_topk_pack(
+            scores, lengths, positions, table, requests,
+            topk=topk, regions_per_page=2,
+            _logical_out=actual_logical,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.equal(actual_ids, expected_ids)
+        assert torch.equal(actual_logical, expected_logical)
+        assert torch.equal(actual_pack, expected_pack)
+
+        # A one-column score buffer is scalarized by the DTK compiler, so the
+        # wrapper must retain the exact compatibility path for this corner.
+        tiny_scores = scores[:2, :1].contiguous()
+        tiny_lengths = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        tiny_positions = tiny_lengths * 8 + 3
+        tiny_requests = requests[:2]
+        expected_tiny_ids = region_topk_ids(
+            tiny_scores, tiny_lengths, topk=topk
+        )
+        actual_tiny_ids = kernels.region_topk_ids(
+            tiny_scores, tiny_lengths, topk=topk
+        )
+        expected_tiny_pack = region_topk_pack(
+            tiny_scores,
+            tiny_lengths,
+            tiny_positions,
+            table,
+            tiny_requests,
+            topk=topk,
+            regions_per_page=2,
+        )
+        actual_tiny_pack = kernels.region_topk_pack(
+            tiny_scores,
+            tiny_lengths,
+            tiny_positions,
+            table,
+            tiny_requests,
+            topk=topk,
+            regions_per_page=2,
+        )
+        assert torch.equal(actual_tiny_ids, expected_tiny_ids)
+        assert torch.equal(actual_tiny_pack, expected_tiny_pack)
+    finally:
+        kernels._radix_topk_threshold = original_threshold
+        kernels.region_topk_ids = original_ids
+        kernels.region_topk_pack = original_pack
