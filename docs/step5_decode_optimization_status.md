@@ -767,3 +767,20 @@ the private pool reservation. This is an operator/storage qualification,
 not an end-to-end Decode throughput result.
 Evidence: bs64-capacity-20261007/swa_workspace_gpu_tests.log and
 qualify_swa_shared_arena.json.
+
+
+The v5 native shared-arena path was confirmed active in worker startup.
+All-FULL profiling measured2.58GiB, down from v4's2.75GiB, and effective
+capacity reached1137127 tokens/DP. Real PIECEWISE capture nevertheless
+failed on a352MiB DeepEP receive allocation with less than1GiB physical
+free memory. This is not a service result or proof of a sufficient reserve.
+The owned failed service/controller were stopped; no BS64 benchmark ran.
+
+The exact-profile option now also accepts explicit nonnegative integer
+VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES (default0). This adds headroom to the
+native whole-pool profile rather than bypassing profiling. Invalid values
+fail before capture, and other contexts retain native accounting. Sixteen
+CPU tests pass, including complete/partial/signed samples and margin guards.
+A v6 candidate uses512MiB extra Graph headroom and memory utilization0.956;
+all four actual capacities, successful real capture and native free-memory
+checks must still pass. The one-percent/page/draft benchmark guard is retained.

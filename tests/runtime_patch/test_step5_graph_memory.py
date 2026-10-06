@@ -150,3 +150,23 @@ def test_signed_full_deltas_preserve_whole_pool_measurement(runtime, config, nat
     with runtime.exact_graph_memory(config):
         estimate = native._extrapolate_full_graph_memory(samples, len(samples))
         assert measured - sum(samples) + estimate == measured
+
+
+def test_margin_adds_headroom_without_changing_native_pool_accounting(runtime, config, native, monkeypatch):
+    monkeypatch.setenv("VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES", str(512*1024*1024))
+    samples = [-10, -20, -30]
+    measured = 2952790016
+    with runtime.exact_graph_memory(config):
+        assert measured - sum(samples) + native._extrapolate_full_graph_memory(samples, 3) == measured + 512*1024*1024
+        assert native._extrapolate_full_graph_memory([100, 60], 6) == 400 + 512*1024*1024
+    assert native._extrapolate_full_graph_memory([100, 60], 6) == 400
+
+
+@pytest.mark.parametrize("raw", ["-1", "512MB", "nan"])
+def test_margin_rejects_invalid_bytes_before_profiling(runtime, config, native, monkeypatch, raw):
+    monkeypatch.setenv("VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES", raw)
+    with pytest.raises(ValueError):
+        with runtime.exact_graph_memory(config):
+            pytest.fail("Invalid margin must fail before profiling")
+    assert not runtime._exact_profile.get()
+    assert not hasattr(native, "_step5_exact_graph_memory_installed")
