@@ -372,3 +372,89 @@ def test_flash_sparse_short_prefill_matches_triton():
     )
     torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-5, atol=2e-5)
+
+def test_fused_step5_indexer_norm_and_batched_scoring_match_reference():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA/HIP unavailable")
+    from vllm_hcu.model_executor.layers.step4_dsa import (
+        short_prefill_indexer_logits,
+    )
+    from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
+        indexer_logits,
+        indexer_norm_rope,
+        round_activations_e4m3,
+    )
+    from vllm_hcu.model_executor.layers.step5_dsa_norm_rope import (
+        fused_indexer_qk_norm_rope,
+    )
+
+    torch.manual_seed(67)
+    tokens, groups, heads, proxy, rotary = 8, 2, 4, 256, 64
+    q = torch.randn(
+        tokens, groups * heads * proxy, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(tokens, proxy, device="cuda", dtype=torch.bfloat16)
+    z = torch.randn_like(k)
+    q_weight = torch.randn(proxy, device="cuda", dtype=torch.bfloat16)
+    k_weight = torch.randn(proxy, device="cuda", dtype=torch.bfloat16)
+    k_bias = torch.randn(proxy, device="cuda", dtype=torch.bfloat16)
+    cos = torch.randn(256, rotary, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    positions = torch.arange(120, 128, device="cuda")
+
+    expected_q, expected_k, _ = indexer_norm_rope(
+        q, k, z, q_weight, k_weight, k_bias, cos, sin, positions,
+        head_dim=proxy, num_q_heads=groups * heads, num_k_heads=1,
+        rotary_dim=rotary, eps=1e-6, q_norm_weight_bias=1.0,
+    )
+    actual_q, actual_k = fused_indexer_qk_norm_rope(
+        q, k, q_weight, k_weight, k_bias, cos, sin, positions,
+        head_dim=proxy, num_q_heads=groups * heads,
+        rotary_dim=rotary, eps=1e-6,
+    )
+    assert torch.equal(actual_q, expected_q)
+    assert torch.equal(actual_k, expected_k)
+
+    index_q = round_activations_e4m3(
+        actual_q.view(tokens, groups, heads, proxy)
+    )
+    weights = torch.randn(
+        tokens, groups, heads, device="cuda", dtype=torch.float32
+    )
+    requests = torch.tensor([0] * 4 + [1] * 4, device="cuda", dtype=torch.int32)
+    score_positions = torch.tensor(
+        [124, 125, 126, 127] * 2, device="cuda", dtype=torch.int32
+    )
+    regions_per_page, width = 8, 15
+    block_table = torch.tensor(
+        [[1, 2], [3, 4]], device="cuda", dtype=torch.int32
+    )
+    summary = torch.randn(
+        5 * regions_per_page, 1, proxy,
+        device="cuda", dtype=torch.bfloat16,
+    ).to(torch.float8_e4m3fn)
+    expected = torch.zeros(
+        groups * tokens, width, device="cuda", dtype=torch.float32
+    )
+    logical = torch.arange(width, device="cuda")
+    for request in range(2):
+        slots = (
+            block_table[request, logical // regions_per_page].to(torch.int64)
+            * regions_per_page
+            + logical % regions_per_page
+        )
+        indexer_logits(
+            index_q[request * 4 : (request + 1) * 4],
+            weights[request * 4 : (request + 1) * 4],
+            summary[slots].to(torch.bfloat16),
+            out=expected,
+            out_row_base=request * 4,
+            out_group_stride=tokens,
+            quantize_keys=False,
+        )
+    actual = torch.zeros_like(expected)
+    short_prefill_indexer_logits(
+        index_q, weights, summary, block_table, requests, score_positions, actual,
+        regions_per_page=regions_per_page,
+    )
+    assert torch.equal(actual, expected)

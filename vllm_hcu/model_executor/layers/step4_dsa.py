@@ -43,6 +43,9 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
     sparse_attention_decode,
     sparse_attention_prefill,
 )
+from vllm_hcu.model_executor.layers.step5_dsa_norm_rope import (
+    fused_indexer_qk_norm_rope,
+)
 from vllm_hcu.model_executor.layers.step5_dsa_shortquery import (
     sparse_attention_short_prefill,
     prefill_request_indices_device,
@@ -900,6 +903,163 @@ def decode_indexer_logits(
         BLOCK_K=block_k,
     )
 
+
+@triton.jit
+def _short_prefill_indexer_logits_kernel(
+    index_q_ptr,
+    summary_ptr,
+    block_table_ptr,
+    request_indices_ptr,
+    positions_ptr,
+    weights_ptr,
+    out_ptr,
+    num_tokens,
+    stride_q_token,
+    stride_q_group,
+    stride_q_head,
+    stride_s_row,
+    stride_bt_req,
+    stride_w_token,
+    stride_w_group,
+    stride_out_row,
+    heads_per_group: tl.constexpr,
+    proxy_dim: tl.constexpr,
+    regions_per_page: tl.constexpr,
+    region_size: tl.constexpr,
+    query_dtype: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    """Score every short-prefill query against its request's summary pool.
+
+    MTP verification contributes four queries per request. The reference path
+    loops over requests on the host because ``indexer_logits`` accepts one key
+    set; moving the request lookup into this grid removes 8 or 16 launches per
+    DSA layer at total BS32 or BS64 while retaining the same dot-product and
+    head accumulation order.
+    """
+    token = tl.program_id(0)
+    k_block = tl.program_id(1)
+    group = tl.program_id(2)
+
+    queries = tl.arange(0, BLOCK_Q)
+    keys = k_block * BLOCK_K + tl.arange(0, BLOCK_K)
+    dims = tl.arange(0, proxy_dim)
+    request = tl.load(request_indices_ptr + token).to(tl.int64)
+    visible = tl.load(positions_ptr + token).to(tl.int32) // region_size
+    key_ok = keys < visible
+
+    pages = tl.load(
+        block_table_ptr
+        + request * stride_bt_req
+        + keys // regions_per_page,
+        mask=key_ok,
+        other=0,
+    ).to(tl.int64)
+    slots = pages * regions_per_page + keys % regions_per_page
+    key_tile = tl.load(
+        summary_ptr + slots[None, :] * stride_s_row + dims[:, None],
+        mask=key_ok[None, :],
+        other=0.0,
+    ).to(query_dtype)
+
+    query_ok = queries < 1
+    accumulator = tl.zeros((BLOCK_Q, BLOCK_K), dtype=tl.float32)
+    for head in tl.static_range(heads_per_group):
+        query_tile = tl.load(
+            index_q_ptr
+            + token * stride_q_token
+            + group * stride_q_group
+            + head * stride_q_head
+            + dims[None, :]
+            + queries[:, None] * 0,
+            mask=query_ok[:, None],
+            other=0.0,
+        )
+        head_weight = tl.load(
+            weights_ptr
+            + token * stride_w_token
+            + group * stride_w_group
+            + head
+        ).to(tl.float32)
+        scores = tl.dot(query_tile, key_tile, out_dtype=tl.float32)
+        accumulator += tl.maximum(scores, 0.0) * head_weight
+
+    row = group * num_tokens + token
+    tl.store(
+        out_ptr
+        + row * stride_out_row
+        + keys[None, :]
+        + queries[:, None] * 0,
+        accumulator,
+        mask=query_ok[:, None] & key_ok[None, :],
+    )
+
+
+def short_prefill_indexer_logits(
+    index_q: torch.Tensor,
+    weights: torch.Tensor,
+    summary: torch.Tensor,
+    block_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    positions: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    regions_per_page: int,
+    region_size: int = REGION_BLOCK_SIZE,
+    block_k: int = 128,
+) -> None:
+    """Batched request-aware indexer scoring for MTP verification queries."""
+    num_tokens, groups, heads_per_group, proxy_dim = index_q.shape
+    width = out.shape[1]
+    if request_indices.numel() != num_tokens or positions.numel() != num_tokens:
+        raise ValueError(
+            "short-prefill indexer needs one request and position per query; "
+            f"got tokens={num_tokens}, requests={request_indices.numel()}, "
+            f"positions={positions.numel()}"
+        )
+    if summary.shape[-1] != proxy_dim:
+        raise ValueError(f"proxy_dim mismatch: q={proxy_dim} pool={summary.shape[-1]}")
+    if out.shape[0] != groups * num_tokens:
+        raise ValueError(
+            f"out has {out.shape[0]} rows, expected {groups * num_tokens}"
+        )
+    if width > block_table.shape[1] * regions_per_page:
+        raise ValueError(
+            f"score width {width} exceeds the {block_table.shape[1]} pages x "
+            f"{regions_per_page} regions the block table can address"
+        )
+
+    quantized_q = round_activations_e4m3(index_q)
+    _short_prefill_indexer_logits_kernel[
+        (num_tokens, triton.cdiv(width, block_k), groups)
+    ](
+        quantized_q,
+        summary,
+        block_table,
+        request_indices,
+        positions,
+        weights,
+        out,
+        num_tokens,
+        quantized_q.stride(0),
+        quantized_q.stride(1),
+        quantized_q.stride(2),
+        summary.stride(0),
+        block_table.stride(0),
+        weights.stride(0),
+        weights.stride(1),
+        out.stride(0),
+        heads_per_group=heads_per_group,
+        proxy_dim=proxy_dim,
+        regions_per_page=regions_per_page,
+        region_size=region_size,
+        query_dtype=(
+            tl.bfloat16 if quantized_q.dtype is torch.bfloat16 else tl.float16
+        ),
+        BLOCK_Q=16,
+        BLOCK_K=block_k,
+    )
 
 # --------------------------------------------------------------------------
 # Metadata
@@ -2983,26 +3143,50 @@ class Step4Indexer:
             device=hidden_states.device,
             dtype=index_q.dtype,
         )
-        # Only index_k is normalised and rotated; index_q is normalised without
-        # rotation and index_z is returned untouched -- it is a per-dimension
-        # softmax logit, not a key.
-        index_q, index_k, index_z = indexer_norm_rope(
-            index_q,
-            index_k,
-            index_z,
-            owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype),
-            owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype),
-            owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype),
-            cos,
-            sin,
-            positions,
-            head_dim=proxy,
-            num_q_heads=self.num_heads,
-            num_k_heads=1,
-            rotary_dim=cos.shape[1],
-            eps=self.eps,
-            q_norm_weight_bias=1.0,
-        )
+        # Q uses RMSNorm and K uses LayerNorm; both then receive partial
+        # RoPE. Index Z is returned untouched because it is a per-dimension
+        # softmax logit rather than a key.
+        q_norm_weight = owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype)
+        k_norm_weight = owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype)
+        k_norm_bias = owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype)
+        # At the TP2 + DP4 MTP3 shape, total BS32 gives each DP eight
+        # requests and therefore 32 target-verification tokens. Combining the
+        # Q and K grids removes one launch and is 1.37x faster there. Once the
+        # local token count reaches 64, the larger joint grid loses occupancy;
+        # retain the two reference launches for BS64 and prefill.
+        if num_tokens <= 32:
+            index_q, index_k = fused_indexer_qk_norm_rope(
+                index_q,
+                index_k,
+                q_norm_weight,
+                k_norm_weight,
+                k_norm_bias,
+                cos,
+                sin,
+                positions,
+                head_dim=proxy,
+                num_q_heads=self.num_heads,
+                rotary_dim=cos.shape[1],
+                eps=self.eps,
+            )
+        else:
+            index_q, index_k, index_z = indexer_norm_rope(
+                index_q,
+                index_k,
+                index_z,
+                q_norm_weight,
+                k_norm_weight,
+                k_norm_bias,
+                cos,
+                sin,
+                positions,
+                head_dim=proxy,
+                num_q_heads=self.num_heads,
+                num_k_heads=1,
+                rotary_dim=cos.shape[1],
+                eps=self.eps,
+                q_norm_weight_bias=1.0,
+            )
 
         # Round the fp32 weight to the activation dtype *before* the GEMM and
         # widen the result back to fp32 afterwards. Both boundaries are part of
@@ -3207,6 +3391,31 @@ class Step4Indexer:
                 dtype=torch.float32,
                 device=device,
             )
+
+        prefill_plans = [
+            plan for plan in sched.requests if plan.row >= num_decodes
+        ]
+        batched_short_prefill = (
+            os.environ.get("VLLM_STEP5_BATCHED_SHORT_INDEXER", "0") == "1"
+            and not DENSE_EQUIV
+            and prefill_logits is not None
+            and md.prefill_request_indices is not None
+            and max((plan.qlen for plan in prefill_plans), default=0) <= 4
+            and width_prefill > 0
+        )
+        if batched_short_prefill:
+            assert md.positions is not None
+            short_prefill_indexer_logits(
+                index_q[num_decode_tokens:].contiguous(),
+                weights[num_decode_tokens:].contiguous(),
+                summary,
+                md.block_table,
+                md.prefill_request_indices,
+                md.positions[num_decode_tokens:md.num_actual_tokens],
+                prefill_logits,
+                regions_per_page=state.regions_per_page,
+            )
+
         if DENSE_EQUIV:
             # All-zero scores plus topk >= every row's region count selects
             # every visible region, which makes DSA exactly full causal
@@ -3217,8 +3426,10 @@ class Step4Indexer:
         for plan in sched.requests:
             if plan.nscore == 0:
                 continue
-            keys = summary[plan.score_slots].to(index_q.dtype)
             decode = plan.row < num_decodes
+            if batched_short_prefill and not decode:
+                continue
+            keys = summary[plan.score_slots].to(index_q.dtype)
             out = decode_logits if decode else prefill_logits
             stride = num_decodes if decode else num_prefill_tokens
             base = plan.row if decode else plan.tok_start - num_decode_tokens

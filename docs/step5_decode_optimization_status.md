@@ -18,6 +18,15 @@ and the same 64K decode topology unless a row explicitly says operator-only.
   Triton path.
 - The main QKV projection remains on LightOP's channel-wise FP8 hipBLASLt
   kernel. It is the fastest installed implementation for this shape.
+- MTP3 short-prefill indexer scoring is batched across requests and reads the
+  summary pool directly through the block table. At 64K context, the per-layer
+  score stage improved from 1.2004 ms to 0.3430 ms at total BS32 (3.50x), and
+  from 2.3946 ms to 0.6778 ms at total BS64 (3.53x), with bit-identical fp32
+  scores.
+- Q/K indexer normalization and partial RoPE share one launch when a DP has at
+  most 32 target-verification tokens. The BS32 shape improved from 0.01319 ms
+  to 0.00966 ms (1.37x), bit-identically. At 64 tokens the joint grid is slower,
+  so BS64 and prefill retain the reference two-launch path.
 
 ## Rejected after measurement
 
@@ -77,10 +86,10 @@ fails early with this explanation when `STEP5_DCP_SIZE` is not 1.
 
 ## Remaining kernel work
 
-The short-query attention kernel is now fast, but the target indexer still has
-separate projection, norm/RoPE, summary update, scoring, selection, and
-attention launches. LightOP and AITER only provide MLA-specific fused kernels
-for incompatible head dimensions and cache semantics. A full fusion therefore
-requires a new Step5-specific kernel rather than wiring an existing library
-operator into this backend.
+Short MTP queries now batch scoring across requests, and the BS32 Q/K
+normalization shares one launch. Projection, summary update, radix selection,
+and attention are still separate stages. LightOP and AITER only provide
+MLA-specific fused kernels for incompatible head dimensions and cache
+semantics. Fusing the remaining stages therefore requires a new Step5-specific
+kernel rather than wiring an existing library operator into this backend.
 
