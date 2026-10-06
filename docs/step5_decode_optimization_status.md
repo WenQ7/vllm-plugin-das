@@ -414,3 +414,29 @@ This is a one-round short-context screen, not a new 64K/4K measurement.
 Result: /tmp/step5_small_tiles_v1_bench/openai-chat-infqps-concurrency64-step5-20261007-014602.json
 Manifest: /tmp/step5_small_tiles_v1_manifest.json
 Comparison: /tmp/step5_small_tiles_v1_comparison.json
+
+### Rounding-fusion candidates rejected for the 64K target
+
+Fusing BF16-to-e4m3-to-BF16 Q rounding into the grouped scorer removes one
+launch and a temporary tensor. It passed the sampled bit-exact score and
+Graph tests but repeated conversion in every key CTA regressed width8192
+from 0.1012/0.1023/0.1221/0.1179 ms to
+0.1088/0.1108/0.1483/0.1438 ms for queries/request 1/2/3/4.
+The width128 benefit is not a reason to adopt it for the 64K workload.
+
+Direct FP8 MMA reduced the width8192 q1/2/3 screen to
+0.0548/0.0563/0.0947 ms but q4 differed from the native score by
+3.814697265625e-6. It is not qualified for replacing the native scorer.
+An interleaved-zero FP8-K prototype preserved the sampled native rounding
+at every tested q count and Graph replay but slowed width8192 to
+0.1354/0.1343/0.2142/0.1726 ms. Neither FP8-MMA prototype is in
+production code or enabled in the service.
+
+The live service is PID3162510, source dd54506, healthy after the completed
+short screen. Its Graph dispatch table explicitly shows FULL at real token
+counts 12--64, including padded batches. The MoE log confirms loading
+E=44,N=1536,device_name=BW1101.json and masked DeepGEMM mode1101.
+The kernel and service evidence is preserved outside /tmp at
+/workspace/step5-tp2-performance/live-tile-and-index-rounding-20261007.
+The previous long-context evidence is preserved at
+/workspace/step5-tp2-performance/grouped-head-full-graph-64k-bs32-v2.
