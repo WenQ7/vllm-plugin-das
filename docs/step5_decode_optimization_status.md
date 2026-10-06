@@ -432,8 +432,7 @@ at every tested q count and Graph replay but slowed width8192 to
 0.1354/0.1343/0.2142/0.1726 ms. Neither FP8-MMA prototype is in
 production code or enabled in the service.
 
-The live service is PID3162510, source dd54506, healthy after the completed
-short screen. Its Graph dispatch table explicitly shows FULL at real token
+That completed BF16 service screen used PID3162510, source dd54506. Its Graph dispatch table explicitly shows FULL at real token
 counts 12--64, including padded batches. The MoE log confirms loading
 E=44,N=1536,device_name=BW1101.json and masked DeepGEMM mode1101.
 The kernel and service evidence is preserved outside /tmp at
@@ -474,8 +473,8 @@ This still does not fit 16 requests/DP at input65536/output4096.
 
 The calibration file has all 92 main and three MTP groups and the matching
 model-index hash. It uses independent document activations from DP0/1;
-heldout DP2/3 and evaluation answers were excluded. The current candidate
-service is PID3217802, source1138074, with QKV FP8. Formal QKV stays BF16:
+heldout DP2/3 and evaluation answers were excluded. That completed candidate
+service used PID3217802, source1138074, with QKV FP8. Formal QKV stays BF16:
 ordinary MTP accuracy and a 64K/4K FP8 comparison remain unverified.
 Result: /tmp/step5_qkv_fp8_graph_v1_bench/openai-chat-infqps-concurrency64-step5-20261007-021335.json
 Evidence: /workspace/step5-tp2-performance/qkv-small-m-and-decode-overlap-20261007.
@@ -512,4 +511,21 @@ or reduced on the host. Twenty-eight tests passed after this repair,
 including auxiliary-stream Graph replays without a descriptor, GPU-count
 poison tests and mixed attention groups. The successful earlier 15-test
 descriptor-only screen did not cover the actual FULL-capture call shape.
-The repaired v2 service screen remains pending.
+The repaired v2 service screen completed 64/64 at input1024/output512,
+BS64, with the same input/output tokens and synthetic acceptance counts as
+the preceding calibrated-FP8, no-overlap screen. Output throughput fell
+838.88914 -> 706.43915 token/s (-15.79%), while mean TPOT rose
+55.18102 -> 67.65255 ms (+22.60%). No DP preemption counter increased.
+The opt-in profile is rejected; the formal default remains off.
+
+The service env flags requested aux-stream overlap, but the captured log
+contains no mode-selection diagnostic. Isolated stream/Graph tests passed;
+the actual full-model aux-stream activation is not independently proven.
+Therefore this result rejects the configured candidate, without attributing
+the entire regression to verified communication/computation overlap.
+Results and comparison are preserved in the evidence directory above.
+
+Checkpoint shape inspection confirms Q/K/V rows 12288/768/768 at both SWA
+and full Attention, including MTP: TP2 QKV width is N6912 in either case.
+A separate N3840 SWA hypothesis was incorrect and is not used as a basis
+for precision selection. The formal QKV precision remains BF16.
