@@ -42,6 +42,26 @@ class Step5DCP2MetadataBuilder(Step4DSAMetadataBuilder):
 
 
 class Step5DCP2Impl(Step4DSAImpl):
+    def __init__(self, num_heads, head_size, scale, num_kv_heads=None,
+                 alibi_slopes=None, sliding_window=None, kv_cache_dtype="auto",
+                 logits_soft_cap=None, attn_type="decoder",
+                 kv_sharing_target_layer_name=None, **kwargs):
+        if (num_heads != 32 or num_kv_heads != 4 or head_size != 192
+            or sliding_window not in (None, 512)
+            or kv_cache_dtype not in ("auto", "bfloat16")
+            or attn_type != "decoder"):
+            raise ValueError("Step5 DCP2 backend requires local32Q/cache4KV/BF16 HD192/SWA512")
+        # The gathered-head bridge implements both sparse and window attention.
+        # Reuse the base's ALiBi/soft-cap/KV-sharing/splitting checks without
+        # routing its DCP1-only sliding implementation into this backend.
+        super().__init__(
+            num_heads, head_size, scale, num_kv_heads=num_kv_heads,
+            alibi_slopes=alibi_slopes, sliding_window=None,
+            kv_cache_dtype=kv_cache_dtype, logits_soft_cap=logits_soft_cap,
+            attn_type=attn_type,
+            kv_sharing_target_layer_name=kv_sharing_target_layer_name, **kwargs)
+        self.sliding_window = sliding_window
+
     def forward(self, *args, **kwargs):
         raise RuntimeError("Step5 DCP2 must execute through its gathered-head custom op")
 

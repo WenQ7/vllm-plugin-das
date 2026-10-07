@@ -94,3 +94,27 @@ def test_step5_config_registers_runtime_split_before_compilation(monkeypatch):
     Step5TextConfig(sparse_config={"enabled": True})
     assert CompilationConfig._attention_ops == [
         "vllm::step4_dsa_index", "vllm::step5_dcp2_attention"]
+
+
+@pytest.mark.parametrize("window", [None,512])
+def test_real_backend_initializer_admits_qualified_window(monkeypatch,window):
+    from vllm_hcu.model_executor.layers import step4_dsa
+    from vllm_hcu.model_executor.layers.step5_dcp2_attention import Step5DCP2Impl
+    monkeypatch.setattr(step4_dsa, "_require_splitting_op",lambda:None)
+    impl=Step5DCP2Impl(32,192,192**-.5,num_kv_heads=4,sliding_window=window)
+    assert impl.sliding_window==window
+    assert impl.num_heads==32 and impl.num_kv_heads==4
+    with pytest.raises(RuntimeError,match="gathered-head"):
+        impl.forward()
+
+
+@pytest.mark.parametrize("change",[
+    {"sliding_window":256},{"num_heads":64},{"num_kv_heads":2},
+    {"head_size":128},{"kv_cache_dtype":"fp8"},{"attn_type":"encoder"},
+])
+def test_real_backend_rejects_unqualified_geometry(change):
+    from vllm_hcu.model_executor.layers.step5_dcp2_attention import Step5DCP2Impl
+    kwargs=dict(num_heads=32,head_size=192,scale=192**-.5,num_kv_heads=4)
+    kwargs.update(change)
+    with pytest.raises(ValueError,match="backend requires"):
+        Step5DCP2Impl(**kwargs)
