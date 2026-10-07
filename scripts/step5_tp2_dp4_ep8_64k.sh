@@ -1,17 +1,31 @@
 #!/usr/bin/env bash
-# Launch the selected Step5 TP2/DP4/EP8 profiles with DCP disabled.
+# Launch Step5 TP2/DP4/EP8; DCP2 is an explicit experimental Decode opt-in.
 set -euo pipefail
 stage="${1:-decode}"
 sampling="${2:-standard}"
 case "$stage" in prefill|decode) ;; *) echo "Usage: $0 [prefill|decode] [standard|synthetic]" >&2; exit 2;; esac
 case "$sampling" in standard|synthetic) ;; *) echo "MTP sampling must be standard or synthetic" >&2; exit 2;; esac
 dcp_size="${STEP5_DCP_SIZE:-1}"
-if [[ "$dcp_size" != 1 ]]; then
-  echo "Step5 TP2 cannot use DCP${dcp_size}: the model has four total KV heads," >&2
-  echo "and vLLM requires tensor_parallel_size > num_kv_heads for GQA/MQA DCP." >&2
-  echo "Keep STEP5_DCP_SIZE=1; an eight-card DCP2 topology needs TP8/DP1." >&2
-  exit 2
-fi
+case "$dcp_size" in
+  1) ;;
+  2)
+    [[ "$stage" == decode && "${VLLM_STEP5_DCP2_RUNTIME:-0}" == 1 ]] || {
+      echo "Step5 DCP2 requires Decode and VLLM_STEP5_DCP2_RUNTIME=1" >&2
+      exit 2
+    }
+    # Qualified on real MTP3/frozen100; BS32/64 long-context performance
+    # remains experimental until the initialized capacity and run are checked.
+    export VLLM_STEP5_DCP2_FULL_GRAPH="${VLLM_STEP5_DCP2_FULL_GRAPH:-1}"
+    export VLLM_STEP5_EXACT_GRAPH_MEMORY="${VLLM_STEP5_EXACT_GRAPH_MEMORY:-1}"
+    export VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES="${VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES:-1073741824}"
+    export VLLM_STEP5_LL_DISPATCH_ALIGNMENT="${VLLM_STEP5_LL_DISPATCH_ALIGNMENT:-64}"
+    case "$VLLM_STEP5_DCP2_FULL_GRAPH" in
+      0|1) ;;
+      *) echo "VLLM_STEP5_DCP2_FULL_GRAPH must be 0 or 1" >&2; exit 2;;
+    esac
+    ;;
+  *) echo "STEP5_DCP_SIZE must be 1 or explicitly qualified 2" >&2; exit 2;;
+esac
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${repo_root}${PYTHONPATH:+:${PYTHONPATH}}"
 export VLLM_TUNED_CONFIG_FOLDER="${repo_root}/configs/step5_moe"
@@ -70,23 +84,47 @@ case "$VLLM_STEP5_QKV_NORM_FP8_FUSION" in
 esac
 export VLLM_SERVER_DEV_MODE=1 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600
 unset NCCL_TOPO_FILE VLLM_STEP5_HOST_REQUEST_INDICES
+decode_runtime_args=()
 if [[ "$stage" == prefill ]]; then
   backend=deepep_high_throughput; tokens=6144; sequences=64; memory=0.89
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=1 VLLM_STEP5_SP_LL_WORKSPACE=0 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=0
   compilation='{"cudagraph_mode":"NONE","cudagraph_copy_inputs":false,"mode":3}'
 else
   backend=deepep_low_latency; tokens=512; sequences=32; memory=0.92
+  capture_sizes='[4,8,16,32,64,128,256,512]'
+  default_graph_mode=FULL_AND_PIECEWISE
+  if [[ "$dcp_size" == 2 ]]; then
+    tokens=384; sequences=16; memory=0.95
+    capture_sizes='[4,8,16,32,64]'
+    default_graph_mode=PIECEWISE
+    if [[ "$VLLM_STEP5_DCP2_FULL_GRAPH" == 1 ]]; then
+      default_graph_mode=FULL_DECODE_ONLY
+    fi
+    # Use the qualified long-prefill setting and record actual graph modes.
+    decode_runtime_args=(--long-prefill-token-threshold 0 --cudagraph-metrics)
+  fi
   export VLLM_STEP5_BF16_COMPACT_GRID="${VLLM_STEP5_BF16_COMPACT_GRID:-1}"
   export VLLM_STEP5_GROUPED_HEAD_INDEXER="${VLLM_STEP5_GROUPED_HEAD_INDEXER:-1}"
   # FULL_DECODE_ONLY keeps complete Decode graphs and runs mixed batches
   # without PIECEWISE graphs; useful when the long-context KV budget is tight.
-  target_graph_mode="${STEP5_TARGET_GRAPH_MODE:-FULL_AND_PIECEWISE}"
+  target_graph_mode="${STEP5_TARGET_GRAPH_MODE:-$default_graph_mode}"
   case "$target_graph_mode" in
     FULL_AND_PIECEWISE|FULL_DECODE_ONLY|PIECEWISE) ;;
     *) echo "STEP5_TARGET_GRAPH_MODE must be FULL_AND_PIECEWISE, FULL_DECODE_ONLY or PIECEWISE" >&2; exit 2;;
   esac
+  if [[ "$dcp_size" == 2 ]]; then
+    if [[ "$VLLM_STEP5_DCP2_FULL_GRAPH" == 1 ]]; then
+      [[ "$target_graph_mode" == FULL_DECODE_ONLY ]] || {
+        echo "Step5 DCP2 FULL graphs require FULL_DECODE_ONLY" >&2; exit 2
+      }
+    else
+      [[ "$target_graph_mode" == PIECEWISE ]] || {
+        echo "Step5 DCP2 without FULL opt-in requires PIECEWISE" >&2; exit 2
+      }
+    fi
+  fi
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=0 VLLM_STEP5_SP_LL_WORKSPACE=1 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=1
-  compilation='{"cudagraph_mode":"'"$target_graph_mode"'","cudagraph_copy_inputs":true,"mode":3,"cudagraph_capture_sizes":[4,8,16,32,64,128,256,512]}'
+  compilation='{"cudagraph_mode":"'"$target_graph_mode"'","cudagraph_copy_inputs":true,"mode":3,"cudagraph_capture_sizes":'"$capture_sizes"'}'
 fi
 # Keep the measured stage defaults; memory headroom candidates opt in.
 memory="${STEP5_GPU_MEMORY_UTILIZATION:-$memory}"
@@ -112,4 +150,4 @@ exec vllm serve "${STEP5_MODEL:-/data/model/step-5-preview-0913-fp8-per-channel}
   --max-num-batched-tokens "$tokens" --gpu-memory-utilization "$memory" \
   --no-enable-prefix-caching --disable-custom-all-reduce --compilation-config "$compilation" \
   --speculative-config "$speculation" --override-generation-config '{"eos_token_id":[1,2,128007]}' \
-  --host 127.0.0.1 --port "${STEP5_PORT:-18106}" --served-model-name step5 --api-server-count 1
+  "${decode_runtime_args[@]}" --host 127.0.0.1 --port "${STEP5_PORT:-18106}" --served-model-name step5 --api-server-count 1
