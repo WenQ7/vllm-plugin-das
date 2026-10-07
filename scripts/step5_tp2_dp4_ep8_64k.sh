@@ -85,6 +85,7 @@ esac
 export VLLM_SERVER_DEV_MODE=1 VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=3600
 unset NCCL_TOPO_FILE VLLM_STEP5_HOST_REQUEST_INDICES
 decode_runtime_args=()
+long_prefill_threshold="${STEP5_LONG_PREFILL_TOKEN_THRESHOLD:-0}"
 if [[ "$stage" == prefill ]]; then
   backend=deepep_high_throughput; tokens=6144; sequences=64; memory=0.89
   export VLLM_STEP5_HT_COMPACT_WORKSPACE=1 VLLM_STEP5_SP_LL_WORKSPACE=0 VLLM_STEP5_MTP_DRAFT_FULL_GRAPH=0
@@ -101,7 +102,10 @@ else
       default_graph_mode=FULL_DECODE_ONLY
     fi
     # Use the qualified long-prefill setting and record actual graph modes.
-    decode_runtime_args=(--long-prefill-token-threshold 0 --cudagraph-metrics)
+    decode_runtime_args=(--long-prefill-token-threshold "$long_prefill_threshold" --cudagraph-metrics)
+  fi
+  if [[ "$dcp_size" == 1 && -n "${STEP5_LONG_PREFILL_TOKEN_THRESHOLD+x}" ]]; then
+    decode_runtime_args=(--long-prefill-token-threshold "$long_prefill_threshold")
   fi
   export VLLM_STEP5_BF16_COMPACT_GRID="${VLLM_STEP5_BF16_COMPACT_GRID:-1}"
   export VLLM_STEP5_GROUPED_HEAD_INDEXER="${VLLM_STEP5_GROUPED_HEAD_INDEXER:-1}"
@@ -128,7 +132,7 @@ else
 fi
 # Keep the measured stage defaults; memory headroom candidates opt in.
 memory="${STEP5_GPU_MEMORY_UTILIZATION:-$memory}"
-python - "$memory" <<'PY_CHECK_MEMORY'
+python - "$memory" "$long_prefill_threshold" <<'PY_CHECK_MEMORY'
 import math
 import sys
 try:
@@ -137,6 +141,12 @@ except ValueError:
     raise SystemExit("STEP5_GPU_MEMORY_UTILIZATION must be a number in (0, 1]")
 if not math.isfinite(value) or not 0 < value <= 1:
     raise SystemExit("STEP5_GPU_MEMORY_UTILIZATION must be a number in (0, 1]")
+try:
+    threshold = int(sys.argv[2])
+except ValueError:
+    raise SystemExit("STEP5_LONG_PREFILL_TOKEN_THRESHOLD must be an integer in [0, 69632]")
+if not 0 <= threshold <= 69632:
+    raise SystemExit("STEP5_LONG_PREFILL_TOKEN_THRESHOLD must be an integer in [0, 69632]")
 PY_CHECK_MEMORY
 speculation='{"method":"mtp","num_speculative_tokens":3}'
 if [[ "$sampling" == synthetic ]]; then
