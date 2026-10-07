@@ -118,3 +118,22 @@ def test_real_backend_rejects_unqualified_geometry(change):
     kwargs.update(change)
     with pytest.raises(ValueError,match="backend requires"):
         Step5DCP2Impl(**kwargs)
+
+
+def test_internal_lse_bridge_validation_does_not_advertise_stock_lse(monkeypatch):
+    from vllm_hcu.model_executor.layers import step4_dsa
+    from vllm_hcu.model_executor.layers.step5_dcp2_attention import (
+        Step5DCP2Impl, validate_dcp2_attention_layers,
+    )
+    monkeypatch.setattr(step4_dsa,"_require_splitting_op",lambda:None)
+    sparse=make_layer(None)
+    window=make_layer(512)
+    for layer in (sparse,window):
+        layer.impl=Step5DCP2Impl(32,192,192**-.5,num_kv_heads=4,
+                                sliding_window=layer.sliding_window)
+        assert not layer.impl.can_return_lse_for_decode
+    validate_dcp2_attention_layers({"sparse":sparse,"window":window})
+    with pytest.raises(ValueError,match="incompatible"):
+        validate_dcp2_attention_layers({"stock":SimpleNamespace(impl=window.impl)})
+    with pytest.raises(ValueError,match="requires"):
+        validate_dcp2_attention_layers({})

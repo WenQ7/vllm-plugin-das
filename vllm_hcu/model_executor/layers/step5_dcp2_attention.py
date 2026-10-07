@@ -159,6 +159,24 @@ def step5_dcp2_attention(query: torch.Tensor, key: torch.Tensor,
     )
 
 
+def validate_dcp2_attention_layers(layers):
+    """The bridge combines FP32 shard LSE internally, returning local TP heads."""
+    cached = 0
+    for name, layer in layers.items():
+        impl = getattr(layer, "impl", None)
+        if impl is None:
+            continue
+        if (type(layer) is not Step5DCP2Attention or type(impl) is not Step5DCP2Impl
+            or impl.num_heads != 32 or impl.num_kv_heads != 4
+            or impl.head_size != 192 or abs(impl.scale - 192**-.5) > 1e-8
+            or impl.kv_cache_dtype not in ("auto", "bfloat16")
+            or impl.sliding_window not in (None, 512)):
+            raise ValueError(f"Step5 DCP2 has an incompatible Attention layer: {name}")
+        cached += 1
+    if not cached:
+        raise ValueError("Step5 DCP2 requires gathered-head Attention layers")
+
+
 def step5_dcp2_attention_fake(query, key, value, positions, plan_token, layer_name):
     return torch.empty_like(query)
 
