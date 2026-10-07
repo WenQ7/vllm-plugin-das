@@ -1320,3 +1320,29 @@ Evidence: dcp2-prototype-20261007/current_dcp2_native_qualification_summary.json
 fine-native-v3/gpu_qualification-rank0/1.json,
 exchange-native-v2/exchange_gpu-rank0/1.json and
 current_dcp2_native_qualifications-v2.log.
+
+### DCP2 sliding-window allocation qualification
+
+The new experimental Step5DCP2SlidingWindowSpec preserves the installed
+SlidingWindowManager recycling behavior while aligning startup memory and
+admission sizing to global page128 / physical page64. It retains all four
+BF16 KV heads, HD192, window512, and MTP extra trailing tokens. Prefix
+caching is disabled, and unsupported storage/config geometries fail.
+
+Thirty CPU tests passed against the installed vLLM allocator in5.67s.
+They include chunked prefill through65536 tokens at BS32/64 with no spare
+pool capacity beyond the admission bound, logical page127/128/129 edges,
+uniform group sizing/table width, preempted-request suffix restoration,
+and MTP3 accept/reject schedules without double allocation or premature
+window release. GPU/whole-model behavior is not established by these tests.
+
+This spec is not yet returned by model Attention and does not enable DCP2.
+Integration must convert every SWA layer, including MTP, before grouping;
+stock-first mixed grouping would otherwise retain stock DCP1-only sizing.
+The upstream hybrid-cache coordinator still rejects DCP + sliding-window
+groups, and Step5 TP2/GQA validation, FP32 LSE/output communication, and the
+full Attention call chain still need scoped integration and qualification.
+No launch guard, production cache behavior or performance result changed.
+
+Evidence: tests/v1/test_step5_dcp2_cache.py;
+dcp2-prototype-20261007/window-cache/allocator-v1.log.
