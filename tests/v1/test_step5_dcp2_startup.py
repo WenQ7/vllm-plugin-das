@@ -278,3 +278,54 @@ def test_typed_world_size_requires_opt_in_and_homogeneous_uniform_group(opt_in,m
     monkeypatch.setenv("VLLM_STEP5_DCP2_RUNTIME","0")
     with pytest.raises(ValueError,match="opt-in"):
         kv_cache_utils.dcp_world_size_for_kv_cache_spec(uniform,2)
+
+
+def test_full_graph_scope_requires_explicit_decode_only_opt_in(opt_in,monkeypatch):
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm_hcu.step5_dcp2_config import step5_dcp2_full_graph_allowed
+    cfg=envelope()
+    cfg.compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)
+    monkeypatch.delenv("VLLM_STEP5_DCP2_FULL_GRAPH",raising=False)
+    assert not step5_dcp2_full_graph_allowed(cfg)
+    monkeypatch.setenv("VLLM_STEP5_DCP2_FULL_GRAPH","1")
+    assert step5_dcp2_full_graph_allowed(cfg)
+    cfg.compilation_config.cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE
+    with pytest.raises(ValueError,match="FULL_DECODE_ONLY"):
+        step5_dcp2_full_graph_allowed(cfg)
+    cfg.model_config.architectures=["LlamaForCausalLM"]
+    assert not step5_dcp2_full_graph_allowed(cfg)
+    cfg=envelope()
+    cfg.parallel_config.decode_context_parallel_size=1
+    assert not step5_dcp2_full_graph_allowed(cfg)
+
+
+@pytest.mark.parametrize("dcp",[1,2])
+@pytest.mark.parametrize("mode",["PIECEWISE","FULL_DECODE_ONLY","FULL_AND_PIECEWISE"])
+def test_mtp_full_padding_guard_is_armed_for_existing_full_modes(opt_in,monkeypatch,dcp,mode):
+    from types import ModuleType
+    from vllm.config.compilation import CUDAGraphMode
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm_hcu.patch.platform.core_fix import patch_step5_multi_mtp
+    monkeypatch.setenv("VLLM_STEP5_MTP_DRAFT_FULL_GRAPH","1")
+    class Speculator:
+        def __init__(self,*a,**kw): pass
+        def _run_model(self,*a,**kw): pass
+        def propose(self,*a,**kw): pass
+        def _build_draft_attn_metadata(self,*a,**kw): pass
+        def init_cudagraph_manager(self,mode): self.seen_mode=mode
+    module=ModuleType(patch_step5_multi_mtp.TARGET_MODULE)
+    module.MultiModuleMTPSpeculator=Speculator
+    module.dispatch_cg_and_sync_dp=lambda *a,**kw:None
+    module.logger=SimpleNamespace(info=lambda *a:None)
+    assert patch_step5_multi_mtp.apply_to_module(module)
+    cfg=envelope()
+    cfg.parallel_config.decode_context_parallel_size=dcp
+    cfg.speculative_config.draft_model_config=SimpleNamespace(
+        hf_config=SimpleNamespace(model_type="step5_mtp"))
+    obj=Speculator.__new__(Speculator)
+    obj.vllm_config=cfg
+    obj.num_speculative_steps=3
+    obj.attn_cg_support=SimpleNamespace(min_cg_support=AttentionCGSupport.UNIFORM_BATCH)
+    obj.init_cudagraph_manager(CUDAGraphMode[mode])
+    assert obj.seen_mode==CUDAGraphMode.FULL_DECODE_ONLY
+    assert obj._step5_draft_full_graph_enabled

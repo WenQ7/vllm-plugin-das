@@ -110,3 +110,16 @@ def step5_context_parallel_supported(config) -> bool:
     if os.getenv("VLLM_STEP5_DCP2_RUNTIME", "0") != "1":
         return False
     return validate_step5_dcp2_config(config)
+
+
+def step5_dcp2_full_graph_allowed(config) -> bool:
+    """Opt in only the qualified gathered-head adapter to FULL Decode graphs."""
+    if (config.parallel_config.decode_context_parallel_size != 2
+        or os.getenv("VLLM_STEP5_DCP2_FULL_GRAPH", "0") != "1"):
+        return False
+    if not validate_step5_dcp2_config(config):
+        return False
+    from vllm.config.compilation import CUDAGraphMode
+    if config.compilation_config.cudagraph_mode != CUDAGraphMode.FULL_DECODE_ONLY:
+        raise ValueError("Step5 DCP2 full Graph opt-in requires FULL_DECODE_ONLY")
+    return True

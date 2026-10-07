@@ -44,11 +44,13 @@ from vllm.distributed.parallel_state import (
     destroy_model_parallel, destroy_distributed_environment,
 )
 
+qualify_adapter = os.environ.get("STEP5_DCP2_QUALIFY_ADAPTER", "0") == "1"
 root = Path(os.environ.get("STEP5_DCP2_RESULT_DIR", "/tmp/step5-dcp2-runtime"))
 root.mkdir(parents=True, exist_ok=True)
 report = root/f"runtime-rank{rank}.json"
 record = {
     "rank": rank, "pid": os.getpid(), "model_integrated": False, "qualified": False,
+    "attention_adapter_qualified": False, "qualify_adapter": qualify_adapter,
     "source_sha256": {x: hashlib.sha256((source/x).read_bytes()).hexdigest()
                       for x in ["step5_dcp2_runtime.py", "step5_dcp2.py",
                                 "step5_dcp2_exchange.py"]},
@@ -303,7 +305,39 @@ with set_current_vllm_config(config):
                     physical_k[:,rank::2].reshape_as(kc),
                     physical_v[:,rank::2].reshape_as(vc))
 
+        if qualify_adapter:
+            from vllm.forward_context import set_forward_context
+            from vllm_hcu.model_executor.layers.step4_dsa import Step4DSAMetadata
+            from vllm_hcu.model_executor.layers.step5_dcp2_attention import Step5DCP2Attention
+            md = Step4DSAMetadata(
+                num_decodes=nd, num_prefills=nreq-nd, num_decode_tokens=nd,
+                num_prefill_tokens=nactual-nd, num_actual_tokens=nactual,
+                block_table=table, slot_mapping=slots, seq_lens=lengths,
+                query_start_loc=starts, query_start_loc_cpu=starts_cpu,
+                seq_lens_cpu=lengths_cpu, positions=positions,
+                max_seq_len=context, block_size=128)
+            plan.md = md
+            layer = Step5DCP2Attention.__new__(Step5DCP2Attention)
+            torch.nn.Module.__init__(layer)
+            layer.layer_name = f"qualification.{mode}"
+            layer.sliding_window = 512 if mode == "window" else None
+            layer.step4_sparse_plan = plan
+            layer.bind_kv_cache(
+                backing.view(pages,64,4,384).permute(0,2,1,3))
+            config.compilation_config.static_forward_context[layer.layer_name] = layer
+            dependency = torch.empty(1,device=device,dtype=torch.int32)
+            record["adapter_source_sha256"] = hashlib.sha256(
+                (source.parent/"model_executor/layers/step5_dcp2_attention.py").read_bytes()
+            ).hexdigest()
+
         def pipeline():
+            if qualify_adapter:
+                with set_forward_context(
+                    {layer.layer_name:md},config,num_tokens=tokens,
+                    slot_mapping={layer.layer_name:slots}):
+                    out = layer(query,key,value,positions=positions,
+                                plan_token=dependency if mode != "window" else None)
+                return out.view_as(query), None
             return runtime.dcp2_attention(
                 query, key, value, kc, vc, slots, positions, starts, lengths, table,
                 group, window=512 if mode == "window" else 0, plan=plan,
@@ -314,7 +348,8 @@ with set_current_vllm_config(config):
         actual = pipeline()
         case = {"mode":mode, "qlens":qlens, "context":context, "topk_slots":topk,
                 "padded_tokens":tokens,
-                **compare(actual[0],expected[0]), "lse_abs":check_lse(actual[1],expected[1]),
+                **compare(actual[0],expected[0]),
+                "lse_abs":check_lse(actual[1],expected[1]) if actual[1] is not None else None,
                 "graphs":[]}
         torch.testing.assert_close(kc.cpu(), expected[2], rtol=0, atol=0)
         torch.testing.assert_close(vc.cpu(), expected[3], rtol=0, atol=0)
@@ -339,7 +374,7 @@ with set_current_vllm_config(config):
                 result = {"shift":shift,"scale":scale,"reverse_pages":reverse,
                           "inactive_last_request":inactive,
                           **compare(captured[0],expected[0]),
-                          "lse_abs":check_lse(captured[1],expected[1])}
+                          "lse_abs":check_lse(captured[1],expected[1]) if captured[1] is not None else None}
                 torch.testing.assert_close(kc.cpu(), expected[2], rtol=0, atol=0)
                 torch.testing.assert_close(vc.cpu(), expected[3], rtol=0, atol=0)
                 result["cache_exact"] = True
@@ -373,6 +408,7 @@ with set_current_vllm_config(config):
 
         attention_suite("sparse", [4], 65538, True, topk=513)
         record["qualified"] = True
+        record["attention_adapter_qualified"] = qualify_adapter
         record["whole_model_dcp2_support"] = False
         save()
     except BaseException as error:

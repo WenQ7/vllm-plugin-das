@@ -106,6 +106,7 @@ def apply_to_module(module: ModuleType) -> bool:
             from vllm.config.compilation import CUDAGraphMode
             from vllm.v1.attention.backend import AttentionCGSupport
 
+            from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
             parallel = self.vllm_config.parallel_config
             draft = self.vllm_config.speculative_config.draft_model_config.hf_config
             scoped = (
@@ -114,14 +115,17 @@ def apply_to_module(module: ModuleType) -> bool:
                 and parallel.tensor_parallel_size == 2
                 and parallel.data_parallel_size == 4
                 and parallel.pipeline_parallel_size == 1
-                and parallel.decode_context_parallel_size == 1
+                and step5_context_parallel_supported(self.vllm_config)
                 and parallel.prefill_context_parallel_size == 1
-                and cudagraph_mode == CUDAGraphMode.PIECEWISE
+                and cudagraph_mode in (
+                    CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL_DECODE_ONLY,
+                    CUDAGraphMode.FULL_AND_PIECEWISE,
+                )
             )
             if scoped:
-                # The target's sparse indexer requires PIECEWISE. Draft layers
-                # use their own sliding-attention backend, which can support
-                # the uniform four-token batch needed by the native MTP graph.
+                # Preserve padding initialization for all FULL draft modes,
+                # including a target that already selected FULL_DECODE_ONLY.
+                # DCP2 uses its qualified window bridge and logical-page cache.
                 support = self.attn_cg_support.min_cg_support
                 if support.value < AttentionCGSupport.UNIFORM_BATCH.value:
                     raise ValueError(
@@ -131,8 +135,8 @@ def apply_to_module(module: ModuleType) -> bool:
                 self._step5_draft_full_graph_enabled = True
                 module.logger.info(
                     "Step5 TP2 MTP draft graph: FULL_DECODE_ONLY; "
-                    "target remains PIECEWISE; draft attention support=%s",
-                    support.name,
+                    "DCP=%s; draft attention support=%s",
+                    parallel.decode_context_parallel_size, support.name,
                 )
         return original_cg_init(self, cudagraph_mode)
 
