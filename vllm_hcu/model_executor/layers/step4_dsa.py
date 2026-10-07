@@ -1850,6 +1850,13 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         # Dummy/profiling run: no metadata, no cache to write, nothing to
         # attend to. The profiler only needs the allocation high-water mark.
         if attn_metadata is None:
+            if (
+                os.environ.get("VLLM_STEP5_NATIVE_SPARSE_DECODE", "0") == "1"
+                and self.num_heads == 32 and self.num_kv_heads == 2
+                and self.head_size == 192
+            ):
+                from .step5_native_sparse_decode import reserve_workspace
+                reserve_workspace()
             return output
 
         num_tokens = attn_metadata.num_actual_tokens
@@ -2056,13 +2063,29 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                         splits = _decode_num_splits(
                             prefill_tokens * num_kv_groups, packed.shape[1]
                         )
-                    out_p, lse_p = sparse_attention_short_prefill(
-                        query[ndt:num_tokens], k_flat, v_flat, packed, counts,
-                        num_kv_groups=num_kv_groups,
-                        region_size=REGION_BLOCK_SIZE, softmax_scale=self.scale,
-                        num_splits=splits, k_scale=k_scale, v_scale=v_scale,
-                        output=output[ndt:num_tokens], return_lse=False,
-                    )
+                    native_sparse = False
+                    if os.environ.get("VLLM_STEP5_NATIVE_SPARSE_DECODE", "0") == "1":
+                        from .step5_native_sparse_decode import (
+                            eligible, sparse_attention_native_paged,
+                        )
+                        native_sparse = eligible(
+                            query[ndt:num_tokens], k_flat, v_flat, packed,
+                            counts, output[ndt:num_tokens],
+                        )
+                    if native_sparse:
+                        out_p, lse_p = sparse_attention_native_paged(
+                            query[ndt:num_tokens], k_flat, v_flat, packed, counts,
+                            softmax_scale=self.scale, k_scale=k_scale, v_scale=v_scale,
+                            output=output[ndt:num_tokens],
+                        )
+                    else:
+                        out_p, lse_p = sparse_attention_short_prefill(
+                            query[ndt:num_tokens], k_flat, v_flat, packed, counts,
+                            num_kv_groups=num_kv_groups,
+                            region_size=REGION_BLOCK_SIZE, softmax_scale=self.scale,
+                            num_splits=splits, k_scale=k_scale, v_scale=v_scale,
+                            output=output[ndt:num_tokens], return_lse=False,
+                        )
                     wrote_prefill_output = True
                 else:
                     out_p, lse_p = sparse_attention_prefill(
