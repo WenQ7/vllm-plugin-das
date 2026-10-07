@@ -10,7 +10,14 @@ for x in psutil.process_iter(["pid","name","cmdline"]):
         if x.status()!=psutil.STATUS_ZOMBIE:
             raise RuntimeError(f"Active model process {x.info['pid']}; no concurrent GPU qualification")
 import torch,torch.distributed as dist,numpy as np
-from vllm_hcu.ops.step5_dcp2 import partial,merge
+# Load the source beside this test, not an installed/editable HCU package.
+# A small immutable snapshot need not duplicate the complete plugin runtime.
+import importlib.util
+_source=Path(__file__).resolve().parents[2]/"vllm_hcu/ops/step5_dcp2.py"
+_spec=importlib.util.spec_from_file_location("step5_dcp2_qualified_source",_source)
+_module=importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_module)
+partial,merge=_module.partial,_module.merge
 root=Path(os.environ.get("STEP5_DCP2_RESULT_DIR","/tmp/step5-dcp2-qualification"))
 root.mkdir(parents=True,exist_ok=True)
 operator=Path(__file__).resolve().parents[2]/"vllm_hcu/ops/step5_dcp2.py"
