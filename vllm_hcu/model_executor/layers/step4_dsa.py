@@ -2145,9 +2145,19 @@ def build_plan(
     ndt = attn_metadata.num_decode_tokens
 
     if nd > 0 and decode_logits is not None:
-        packed, counts = decode_sparse_meta(
+        decode_meta = decode_sparse_meta
+        decode_seqlens = attn_metadata.seq_lens[:nd].to(torch.int32)
+        if os.environ.get("VLLM_STEP5_DSA_LIGHTOP_DECODE_TOP512", "0") == "1":
+            from .step5_dsa_lightop_selector import (
+                decode_sparse_meta_lightop, supports_native_decode_selector,
+            )
+            if supports_native_decode_selector(
+                decode_logits, decode_seqlens, topk=topk,
+            ):
+                decode_meta = decode_sparse_meta_lightop
+        packed, counts = decode_meta(
             decode_logits,
-            attn_metadata.seq_lens[:nd].to(torch.int32),
+            decode_seqlens,
             attn_metadata.block_table[:nd],
             None,  # group-major arange(num_reqs), the default, is what we want
             topk=topk,
@@ -2853,6 +2863,18 @@ class Step4DSAState:
             region_size=region,
             regions_per_page=self.regions_per_page,
         )
+
+        if os.environ.get("VLLM_STEP5_DSA_LIGHTOP_DECODE_TOP512", "0") == "1":
+            from .step5_dsa_lightop_selector import (
+                decode_sparse_meta_lightop, supports_native_decode_selector,
+            )
+            if supports_native_decode_selector(
+                logits, seq_lens, topk=self.geometry.topk,
+            ):
+                decode_sparse_meta_lightop(
+                    logits, seq_lens, table, topk=self.geometry.topk,
+                    region_size=region, regions_per_page=self.regions_per_page,
+                )
 
         if os.environ.get("VLLM_STEP5_BATCHED_SHORT_INDEXER", "0") == "1":
             # MTP3 target verification reaches the four-query scorer only after
