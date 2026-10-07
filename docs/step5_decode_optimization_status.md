@@ -1346,3 +1346,58 @@ No launch guard, production cache behavior or performance result changed.
 
 Evidence: tests/v1/test_step5_dcp2_cache.py;
 dcp2-prototype-20261007/window-cache/allocator-v1.log.
+
+### DCP2 Attention bridge and gated model adapter
+
+The bridge exchanges TP-sharded, normalized/rotated QKV and two local
+provider-group selection plans, evaluates fine8 sparse or window512
+Attention over striped BF16 cache, merges local splits in FP32, gathers
+LSE, then ReduceScatters FP32 weighted output to the original32 TP heads.
+The head-major reduction layout avoids the generic dim1 transpose/copy;
+BF16 conversion occurs only after inter-rank reduction. HD192 uses a
+masked256-wide kernel because the stock DCP correction kernel passes192
+directly to tl.arange. Empty shards produce zero output and -inf LSE.
+
+Actual vLLM TP2/DCP2 GroupCoordinator/CudaCommunicator qualification passed
+per rank: four standalone combine shapes and nine complete Attention cases.
+Each rank passed30 changing-input Graph replays. Cases cover q1/q4,
+ragged mixed q1/q4,64-query Prefill, padded/inactive requests, shuffled and
+changed physical tables, contexts129/1025/65538, SWA512, and real513-slot
+TopK512 plus current-region selections. Cache writes were exact. Maximum
+Attention relativeL2 against the FP64 oracle was0.00227701; maximum LSE
+absolute error1.08212e-6. Native FP32-to-BF16 conversion was exact. These
+are numerical/operator gates, not model accuracy or throughput results.
+
+Current runtime SHA:
+e3aa8e3b98bb2a7cc9e14b2450401fc3fa899a99203c2966b99f607e44fa38db.
+Seven CPU-interpreter layout checks and five actual build_plan selection
+contract checks passed. The CPU interpreter truncates BF16 casts, so its
+layout gate uses FP32; the native GPU gate tests exact BF16 conversion.
+All qualification handles/processes are terminal, with clean group teardown.
+
+Step5 now selects the new Attention/cache/metadata adapter only for opt-in
+VLLM_STEP5_DCP2_RUNTIME=1 with supported TP2/DCP2 head geometry. It preserves
+sharded QKV weights, declares four cached KV heads, uses affine sparse-style
+SWA cache views with the DCP2 recycling spec, and carries the indexer's
+dependency token into the Attention op. DCP2 retains logical selections
+even when short-query DCP1 suppresses them. Early config registration and
+a constructor guard keep the new op outside piecewise graph segments.
+Seven adapter declaration/alias/fake-op/split tests and the existing DCP1
+Flash cache declaration test passed. The complete model adapter has not
+yet been exercised with model weights.
+
+The first model-free communication setup exposed Hy4 validation reading a
+None ModelConfig. The scoped guard now returns outside Hy4's scope for
+model-free configs; all35 Hy4 config tests passed. No Hy4 model checks
+were relaxed. Qualification explicitly records model_config_validated=false.
+
+Whole-model DCP2 still requires scoped TP2/GQA validation, hybrid SWA
+coordinator integration, workspace/memory/full-Graph policy adaptation,
+model correctness and one end-to-end measurement. The production launcher
+still rejects DCP2; no official result/default has changed.
+
+Evidence: dcp2-prototype-20261007/runtime-bridge/
+current_qualification_summary.json, native-v2/runtime-rank0/1.json,
+native-topk513-v1/runtime-rank0/1.json and respective logs.
+The native-v2 qualifier source is retained next to that run's reports.
+Initial setup and CPU test failures remain in their original logs.

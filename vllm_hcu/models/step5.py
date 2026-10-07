@@ -406,22 +406,45 @@ class Step5Attention(nn.Module):
         # Pair each per-layer cache view with its validated reader. V2's
         # automatic selection can otherwise choose Triton for sliding layers.
         self.is_sparse_layer = dsa_state is not None and dsa_slot is not None
-        attention_cls = (
-            Step5SparseAttention if self.is_sparse_layer else Step5FlashAttention
-        )
+        dcp_size = get_current_vllm_config().parallel_config.decode_context_parallel_size
+        self.dcp2_attention_enabled = dcp_size == 2
+        if dcp_size != 1:
+            if (
+                dcp_size != 2 or tp_size != 2
+                or os.environ.get("VLLM_STEP5_DCP2_RUNTIME", "0") != "1"
+                or self.total_num_heads != 64 or self.total_num_kv_heads != 4
+                or self.head_dim != 192
+                or (not self.is_sparse_layer and sliding_window != 512)
+                or (dsa_state is not None and dsa_state.context_parallel_size != 2)
+            ):
+                raise ValueError(
+                    "Step5 DCP requires experimental TP2/DCP2, global64Q/4KV/HD192 "
+                    "and sparse or window512 Attention"
+                )
+            from vllm_hcu.model_executor.layers.step5_dcp2_attention import (
+                Step5DCP2Attention, Step5DCP2AttentionBackend,
+            )
+            attention_cls, attention_backend = Step5DCP2Attention, Step5DCP2AttentionBackend
+            cache_kv_heads = 4
+        else:
+            attention_cls = (
+                Step5SparseAttention if self.is_sparse_layer else Step5FlashAttention
+            )
+            attention_backend = (
+                Step4SparseAttentionBackend if self.is_sparse_layer else Step5FlashAttentionBackend
+            )
+            cache_kv_heads = self.num_kv_heads
         self.attn = attention_cls(
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=cache_kv_heads,
             cache_config=cache_config,
             quant_config=None,
             prefix=f"{prefix}.attn",
             per_layer_sliding_window=sliding_window,
             attn_type=attn_type,
-            attn_backend=Step4SparseAttentionBackend
-            if self.is_sparse_layer
-            else Step5FlashAttentionBackend,
+            attn_backend=attention_backend,
         )
 
         self.indexer: Step4Indexer | None = None
@@ -537,7 +560,13 @@ class Step5Attention(nn.Module):
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
             # reads. It needs hidden_states, which Attention.forward never sees.
             self.indexer.forward(hidden_states, positions, projected_index)
-        attn_output = self.attn(q, k, v)
+        if self.dcp2_attention_enabled:
+            attn_output = self.attn(
+                q, k, v, positions=positions,
+                plan_token=self.step4_dsa_plan_token if self.indexer is not None else None,
+            )
+        else:
+            attn_output = self.attn(q, k, v)
         if self.use_head_wise_attn_gate:
             if projected_gate is None:
                 extra_dims, _ = self.g_proj(hidden_states)

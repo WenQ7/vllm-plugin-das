@@ -1,0 +1,149 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Experimental Step5 Attention adapter for the qualified DCP2 execution bridge.
+
+This adapter is explicitly selected by Step5, never registered over the CUSTOM
+backend slot. Stock DCP GQA validation and hybrid-cache coordinator integration
+remain separate requirements before whole-model activation.
+"""
+from __future__ import annotations
+
+import torch
+
+from vllm.config import get_current_vllm_config, CUDAGraphMode
+from vllm.distributed import get_dcp_group, get_tp_group
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.utils.torch_utils import direct_register_custom_op
+from vllm_hcu.model_executor.layers.step4_dsa import (
+    Step4DSAMetadata, Step4DSAMetadataBuilder,
+    Step4DSAImpl, Step4SparseAttentionBackend,
+)
+from vllm_hcu.model_executor.layers.step5_dsa_compat import sparse_cache_view
+from vllm_hcu.ops.step5_dcp2_runtime import dcp2_attention
+from vllm_hcu.v1.step5_dcp2_cache import Step5DCP2SlidingWindowSpec
+
+
+class Step5DCP2MetadataBuilder(Step4DSAMetadataBuilder):
+    def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
+        parallel = vllm_config.parallel_config
+        if (parallel.tensor_parallel_size != 2
+            or parallel.decode_context_parallel_size != 2
+            or parallel.prefill_context_parallel_size != 1
+            or kv_cache_spec.block_size != 64):
+            raise ValueError("Step5 DCP2 metadata requires TP2/DCP2/PCP1/local64")
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        md = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        # SWA/MTP layers have no indexer state from which to infer CP size.
+        # Their table is still indexed by global128 pages, just like DSA layers.
+        md.block_size = 128
+        return md
+
+
+class Step5DCP2Impl(Step4DSAImpl):
+    def forward(self, *args, **kwargs):
+        raise RuntimeError("Step5 DCP2 must execute through its gathered-head custom op")
+
+
+class Step5DCP2AttentionBackend(Step4SparseAttentionBackend):
+    supported_kv_cache_dtypes = ["auto", "bfloat16"]
+
+    @staticmethod
+    def get_builder_cls():
+        return Step5DCP2MetadataBuilder
+
+    @staticmethod
+    def get_impl_cls():
+        return Step5DCP2Impl
+
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        return [64]
+
+
+class Step5DCP2Attention(Attention):
+    def __init__(self, *args, **kwargs):
+        compilation = get_current_vllm_config().compilation_config
+        if (
+            compilation.cudagraph_mode != CUDAGraphMode.NONE
+            and "vllm::step5_dcp2_attention" not in (compilation.splitting_ops or [])
+        ):
+            raise RuntimeError(
+                "Step5 DCP2 requires vllm::step5_dcp2_attention in splitting_ops"
+            )
+        super().__init__(*args, **kwargs)
+
+    def bind_kv_cache(self, kv_cache):
+        # SWA and sparse layers both use an affine, aliased LBNHC cache view.
+        # Keep SlidingWindowSpec recycling for SWA; layout does not imply
+        # full-context allocation.
+        self.kv_cache = sparse_cache_view(kv_cache)
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        if self.sliding_window is not None:
+            return Step5DCP2SlidingWindowSpec.from_spec(spec)
+        return spec
+
+    def forward(self, query, key, value, *, positions, plan_token=None):
+        tokens = query.shape[0]
+        result = torch.ops.vllm.step5_dcp2_attention(
+            query.view(tokens, 32, 192),
+            key.view(tokens, 2, 192),
+            value.view(tokens, 2, 192),
+            positions, plan_token, self.layer_name,
+        )
+        return result.flatten(1)
+
+
+def step5_dcp2_attention(query: torch.Tensor, key: torch.Tensor,
+                         value: torch.Tensor, positions: torch.Tensor,
+                         plan_token: torch.Tensor | None,
+                         layer_name: str) -> torch.Tensor:
+    md, layer, cache, slots = get_attention_context(layer_name)
+    if not isinstance(layer, Step5DCP2Attention):
+        raise RuntimeError("DCP2 op reached an incompatible Attention layer")
+    if not isinstance(md, Step4DSAMetadata) or cache.numel() == 0:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Cannot capture Step5 DCP2 without metadata and KV cache")
+        return torch.zeros_like(query)
+    if md.block_size != 128:
+        raise RuntimeError("Step5 DCP2 requires global128 metadata pages")
+    group = get_dcp_group()
+    tp = get_tp_group()
+    if (group.world_size != 2 or group.ranks != tp.ranks
+        or group.rank_in_group != tp.rank_in_group):
+        raise RuntimeError("Step5 DCP2 and TP2 must have identical ordered membership")
+    tokens = query.shape[0]
+    slots = slots if slots is not None else md.slot_mapping
+    if slots.numel() < tokens:
+        raise RuntimeError("Step5 DCP2 slot mapping does not include padded queries")
+    k, v = cache[0], cache[1]
+    if (k.shape[1:] != (64, 4, 192)
+        or k.stride(0) != 64*k.stride(1)
+        or v.stride(0) != 64*v.stride(1)):
+        raise ValueError("Step5 DCP2 requires affine local64/four-head cache pages")
+    k, v = k.flatten(0, 1), v.flatten(0, 1)
+    window = int(layer.sliding_window or 0)
+    if not window and plan_token is None:
+        raise RuntimeError("Step5 DCP2 sparse op requires the indexer's dependency token")
+    # Match the qualified execution bridge. Tune occupancy only after the
+    # complete model path has passed correctness and profiling.
+    splits = 2
+    return dcp2_attention(
+        query, key, value, k, v, slots[:tokens], positions,
+        md.query_start_loc, md.seq_lens, md.block_table, group,
+        window=window, plan=getattr(layer, "step4_sparse_plan", None),
+        metadata=md, splits=splits,
+    )
+
+
+def step5_dcp2_attention_fake(query, key, value, positions, plan_token, layer_name):
+    return torch.empty_like(query)
+
+
+direct_register_custom_op(
+    op_name="step5_dcp2_attention", op_func=step5_dcp2_attention,
+    mutates_args=[], fake_impl=step5_dcp2_attention_fake,
+)

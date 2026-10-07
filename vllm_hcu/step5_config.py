@@ -101,6 +101,12 @@ class Step5TextConfig(PretrainedConfig):
             op = "vllm::step4_dsa_index"
             if op not in CompilationConfig._attention_ops:
                 CompilationConfig._attention_ops.append(op)
+        if os.environ.get("VLLM_STEP5_DCP2_RUNTIME", "0") == "1":
+            from vllm.config.compilation import CompilationConfig
+
+            op = "vllm::step5_dcp2_attention"
+            if op not in CompilationConfig._attention_ops:
+                CompilationConfig._attention_ops.append(op)
 
 
 class Step5VisionConfig(PretrainedConfig):
