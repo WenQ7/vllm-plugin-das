@@ -57,15 +57,6 @@ export VLLM_KV_CACHE_LAYOUT=LBNHC VLLM_USE_AOT_COMPILE=0
 export VLLM_STEP5_LL_GEMM_TUNING=1
 export VLLM_STEP5_SEQUENCE_PARALLEL_MOE=1 VLLM_STEP5_DSA_SHORT_QUERY=1
 export VLLM_STEP5_DSA_TUNED_SHORT_SPLITS=1
-# Native sparse pages remain opt-in until whole-model qualification.
-export VLLM_STEP5_NATIVE_SPARSE_DECODE="${VLLM_STEP5_NATIVE_SPARSE_DECODE:-0}"
-case "$VLLM_STEP5_NATIVE_SPARSE_DECODE" in
-  0|1) ;;
-  *) echo "VLLM_STEP5_NATIVE_SPARSE_DECODE must be 0 or 1" >&2; exit 2;;
-esac
-if [[ "$VLLM_STEP5_NATIVE_SPARSE_DECODE" == 1 && ( "$dcp_size" != 1 || "$stage" != decode ) ]]; then
-  echo "Native Step5 sparse Decode currently requires DCP1 and Decode stage" >&2; exit 2
-fi
 export VLLM_STEP5_DEVICE_REQUEST_INDICES=1 VLLM_STEP5_BATCHED_SHORT_INDEXER=1 VLLM_STEP5_BF16_TILE_TUNING=1
 # Removes three norm-parameter casts in qualified short-query indexer shapes.
 export VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS="${VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS:-0}"
