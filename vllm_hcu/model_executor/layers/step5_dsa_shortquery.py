@@ -286,7 +286,7 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     block_r = _fit_block_regions(
         min(8, triton.next_power_of_2(slots_per_split)), region_size=region_size,
         block_d=64, element_size=query.element_size())
-    # Qualified against interleaved BF16 KV on BW1101. Keep all other dtypes,
+    # Qualified against per-head packed BF16 KV on BW1101. Keep all other dtypes,
     # layouts, split counts and shapes on their existing tile policy.
     if (
         BF16_TUNED_TILES
@@ -295,11 +295,11 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
         and num_heads == 32 and num_kv_groups == 2 and region_size == 8
         and topk == 513
         and num_splits == short_query_num_splits(num_queries, num_kv_groups, topk)
-        and key_cache.stride() == value_cache.stride() == (768, 192, 1)
+        and key_cache.stride() == value_cache.stride() == (768, 384, 1)
     ):
-        block_r = 2 if num_queries == 64 else 4
+        block_r = 4 if num_queries == 32 else 2
         bf16_tile_logger.info_once(
-            "Step5 BF16 sparse Decode tiles enabled: M16/32 BR4, M64 BR2",
+            "Step5 BF16 sparse Decode tiles enabled: M16/64 BR2, M32 BR4",
             scope="process",
         )
     # BW1101 loses occupancy when this HD192 kernel pipelines two K/V tiles:
