@@ -330,14 +330,59 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     )
 
 
+@triton.jit
+def _prefill_request_indices_kernel(starts, output, TOKENS: tl.constexpr,
+                                    REQUESTS: tl.constexpr,
+                                    DECODE: tl.constexpr, BLOCK: tl.constexpr):
+    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    first = tl.load(starts)
+    absolute = first + token
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), REQUESTS, tl.int32)
+    # Upper-bound search handles empty requests at the beginning, middle,
+    # and end without materializing a repeat-interleave result.
+    while tl.sum((lo < hi).to(tl.int32), axis=0) > 0:
+        mid = (lo + hi) // 2
+        searching = lo < hi
+        end = tl.load(starts + mid + 1, mask=searching, other=2147483647)
+        advance = searching & (absolute >= end)
+        lo = tl.where(advance, mid + 1, lo)
+        hi = tl.where(searching & ~advance, mid, hi)
+    # FULL batches include an empty final request row. Use that in-range
+    # row for trailing padded tokens, whose actual query ownership and KV
+    # slot masks remain empty. Consumers never receive an invalid table row.
+    request = DECODE + tl.minimum(lo, REQUESTS - 1)
+    tl.store(output + token, request, mask=token < TOKENS)
+
+
 def prefill_request_indices_device(query_start_loc, num_decodes,
                                    num_prefills, num_prefill_tokens):
-    """Build the integer request map once on the device, without a host readback."""
+    """Map query rows on device, including the fixed FULL-graph padding bound.
+
+    repeat_interleave(output_size=...) requires the bound to equal the sum
+    of repeats. FULL padding makes it larger, which can trigger a GPU VMFault.
+    Trailing padding uses the final (empty in FULL metadata) request row;
+    attention still determines live queries from the unchanged boundaries.
+    """
+    if min(num_decodes, num_prefills, num_prefill_tokens) < 0:
+        raise ValueError("Request-map dimensions must be nonnegative")
+    if query_start_loc.ndim != 1 or query_start_loc.dtype != torch.int32:
+        raise ValueError("Request-map boundaries must be one-dimensional int32")
     stop = num_decodes + num_prefills
-    starts = query_start_loc[num_decodes:stop + 1]
-    return torch.repeat_interleave(
-        torch.arange(num_decodes, stop, device=query_start_loc.device,
-                     dtype=torch.int32),
-        starts[1:] - starts[:-1],
-        output_size=num_prefill_tokens,
-    )
+    if query_start_loc.numel() < stop + 1:
+        raise ValueError("Request-map boundaries do not cover the batch")
+    if num_prefills == 0 and num_prefill_tokens:
+        raise ValueError("Cannot map tokens without prefill requests")
+    output = torch.empty(num_prefill_tokens, device=query_start_loc.device,
+                         dtype=torch.int32)
+    if num_prefill_tokens == 0:
+        return output
+    starts = query_start_loc[num_decodes:stop + 1].contiguous()
+    if query_start_loc.device.type == "cpu":
+        tokens = torch.arange(num_prefill_tokens, dtype=torch.int32) + starts[0]
+        return torch.searchsorted(starts[1:], tokens, right=True,
+                                  out_int32=True).clamp_max(num_prefills - 1) + num_decodes
+    _prefill_request_indices_kernel[(triton.cdiv(num_prefill_tokens, 128),)](
+        starts, output, TOKENS=num_prefill_tokens, REQUESTS=num_prefills,
+        DECODE=num_decodes, BLOCK=128, num_warps=4, num_stages=1)
+    return output
