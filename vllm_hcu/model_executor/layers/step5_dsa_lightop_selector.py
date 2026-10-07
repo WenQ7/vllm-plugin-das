@@ -48,11 +48,13 @@ def _sort_pack(IDS,P,T,R,O,C,LO,
     physical=page*RPP+safe%RPP
     valid=tl.minimum(tl.maximum(q+1-safe*REGION,0),REGION)
     words=tl.where(live&(page>=0),physical|(valid<<24),-1)
-    tl.store(O+row*OUTS+slot,words)
-    tl.store(O+row*OUTS+512,-1)
+    # The causal slot belongs only to the scalar store below. Otherwise
+    # another lane could overwrite it with history padding.
+    tl.store(O+row*OUTS+slot,words,mask=slot!=history)
+    tl.store(O+row*OUTS+512,-1,mask=history!=512)
     if LOGICAL:
-        tl.store(LO+row*OUTS+slot,tl.where(live,ids,-1))
-        tl.store(LO+row*OUTS+512,-1)
+        tl.store(LO+row*OUTS+slot,tl.where(live,ids,-1),mask=slot!=history)
+        tl.store(LO+row*OUTS+512,-1,mask=history!=512)
     page=tl.load(T+req*TS+current//RPP)
     physical=page*RPP+current%RPP
     valid=tl.minimum(tl.maximum(q+1-current*REGION,0),REGION)
