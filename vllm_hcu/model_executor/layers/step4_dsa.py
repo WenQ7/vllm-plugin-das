@@ -3636,6 +3636,10 @@ class Step4Indexer:
         num_attention_heads: int,
     ) -> None:
         self.owner = owner
+        norm_cast_mode = os.environ.get("VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS", "0")
+        if norm_cast_mode not in ("0", "1"):
+            raise ValueError("VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS must be 0 or 1")
+        self.fuse_norm_weight_casts = norm_cast_mode == "1"
         self.geometry = geometry
         self.state = state
         self.slot = dsa_slot
@@ -3722,6 +3726,10 @@ class Step4Indexer:
         # custom-op boundary. Names are unique per layer per process, and vLLM
         # already relies on that for the attention layers themselves.
         self.layer_name = owner.attn.layer_name
+        if self.fuse_norm_weight_casts:
+            logger.info(
+                "Step5 indexer fused norm weight casts enabled for %s", self.layer_name
+            )
         _INDEXERS[self.layer_name] = self
         # Mutated by the op, and the reason the op is not optimised away: see
         # step4_dsa_index. Non-persistent so it stays out of the state dict, but
@@ -3845,9 +3853,20 @@ class Step4Indexer:
         # Q uses RMSNorm and K uses LayerNorm; both then receive partial
         # RoPE. Index Z is returned untouched because it is a per-dimension
         # softmax logit rather than a key.
-        q_norm_weight = owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype)
-        k_norm_weight = owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype)
-        k_norm_bias = owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype)
+        fuse_weight_casts = (
+            self.fuse_norm_weight_casts and 0 < num_tokens <= 128
+            and proxy == 256 and index_q.dtype == torch.bfloat16
+            and index_k.dtype == torch.bfloat16
+        )
+        if fuse_weight_casts:
+            # The fused kernel performs the same BF16 parameter rounding.
+            q_norm_weight = owner.sparse_indexer_q_norm.weight
+            k_norm_weight = owner.sparse_indexer_k_norm.weight
+            k_norm_bias = owner.sparse_indexer_k_norm.bias
+        else:
+            q_norm_weight = owner.sparse_indexer_q_norm.weight.to(dtype=index_q.dtype)
+            k_norm_weight = owner.sparse_indexer_k_norm.weight.to(dtype=index_k.dtype)
+            k_norm_bias = owner.sparse_indexer_k_norm.bias.to(dtype=index_k.dtype)
         # The one-wave joint Q/K grid removes a launch and remains exact through
         # 128 target-verification tokens. Larger prefill shapes retain the two
         # reference launches because their reduction result starts to diverge.
@@ -3868,6 +3887,7 @@ class Step4Indexer:
                 round_q_e4m3=short_index_query_rounding_enabled(
                     num_tokens, proxy, index_q.dtype,
                 ),
+                round_norm_weights=fuse_weight_casts,
             )
         else:
             index_q, index_k, index_z = indexer_norm_rope(

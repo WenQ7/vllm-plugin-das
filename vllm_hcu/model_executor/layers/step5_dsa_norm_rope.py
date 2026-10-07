@@ -42,6 +42,7 @@ def _fused_indexer_qk_norm_rope_kernel(
     rotary_dim: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     ROUND_Q_E4M3: tl.constexpr,
+    ROUND_NORM_WEIGHTS: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ) -> None:
@@ -83,6 +84,11 @@ def _fused_indexer_qk_norm_rope_kernel(
     q_scale = tl.load(q_weight_ptr + dims, mask=dim_ok, other=0.0).to(tl.float32)
     k_scale = tl.load(k_weight_ptr + dims, mask=dim_ok, other=0.0).to(tl.float32)
     k_bias = tl.load(k_bias_ptr + dims, mask=dim_ok, other=0.0).to(tl.float32)
+    if ROUND_NORM_WEIGHTS:
+        # Preserve the original parameter.to(BF16) boundary before the affine.
+        q_scale = q_scale.to(tl.bfloat16).to(tl.float32)
+        k_scale = k_scale.to(tl.bfloat16).to(tl.float32)
+        k_bias = k_bias.to(tl.bfloat16).to(tl.float32)
     scale = tl.where(is_k, k_scale, q_scale + 1.0)
     bias = tl.where(is_k, k_bias, 0.0)
     normalized = (values - mean) * rstd * scale + bias
@@ -146,6 +152,13 @@ def _fused_indexer_qk_norm_rope_kernel(
     k_bias_imag = tl.load(
         k_bias_ptr + rotary_dim + half, mask=half_ok, other=0.0
     ).to(tl.float32)
+    if ROUND_NORM_WEIGHTS:
+        q_scale_real = q_scale_real.to(tl.bfloat16).to(tl.float32)
+        q_scale_imag = q_scale_imag.to(tl.bfloat16).to(tl.float32)
+        k_scale_real = k_scale_real.to(tl.bfloat16).to(tl.float32)
+        k_scale_imag = k_scale_imag.to(tl.bfloat16).to(tl.float32)
+        k_bias_real = k_bias_real.to(tl.bfloat16).to(tl.float32)
+        k_bias_imag = k_bias_imag.to(tl.bfloat16).to(tl.float32)
     real = (
         (real - mean)
         * rstd
@@ -206,7 +219,25 @@ def fused_indexer_qk_norm_rope(
     rotary_dim: int,
     eps: float = 1e-6,
     round_q_e4m3: bool = False,
+    round_norm_weights: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if round_norm_weights and (
+        index_q.dtype != torch.bfloat16
+        or index_k.dtype != torch.bfloat16
+        or index_k.device != index_q.device
+        or head_dim != 256
+        or any(
+            w.dtype != torch.float32
+            or w.shape != (head_dim,)
+            or not w.is_contiguous()
+            or w.device != index_q.device
+            for w in (q_norm_weight, k_norm_weight, k_norm_bias)
+        )
+    ):
+        raise ValueError(
+            "Fused indexer norm weight casts require contiguous FP32 weights "
+            "and matching BF16 HD256 inputs"
+        )
     if round_q_e4m3 and index_q.dtype != torch.bfloat16:
         raise ValueError("Fused indexer E4M3 rounding requires BF16 queries")
     if index_k.shape[1] != head_dim:
@@ -237,6 +268,7 @@ def fused_indexer_qk_norm_rope(
         rotary_dim=rotary_dim,
         NUM_Q_HEADS=num_q_heads,
         ROUND_Q_E4M3=round_q_e4m3,
+        ROUND_NORM_WEIGHTS=round_norm_weights,
         BLOCK_D=triton.next_power_of_2(head_dim),
         BLOCK_R=triton.next_power_of_2(rotary_dim),
         # One wave is enough for the 256-wide reduction and avoids the

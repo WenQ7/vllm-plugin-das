@@ -64,6 +64,7 @@ def test_projection_and_scores_match_native_casts_in_full_graph(
         (groups * tokens, width), -5., device='cuda', dtype=torch.float32,
     )
     indexer = object.__new__(driver.Step4Indexer)
+    indexer.fuse_norm_weight_casts = False
     indexer.owner = SimpleNamespace(
         sparse_indexer_q_norm=SimpleNamespace(weight=qw),
         sparse_indexer_k_norm=SimpleNamespace(weight=kw, bias=kb),
@@ -142,3 +143,108 @@ def test_projection_and_scores_match_native_casts_in_full_graph(
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         monkeypatch.setenv('VLLM_STEP5_INDEXER_ROUND_IN_NORM', '1')
         monkeypatch.setattr(driver, 'round_activations_e4m3', forbidden_cast)
+
+
+@pytest.mark.parametrize("tokens,proxy,dtype", [
+    (8, 256, torch.bfloat16), (64, 256, torch.bfloat16),
+    (128, 256, torch.bfloat16), (129, 256, torch.bfloat16),
+    (8, 128, torch.bfloat16), (8, 256, torch.float16),
+])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_weight_cast_routing_preserves_norm_rounding(
+    monkeypatch, tokens, proxy, dtype, enabled,
+):
+    from vllm_hcu.model_executor.layers import step4_dsa as driver
+
+    calls = []
+    def capture(q, k, qw, kw, kb, *args, **kwargs):
+        calls.append((qw, kw, kb, kwargs.get("round_norm_weights", False)))
+        return q, k
+
+    def long_capture(q, k, z, qw, kw, kb, *args, **kwargs):
+        capture(q, k, qw, kw, kb)
+        return q, k, z
+
+    monkeypatch.setattr(driver, "fused_indexer_qk_norm_rope", capture)
+    monkeypatch.setattr(driver, "indexer_norm_rope", long_capture)
+    monkeypatch.setenv("VLLM_STEP5_INDEXER_ROUND_IN_NORM", "0")
+    heads = 8
+    parameters = [torch.full((proxy,), 1.00390625) for _ in range(3)]
+    owner = SimpleNamespace(
+        sparse_indexer_q_norm=SimpleNamespace(weight=parameters[0]),
+        sparse_indexer_k_norm=SimpleNamespace(
+            weight=parameters[1], bias=parameters[2],
+        ),
+    )
+    indexer = object.__new__(driver.Step4Indexer)
+    indexer.__dict__.update(
+        owner=owner, geometry=SimpleNamespace(proxy_dim=proxy),
+        num_heads=heads, num_kv_groups=2, heads_per_group=4,
+        eps=1e-6, weight_prescale=.5, rope_theta=10000.,
+        rope_scaling=None, max_position=65536,
+        fuse_norm_weight_casts=enabled,
+        state=SimpleNamespace(rope_tables=lambda **kw: (
+            torch.ones(2, 16, dtype=dtype), torch.zeros(2, 16, dtype=dtype),
+        )),
+    )
+    packed = torch.randn(tokens, heads * proxy + 2 * proxy + heads, dtype=dtype)
+    q, k, z, weights = indexer._project(
+        packed, torch.zeros(tokens, dtype=torch.int64), tokens, packed,
+    )
+    qw, kw, kb, fused = calls.pop()
+    assert not calls
+    expected_fused = enabled and tokens <= 128 and proxy == 256 and dtype == torch.bfloat16
+    assert fused == expected_fused
+    for actual, original in zip((qw, kw, kb), parameters):
+        assert actual.dtype == (torch.float32 if expected_fused else dtype)
+        torch.testing.assert_close(actual.to(dtype), original.to(dtype), rtol=0, atol=0)
+        if expected_fused:
+            assert actual is original
+    assert q.shape == (tokens, 2, 4, proxy)
+    assert k.shape == z.shape == (tokens, 1, proxy)
+    torch.testing.assert_close(
+        weights, packed[:, -heads:].float().view(tokens, 2, 4) * .5,
+        rtol=0, atol=0,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP unavailable")
+@pytest.mark.parametrize("tokens", [8, 64])
+@pytest.mark.parametrize("q_round", [False, True])
+def test_weight_cast_fusion_matches_changing_parameters_in_graph(tokens, q_round):
+    from vllm_hcu.model_executor.layers.step5_dsa_norm_rope import (
+        fused_indexer_qk_norm_rope as norm,
+    )
+
+    torch.manual_seed(4707)
+    heads, dim, rotary = 8, 256, 16
+    q = torch.randn(tokens, heads * dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(tokens, dim, device="cuda", dtype=torch.bfloat16)
+    parameters = [torch.randn(dim, device="cuda", dtype=torch.float32) for _ in range(3)]
+    cos = torch.randn(65536, rotary, device="cuda", dtype=torch.bfloat16)
+    sin = torch.randn_like(cos)
+    positions = torch.arange(tokens, device="cuda", dtype=torch.int64) + 65400
+
+    def invoke(fused):
+        weights = parameters if fused else [w.to(torch.bfloat16) for w in parameters]
+        return norm(q, k, *weights, cos, sin, positions,
+                    head_dim=dim, num_q_heads=heads, rotary_dim=rotary,
+                    round_q_e4m3=q_round, round_norm_weights=fused)
+
+    invoke(True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual_q, actual_k = invoke(True)
+    for value in (None, 1.00390625, -1.0003, .003906251, 0.):
+        q.normal_()
+        k.normal_()
+        for w in parameters:
+            if value is None:
+                w.normal_()
+            else:
+                w.fill_(value)
+        positions.copy_(torch.randperm(65536, device="cuda")[:tokens])
+        graph.replay()
+        expected_q, expected_k = invoke(False)
+        torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+        torch.testing.assert_close(actual_k, expected_k, rtol=0, atol=0)

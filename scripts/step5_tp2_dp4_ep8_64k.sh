@@ -20,7 +20,7 @@ case "$dcp_size" in
     # until the complete model path has passed its native/runtime checks.
     export VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS="${VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS:-1}"
     export VLLM_STEP5_DCP2_FUSED_EXCHANGE="${VLLM_STEP5_DCP2_FUSED_EXCHANGE:-0}"
-    # Native bridge qualified; whole-model qualification is still required.
+    # Qualified on frozen100 and one BS64 Decode round with fixed splits.
     export VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE="${VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE:-0}"
     for dcp_flag in "$VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS" "$VLLM_STEP5_DCP2_FUSED_EXCHANGE" "$VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE"; do
       [[ "$dcp_flag" == 0 || "$dcp_flag" == 1 ]] || {
@@ -58,6 +58,12 @@ export VLLM_STEP5_LL_GEMM_TUNING=1
 export VLLM_STEP5_SEQUENCE_PARALLEL_MOE=1 VLLM_STEP5_DSA_SHORT_QUERY=1
 export VLLM_STEP5_DSA_TUNED_SHORT_SPLITS=1
 export VLLM_STEP5_DEVICE_REQUEST_INDICES=1 VLLM_STEP5_BATCHED_SHORT_INDEXER=1 VLLM_STEP5_BF16_TILE_TUNING=1
+# Removes three norm-parameter casts in qualified short-query indexer shapes.
+export VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS="${VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS:-0}"
+case "$VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS" in
+  0|1) ;;
+  *) echo "VLLM_STEP5_INDEXER_FUSED_NORM_WEIGHT_CASTS must be 0 or 1" >&2; exit 2;;
+esac
 export VLLM_STEP5_GROUPED_MTP_INDEXER="${VLLM_STEP5_GROUPED_MTP_INDEXER:-1}"
 export VLLM_STEP5_TP2_HT_BF16_CHUNKS=0 VLLM_STEP5_DSA_FUSED_SELECTOR=1
 export VLLM_STEP5_SHARED_EXPERT_SPLIT_OVERLAP=0
