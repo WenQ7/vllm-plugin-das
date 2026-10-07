@@ -184,3 +184,43 @@ def _check_norm_rounding():
         assert layer.weight.dtype == torch.float32
         assert layer(x).dtype == dtype
         torch.testing.assert_close(layer(x), expected)
+
+
+
+@pytest.mark.parametrize("tokens", [3, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_norm_quant_fusion_preserves_residual_and_native_fallback(monkeypatch, tokens, dtype):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from vllm_hcu.models import step5 as implementation
+
+    x = torch.randn(tokens, 4, dtype=dtype)
+    original = x.clone()
+    positions = torch.arange(tokens)
+    native_norm = Mock(side_effect=lambda h: h.to(torch.bfloat16))
+    attention = Mock(side_effect=lambda **kw: torch.full_like(kw["hidden_states"], .125))
+    def fused(h, w, epsilon):
+        return (h.to(torch.bfloat16),
+                torch.zeros_like(h, dtype=torch.float8_e4m3fn),
+                torch.ones(tokens, 1))
+    quantize = Mock(side_effect=fused)
+    monkeypatch.setattr(implementation, "step5_gemma_norm_fp8_quant", quantize)
+    layer = SimpleNamespace(
+        fp32_residual_connection=True, fused_input_norm_fp8=True,
+        compute_dtype=torch.bfloat16,
+        input_layernorm=Mock(side_effect=native_norm),
+        post_attention_layernorm=lambda h: h.to(torch.bfloat16),
+        self_attn=attention, _feed_forward=lambda h: torch.zeros_like(h),
+    )
+    layer.input_layernorm.weight = torch.zeros(4)
+    layer.input_layernorm.variance_epsilon = 1e-5
+    actual = implementation.Step5DecoderLayer.forward(layer, positions, x)
+    use_fused = tokens in (4, 8, 16, 32, 64)
+    assert quantize.call_count == int(use_fused)
+    assert native_norm.call_count == int(not use_fused)
+    kwargs = attention.call_args.kwargs
+    assert ("qkv_quantized" in kwargs) == use_fused
+    assert ("qkv_scale" in kwargs) == use_fused
+    assert actual.dtype == torch.float32
+    torch.testing.assert_close(actual, original.float() + .125, rtol=0, atol=0)
+    torch.testing.assert_close(x, original, rtol=0, atol=0)

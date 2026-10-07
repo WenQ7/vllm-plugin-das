@@ -83,6 +83,15 @@ def _fake(
     )
 
 
+def _auto_layout(num_tokens: int, dtype: torch.dtype) -> int:
+    # BF16 draft and FP32 residual norms select different native reductions.
+    # Profiles 2/3 share profile 4's per-row order. BF16 M32/128/256 use
+    # profile 0 instead; reusing the FP32 table changes near-tie BF16 rounding.
+    if dtype == torch.bfloat16:
+        return 4 if num_tokens in (4, 8, 16, 64) else 0
+    return 4 if num_tokens == 4 or 16 < num_tokens <= 256 else 0
+
+
 def _impl(
     x: torch.Tensor, weight: torch.Tensor, epsilon: float, layout: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -94,7 +103,7 @@ def _impl(
     if x.shape[0]:
         if layout == -1:
             # Shape metadata only; no device count or tensor value is read.
-            layout = 4 if x.shape[0] == 4 or 16 < x.shape[0] <= 256 else 0
+            layout = _auto_layout(x.shape[0], x.dtype)
         rows, rblock, spt, wrow, warps = _LAYOUTS[layout]
         fused_norm_quant[(triton.cdiv(x.shape[0], rows),)](
             x, weight, h, q, scale, x.shape[0], epsilon, rows, rblock, spt, wrow, warps,
@@ -116,7 +125,7 @@ def step5_gemma_norm_fp8_quant(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return BF16 hidden, E4M3FN hidden and FP32 [M,1] scales.
 
-    Layout -1 chooses the small-M or large-M profile from host shape metadata.
+    Layout -1 chooses a profile from host shape and dtype metadata.
     BF16 draft inputs are promoted inside the kernel; norm weights remain FP32.
     Layout IDs 0/1/2/3 match respectively rows1/R2048, rows1/R4096,
     rows2/R2048 and rows4/R2048 native norm profiles. Layout4 retains

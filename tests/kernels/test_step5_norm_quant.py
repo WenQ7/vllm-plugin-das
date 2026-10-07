@@ -122,3 +122,30 @@ def test_auto_profile_fp64_norm_oracle(m, dtype):
         assert ((exact_q[mask_q] - mid).abs() <=
                 8 * torch.finfo(torch.float32).eps *
                 exact_q[mask_q].abs().clamp_min(1e-30)).all()
+
+
+@pytest.mark.parametrize("m", [4, 8, 16, 32, 64, 128, 256])
+def test_bf16_draft_norm_matches_compiled_native_in_graph(m):
+    from vllm import ir
+
+    torch.manual_seed(4707 + m)
+    x = torch.randn(m, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(4096, device="cuda", dtype=torch.float32) * .03
+    native = ir.ops.rms_norm.impls["native"].impl_fn
+
+    def reference(x, w):
+        return native(x, w + 1., 1e-5).to(torch.bfloat16)
+
+    compiled = torch.compile(reference, fullgraph=True, dynamic=False)
+    compiled(x, weight)
+    step5_gemma_norm_fp8_quant(x, weight, 1e-5)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        hidden, _, _ = step5_gemma_norm_fp8_quant(x, weight, 1e-5)
+    for value in (None, 0., 1., -1., 1e-14):
+        if value is None:
+            x.normal_()
+        else:
+            x.fill_(value)
+        graph.replay()
+        torch.testing.assert_close(hidden, compiled(x, weight), rtol=0, atol=0)

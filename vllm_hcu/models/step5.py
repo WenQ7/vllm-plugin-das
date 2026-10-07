@@ -878,7 +878,7 @@ class Step5DecoderLayer(nn.Module):
                     "4096 hidden size and local FP8 QKV without merged projections"
                 )
             norm_quant_logger.info_once(
-                "Step5 fused input norm/FP8 candidate enabled; BF16 hidden is "
+                "Step5 fused input norm/FP8 candidate enabled for M4/8/16/32/64; BF16 hidden is "
                 "retained for indexer/gate; prequantized QKV uses LightOp GEMM.",
                 scope="local",
             )
@@ -906,7 +906,9 @@ class Step5DecoderLayer(nn.Module):
         # input dtype, so an fp32 input yields an fp32 norm output that has to be
         # narrowed explicitly before the GEMMs.
         residual = hidden_states
-        if self.fused_input_norm_fp8:
+        # Limit model adoption to qualified Decode Graph shapes. Other
+        # shapes retain native normalization and the normal QKV quantizer.
+        if self.fused_input_norm_fp8 and residual.shape[0] in (4, 8, 16, 32, 64):
             hidden, quantized, scale = step5_gemma_norm_fp8_quant(
                 residual, self.input_layernorm.weight,
                 self.input_layernorm.variance_epsilon,
