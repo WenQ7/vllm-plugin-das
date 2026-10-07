@@ -880,7 +880,7 @@ class Step5DecoderLayer(nn.Module):
             norm_quant_logger.info_once(
                 "Step5 fused input norm/FP8 candidate enabled for M4/8/16/32/64; BF16 hidden is "
                 "retained for indexer/gate; prequantized QKV uses LightOp GEMM.",
-                scope="local",
+                scope="process",
             )
 
     def _feed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

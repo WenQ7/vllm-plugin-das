@@ -73,6 +73,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+indexer_norm_cast_logger = init_logger("vllm.hcu.step5.indexer")
 
 _STEP5_DSA_SELECTOR = os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR", "")
 if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}:
@@ -3727,8 +3728,9 @@ class Step4Indexer:
         # already relies on that for the attention layers themselves.
         self.layer_name = owner.attn.layer_name
         if self.fuse_norm_weight_casts:
-            logger.info(
-                "Step5 indexer fused norm weight casts enabled for %s", self.layer_name
+            indexer_norm_cast_logger.info_once(
+                "Step5 indexer fused norm weight casts enabled",
+                scope="process",
             )
         _INDEXERS[self.layer_name] = self
         # Mutated by the op, and the reason the op is not optimised away: see
