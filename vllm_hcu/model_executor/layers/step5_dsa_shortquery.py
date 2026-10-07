@@ -14,10 +14,7 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
 )
 
 bf16_tile_logger = init_logger("vllm.step5_bf16_dsa")
-bf16_tile_mode = os.environ.get("VLLM_STEP5_BF16_DSA_TUNED_TILES", "0")
-if bf16_tile_mode not in ("0", "1"):
-    raise ValueError("VLLM_STEP5_BF16_DSA_TUNED_TILES must be 0 or 1")
-BF16_TUNED_TILES = bf16_tile_mode == "1"
+
 
 
 def is_short_query_batch(num_tokens, max_query_len=0, *, verification=False,
@@ -286,10 +283,14 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     block_r = _fit_block_regions(
         min(8, triton.next_power_of_2(slots_per_split)), region_size=region_size,
         block_d=64, element_size=query.element_size())
+    # Spawned workers may import this module before runtime env propagation.
+    tile_mode = os.environ.get("VLLM_STEP5_BF16_DSA_TUNED_TILES", "0")
+    if tile_mode not in ("0", "1"):
+        raise ValueError("VLLM_STEP5_BF16_DSA_TUNED_TILES must be 0 or 1")
     # Qualified against per-head packed BF16 KV on BW1101. Keep all other dtypes,
     # layouts, split counts and shapes on their existing tile policy.
     if (
-        BF16_TUNED_TILES
+        tile_mode == "1"
         and num_queries in (16, 32, 64)
         and query.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
         and num_heads == 32 and num_kv_groups == 2 and region_size == 8
