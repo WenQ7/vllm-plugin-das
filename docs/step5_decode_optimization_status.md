@@ -1291,3 +1291,32 @@ fp8-norm-fusion-v11_measured_only_audit.json, result.iterations.json,
 manifest.json, runtime_graph_log.txt, shutdown.json and
 cpu_validation_activity_v11.json; dcp2-prototype-20261007/
 current_dcp2_native_qualification_handle.json.
+
+### Native fine8 and real cache-layout exchange completed
+
+The current fine8/HD192 operator passed62 cases per rank against the FP64
+oracle, including real RCCL FP32 state exchange/global LSE merge, shuffled
+pages, q1-4, long65538 contexts, SWA128, empty/tiny cases and changing-Q
+communication Graphs. Packed metadata was exact. Source SHA:
+f1c4f2e72e89e88c8010b3327f65580adc3310b9aadbb55a01614caf936b3e33.
+
+Current QKV/cache exchange passed32 cases per rank (local Q heads4/32,
+tokens1/2/3/4/16/64/128/384, actual sparse/SWA V2 cache strides).
+All eager QKV/cache outputs matched exactly. Twelve real collective Graph
+cases per rank passed36 changing-input/slot-mapping replays; Decode-word
+conversion also passed changing-count Graphs. Source SHA:
+a935d869211aef72f040091f89b8a86a421732bad78be0db7bf71e37b3d69a30.
+
+The first thin snapshot loaded the installed HCU package and failed before
+numerical cases because that package lacked the snapshot's DCP2 module.
+The portable qualifier now imports the explicit adjacent source file.
+That attempt and its terminal handle are retained. The corrected sequential
+run completed from immutable8a63073 source, and all four native process
+groups destroyed cleanly; jobs are terminal. These are operator proofs,
+not model DCP2 support or performance. Model activation remains disabled
+pending actual Attention/cache/head and gathered-plan/state integration.
+
+Evidence: dcp2-prototype-20261007/current_dcp2_native_qualification_summary.json,
+fine-native-v3/gpu_qualification-rank0/1.json,
+exchange-native-v2/exchange_gpu-rank0/1.json and
+current_dcp2_native_qualifications-v2.log.
