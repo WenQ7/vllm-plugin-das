@@ -1488,6 +1488,12 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
         fast_build: bool = False,
     ) -> Step4DSAMetadata:
         m = common_attn_metadata
+        state = self._dsa_state()
+        logical_block_size = self.block_size * (
+            state.context_parallel_size if state is not None else 1
+        )
+        if state is not None and state.context_parallel_size == 2 and self.block_size != 64:
+            raise ValueError("Step5 DCP2 summaries require local cache pages64")
         (
             num_decodes,
             num_prefills,
@@ -1508,7 +1514,7 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
             seq_lens_cpu=m.seq_lens_cpu,
             positions=m.positions,
             max_seq_len=m.max_seq_len,
-            block_size=self.block_size,
+            block_size=logical_block_size,
             max_query_len=m.max_query_len,
             block_table_np=getattr(m, "block_table_np", None),
         )
@@ -1516,7 +1522,6 @@ class Step4DSAMetadataBuilder(AttentionMetadataBuilder[Step4DSAMetadata]):
         # Build graph schedules here rather than in the indexer op. The builder
         # runs eagerly before every replay and writes current metadata into the
         # fixed addresses captured by the target model graph.
-        state = self._dsa_state()
         sched = None
         if (
             state is not None
@@ -2504,7 +2509,11 @@ class Step4DSAState:
         max_num_reqs: int = 0,
         max_model_len: int = 0,
         num_speculative_tokens: int = 0,
+        context_parallel_size: int = 1,
     ) -> None:
+        if context_parallel_size not in (1, 2):
+            raise ValueError("DSA summary geometry supports context sizes 1 and 2")
+        self.context_parallel_size = context_parallel_size
         self.num_layers = num_layers
         self.geometry = geometry
         self.dtype = dtype
@@ -2583,7 +2592,13 @@ class Step4DSAState:
         self._layers_done = 0
 
     def ensure_allocated(self, kv_cache: torch.Tensor, device: torch.device) -> None:
-        num_blocks, block_size = int(kv_cache.shape[1]), int(kv_cache.shape[2])
+        num_blocks = int(kv_cache.shape[1])
+        physical_block_size = int(kv_cache.shape[2])
+        if self.context_parallel_size == 2 and physical_block_size != 64:
+            raise ValueError("Step5 DCP2 summaries require local cache pages64")
+        # Summary compression always sees the complete global token stream.
+        # Physical DCP2 page64 corresponds to logical page128/16 region8 rows.
+        block_size = physical_block_size * self.context_parallel_size
         if self.summary is not None:
             expected_rows = num_blocks * (block_size // self.geometry.region_size)
             if self.block_size == block_size and self.summary.shape[1] == expected_rows:
@@ -2600,7 +2615,6 @@ class Step4DSAState:
                 "capture time. The capture warmup must run at least one eager "
                 "step through the DSA layers first."
             )
-        num_blocks, block_size = int(kv_cache.shape[1]), int(kv_cache.shape[2])
         if block_size % self.geometry.region_size:
             raise ValueError(
                 f"KV block size {block_size} is not a multiple of the DSA region "

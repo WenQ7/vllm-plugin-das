@@ -895,6 +895,9 @@ class Step5Model(nn.Module):
                 max_pending=(4 if num_speculative_tokens else 2)
                 * vllm_config.scheduler_config.max_num_seqs + 16,
                 num_speculative_tokens=num_speculative_tokens,
+                context_parallel_size=(
+                    vllm_config.parallel_config.decode_context_parallel_size
+                ),
                 dtype=self.compute_dtype,
                 # Capture bounds: the decode schedule lives in [max_num_reqs]
                 # buffers at a score width covering max_model_len, so that both

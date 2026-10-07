@@ -1187,3 +1187,69 @@ capacity gate and began the one measured iteration. No TPS result yet.
 Evidence: dcp2-prototype-20261007/fine_regions_cpu_interpreter.log,
 fine_regions_gpu_compile.json; bs64-capacity-20261007/
 fp8-norm-fusion-v11_state.json and service/controller logs.
+
+### TP2/DCP2 QKV/cache and selection bridge
+
+Source-owned ops/step5_dcp2_exchange.py adds a local normalized/rotated
+Q/K/V pack, rank-ordered head unpack plus owned BF16 KV scatter in one
+kernel, and conversion of existing int64 Decode words to region8 logical
+IDs. QKV projection weights remain TP2-sharded: each rank contributes its
+local Q heads and two KV heads, while the context-striped cache carries
+all four KV heads. The final globally merged Attention output must return
+only that TP rank's Q heads before the existing per-head gate/O projection.
+
+The existing indexer Q/W weights are provider-group sharded, not replicated:
+each TP2 rank scores two distinct groups. Its K/Z providers are replicated,
+so each rank can retain the exact eight-token compression arithmetic over
+the complete token stream, rather than compressing alternate tokens and
+changing the model. Exchange group-major selected logical region IDs and
+counts in TP rank order; do not rescale indexer weights or choose TopK over
+only the rank-local half context.
+
+vLLM V2's existing CP_SIZE2/CP_INTERLEAVE1 slot mapping already masks remote
+tokens with -1 and maps global page128 into local page64. The new cache
+writer consumes that mapping unchanged, preserving padding. It accepts
+only BF16 cache and HD192. Summary pools and schedules must use logical
+page128 with sixteen region8 summaries per page, independently of physical
+cache page64. Step5 now declares the context size to Step4DSAState; its
+summary allocation and metadata builder use this logical page size, with
+an explicit local64 guard for DCP2. Ten CPU checks exercised the actual
+state allocator/builder (DCP1/default and DCP2, reuse/replacement, queries
+1/4/24, unchanged global lengths/positions and local slot mapping). This
+is source integration of metadata geometry, not whole-model DCP2 proof.
+
+Decode's source pack stores logical token offsets in low32 and physical
+region IDs in high32. The new conversion masks the tail using counts,
+including the legitimate zero word for region0, retains the forced current
+region/order, and avoids attempting to invert shuffled physical block IDs.
+Three CPU-interpreter Decode-word cases passed (TopK slots1/2/513).
+Seven current gfx938 offline variants compiled with zero scratch/shared
+memory. The initial contiguous-cache variant passed32 CPU-interpreter cases
+(tokens1/2/3/4/16/64/128/384, local Q heads4/32, int32/int64 slot mappings).
+The actual V2 cache layouts then required explicit head/token/page strides:
+sparse K/V are interleaved per head; SWA K/V are separate within each page,
+with non-affine flattened token addresses across pages. The current writer
+supports both 3D affine and 4D paged views without materializing cache copies.
+Nine current-source CPU cases passed, including both Q geometries, sparse
+and SWA layouts, the page63/64 boundary, -1 and out-of-range int64 slots,
+and Decode-word conversion. The32 earlier cases establish the contiguous
+variant's head-order behavior, not complete current-source GPU proof. Native exchange and changing collective-Graph qualification is
+prepared in tests/kernels/qualify_step5_dcp2_exchange.py and refuses live
+vLLM processes; it has not run while the isolated BS64 fusion measurement
+uses the GPUs. Native whole-model qualification remains pending.
+
+No model activation or DCP launcher guard has changed. Still required:
+native exchange proof; GPU qualification of logical summary/builder
+integration; gathered selection plans; full-query/local-cache Prefill and SWA paths; FP32 partial
+state exchange/global merge and TP-head slicing; stock DCP validation
+adaptation; whole-model correctness and one performance comparison.
+Doubling cached KV heads while halving context does not by itself reduce
+per-GPU KV storage or Attention FLOPs relative to TP2/DCP1; communication
+overhead and the measured end-to-end result must decide adoption.
+
+Evidence: dcp2-prototype-20261007/exchange_offline_compile.json,
+decode_word_cpu_interpreter.log, exchange_cpu_interpreter.log,
+exchange_strided_cpu.log, context_geometry_cpu.log. The initial
+CPU interpreter used255 threads; its exact owned process was stopped and
+the same matrix relaunched with one thread, retaining the partial log and
+exchange_cpu_thread_correction.json. GPU kernels were not run.
