@@ -1720,10 +1720,13 @@ def _require_splitting_op() -> None:
     compilation = config.compilation_config
     if compilation.cudagraph_mode == CUDAGraphMode.NONE:
         return  # nothing is captured, so the op runs every step wherever it sits
-    if STEP4_DSA_INDEX_OP in (compilation.splitting_ops or []):
+    required = [STEP4_DSA_INDEX_OP]
+    if os.environ.get("VLLM_STEP5_DSA_PACK_QKNORM", "0") == "1":
+        required.append("vllm::step5_dsa_index_qknorm")
+    if all(op in (compilation.splitting_ops or []) for op in required):
         return
     raise RuntimeError(
-        f"Step-4 DSA requires {STEP4_DSA_INDEX_OP!r} in "
+        f"Step-4 DSA requires {required!r} in "
         f"CompilationConfig.splitting_ops, but the resolved list is "
         f"{compilation.splitting_ops!r} with cudagraph_mode="
         f"{compilation.cudagraph_mode}. The indexer would be captured into a "
@@ -2118,6 +2121,7 @@ class Step4SparsePlan:
     # graph, and if anything ever reordered them the layer would silently attend
     # to the previous step's regions instead of failing.
     md: Step4DSAMetadata | None = None
+    main_qk: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 def build_plan(
@@ -2129,6 +2133,7 @@ def build_plan(
     num_kv_groups: int,
     regions_per_page: int,
     context_parallel_size: int = 1,
+    main_qknorm: tuple | None = None,
 ) -> Step4SparsePlan:
     """Turn indexer scores into the two kernels' metadata.
 
@@ -2230,17 +2235,40 @@ def build_plan(
             ):
                 prefill_meta = prefill_sparse_meta_lightop
         selector_kwargs = {"num_kv_groups": num_kv_groups} if fused_selector else {}
-        selected = prefill_meta(
-            prefill_logits,
-            q_positions if fused_selector else q_positions.repeat(num_kv_groups),
-            attn_metadata.block_table,
-            group_request_indices,
-            topk=topk,
-            region_size=REGION_BLOCK_SIZE,
-            regions_per_page=regions_per_page,
-            return_logical_ids=need_logical_ids,
-            **selector_kwargs,
-        )
+        joint_norm = False
+        if (
+            main_qknorm is not None and fused_selector and verification and short_query
+            and prefill_tokens == attn_metadata.num_actual_tokens
+            and not need_logical_ids and context_parallel_size == 1
+            and prefill_meta is not prefill_sparse_meta_fused
+            and os.environ.get("VLLM_STEP5_DSA_LIGHTOP_TOP512", "0") == "1"
+        ):
+            from .step5_dsa_norm_selector import (
+                supports_main_norm_selector, prefill_meta_with_main_norm,
+            )
+            joint_norm = supports_main_norm_selector(
+                prefill_logits, q_positions, group_request_indices, main_qknorm
+            )
+        if joint_norm:
+            packed, counts, q, k = prefill_meta_with_main_norm(
+                prefill_logits, q_positions, attn_metadata.block_table,
+                group_request_indices, main_qknorm,
+                regions_per_page=regions_per_page,
+            )
+            plan.main_qk = (q, k)
+            selected = (packed, counts)
+        else:
+            selected = prefill_meta(
+                prefill_logits,
+                q_positions if fused_selector else q_positions.repeat(num_kv_groups),
+                attn_metadata.block_table,
+                group_request_indices,
+                topk=topk,
+                region_size=REGION_BLOCK_SIZE,
+                regions_per_page=regions_per_page,
+                return_logical_ids=need_logical_ids,
+                **selector_kwargs,
+            )
         if need_logical_ids:
             packed, counts, logical_ids = selected
         else:
@@ -3811,7 +3839,8 @@ class Step4Indexer:
         )
 
     def run(self, hidden_states: torch.Tensor, positions: torch.Tensor,
-            projected_index: torch.Tensor | None = None) -> int:
+            projected_index: torch.Tensor | None = None,
+            main_qknorm: tuple | None = None) -> int:
         attn = self.owner.attn
         raw = get_forward_context().attn_metadata
         if isinstance(raw, dict):
@@ -3876,6 +3905,7 @@ class Step4Indexer:
             num_kv_groups=self.num_kv_groups,
             regions_per_page=state.regions_per_page,
             context_parallel_size=state.context_parallel_size,
+            main_qknorm=main_qknorm,
         )
         state.finish_layer()
         return width
@@ -4452,5 +4482,55 @@ direct_register_custom_op(
     op_func=step4_dsa_index,
     mutates_args=["plan_token"],
     fake_impl=step4_dsa_index_fake,
+    dispatch_key=current_platform.dispatch_key,
+)
+
+def step5_dsa_index_qknorm(
+    hidden_states: torch.Tensor, positions: torch.Tensor,
+    qkv: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor, layer_name: str, plan_token: torch.Tensor,
+    num_q_heads: int, num_kv_heads: int, rotary_pairs: int, epsilon: float,
+    projected_index: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    indexer = _INDEXERS.get(layer_name)
+    if indexer is None:
+        raise RuntimeError(f"{layer_name}: no Step4Indexer registered")
+    main_norm = (qkv, q_weight, k_weight, cos_sin_cache, rotary_pairs, epsilon)
+    # Only the qualified TP2 layout can share its norm launch with metadata.
+    width = indexer.run(
+        hidden_states, positions, projected_index,
+        main_qknorm=main_norm if (num_q_heads, num_kv_heads) == (32, 2) else None,
+    )
+    plan_token.fill_(width)
+    plan = indexer.owner.attn.step4_sparse_plan
+    if plan is not None and plan.main_qk is not None:
+        indexer_norm_cast_logger.info_once(
+            "Step5 joint causal pack/QK-norm/RoPE active for target verification",
+            scope="process",
+        )
+        return plan.main_qk
+    from .step5_attention_ops import qknorm_rope_impl
+    return qknorm_rope_impl(
+        qkv, q_weight, k_weight, cos_sin_cache, positions,
+        num_q_heads, num_kv_heads, rotary_pairs, epsilon,
+    )
+
+
+def step5_dsa_index_qknorm_fake(
+    hidden_states: torch.Tensor, positions: torch.Tensor,
+    qkv: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor, layer_name: str, plan_token: torch.Tensor,
+    num_q_heads: int, num_kv_heads: int, rotary_pairs: int, epsilon: float,
+    projected_index: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        qkv.new_empty((qkv.shape[0], num_q_heads * 192)),
+        qkv.new_empty((qkv.shape[0], num_kv_heads * 192)),
+    )
+
+
+direct_register_custom_op(
+    op_name="step5_dsa_index_qknorm", op_func=step5_dsa_index_qknorm,
+    mutates_args=["plan_token"], fake_impl=step5_dsa_index_qknorm_fake,
     dispatch_key=current_platform.dispatch_key,
 )

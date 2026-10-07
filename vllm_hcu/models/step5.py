@@ -515,6 +515,14 @@ class Step5Attention(nn.Module):
             and self.rotary_emb.is_neox_style
             and self.rotary_emb.rotary_dim in (64, 192)
         )
+        pack_norm_requested = os.environ.get("VLLM_STEP5_DSA_PACK_QKNORM", "0")
+        if pack_norm_requested not in ("0", "1"):
+            raise ValueError("VLLM_STEP5_DSA_PACK_QKNORM must be 0 or 1")
+        self.fused_dsa_pack_norm = (
+            pack_norm_requested == "1" and self.fused_qk_norm_rope
+            and self.indexer is not None and not self.dcp2_attention_enabled
+            and self.num_heads == 32 and self.num_kv_heads == 2
+        )
         if self.fused_qk_norm_rope:
             logger.info_once("Step5 main Attention: fused FP32-weight QK-norm + RoPE enabled.")
         self.fused_dcp2_norm_exchange = (
@@ -576,7 +584,17 @@ class Step5Attention(nn.Module):
             )
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            if self.fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+            joint_indexer = self.fused_dsa_pack_norm and qkv.dtype == torch.bfloat16
+            if joint_indexer:
+                cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+                q, k = torch.ops.vllm.step5_dsa_index_qknorm(
+                    hidden_states, positions, qkv,
+                    self.q_norm.weight, self.k_norm.weight, cache,
+                    self.indexer.layer_name, self.step4_dsa_plan_token,
+                    self.num_heads, self.num_kv_heads, self.rotary_dim // 2,
+                    self.q_norm.variance_epsilon, projected_index,
+                )
+            elif self.fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
                 cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
                 q, k = fused_qknorm_rope(
                     qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
@@ -593,7 +611,7 @@ class Step5Attention(nn.Module):
                 k = k_by_head.view(k.shape)
                 if self.use_rope:
                     q, k = self.rotary_emb(positions, q, k)
-            if self.indexer is not None:
+            if self.indexer is not None and not joint_indexer:
                 # Publishes layer.attn.step4_sparse_plan, which the DSA backend
                 # reads. It needs hidden_states, which Attention.forward never sees.
                 self.indexer.forward(hidden_states, positions, projected_index)
