@@ -1164,6 +1164,8 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         prequanted_a1_scale: torch.Tensor | None = None,
         prequanted_a1: bool = False,
+        shared_experts: SharedExperts | None = None,
+        shared_experts_input: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1248,6 +1250,13 @@ class FusedMoEKernelModularImpl:
             hook, receiver = (
                 prepare_ret if isinstance(prepare_ret, tuple) else (None, prepare_ret)
             )
+
+            if (
+                hook is not None and not dbo_enabled()
+                and not prequanted_a1 and shared_experts is not None
+                and shared_experts_input is not None
+            ):
+                shared_experts.maybe_begin_dispatch(shared_experts_input)
 
             if hook is not None:
                 if dbo_enabled():
@@ -1520,6 +1529,8 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             prequanted_a1_scale=scale,
             prequanted_a1=quanted_hidden_states is not None,
+            shared_experts=shared_experts,
+            shared_experts_input=shared_experts_input,
         )
 
         # Stash the original unquantized hidden states on the LoRA context

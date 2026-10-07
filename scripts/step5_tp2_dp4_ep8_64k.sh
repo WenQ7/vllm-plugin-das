@@ -55,6 +55,7 @@ export VLLM_STEP5_DSA_TUNED_SHORT_SPLITS=1
 export VLLM_STEP5_DEVICE_REQUEST_INDICES=1 VLLM_STEP5_BATCHED_SHORT_INDEXER=1 VLLM_STEP5_BF16_TILE_TUNING=1
 export VLLM_STEP5_GROUPED_MTP_INDEXER="${VLLM_STEP5_GROUPED_MTP_INDEXER:-1}"
 export VLLM_STEP5_TP2_HT_BF16_CHUNKS=0 VLLM_STEP5_DSA_FUSED_SELECTOR=1
+export VLLM_STEP5_SHARED_EXPERT_SPLIT_OVERLAP=0
 case "${STEP5_SHARED_EXPERT_OVERLAP:-off}" in
   off)
     export VLLM_DISABLE_SHARED_EXPERTS_STREAM=1
@@ -68,7 +69,14 @@ case "${STEP5_SHARED_EXPERT_OVERLAP:-off}" in
     export VLLM_STEP5_SHARED_EXPERTS_DECODE_ONLY=1
     export VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD="${VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD:-128}"
     ;;
-  *) echo "STEP5_SHARED_EXPERT_OVERLAP must be off or decode" >&2; exit 2;;
+  split)
+    [[ "$stage" == decode ]] || { echo "Split shared-expert overlap is limited to Decode" >&2; exit 2; }
+    export VLLM_DISABLE_SHARED_EXPERTS_STREAM=1
+    export VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH=0 VLLM_HCU_SHARED_EXPERTS_STREAM_FORCE=0
+    export VLLM_STEP5_SHARED_EXPERTS_DECODE_ONLY=0
+    export VLLM_STEP5_SHARED_EXPERT_SPLIT_OVERLAP=1
+    ;;
+  *) echo "STEP5_SHARED_EXPERT_OVERLAP must be off, decode or split" >&2; exit 2;;
 esac
 # These fused projection candidates regress the production TP2 shapes.
 # QKV stays BF16 unless the optional calibrated FP8 path is explicitly enabled.

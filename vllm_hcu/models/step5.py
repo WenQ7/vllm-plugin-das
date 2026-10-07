@@ -230,6 +230,12 @@ class Step5MLP(nn.Module):
         self.prefix = prefix
         self.hidden_size = hidden_size
         self.limit = None
+        # The split schedule is valid only for the BF16 shared expert without
+        # a down-projection collective. Dense FFNs keep the ordinary path.
+        self._hcu_split_shared_supported = (
+            quant_config is None and not reduce_results
+            and prefix.endswith(".share_expert")
+        )
         layer_idx = extract_layer_index(prefix)
         swiglu_limits_shared = getattr(config, "swiglu_limits_shared", None)
         if (
@@ -244,6 +250,14 @@ class Step5MLP(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(hidden_states)
         intermediate_act = self.act_fn(gate_up)
+        output, _ = self.down_proj(intermediate_act)
+        return output
+
+    def _hcu_shared_dispatch(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up, _ = self.gate_up_proj(hidden_states)
+        return self.act_fn(gate_up)
+
+    def _hcu_shared_combine(self, intermediate_act: torch.Tensor) -> torch.Tensor:
         output, _ = self.down_proj(intermediate_act)
         return output
 

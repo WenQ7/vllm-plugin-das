@@ -61,6 +61,10 @@ class SharedExperts(torch.nn.Module):
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
         self._layer = layer
+        self._split_dispatch_act: torch.Tensor | None = None
+        self._step5_split_overlap = (
+            os.environ.get("VLLM_STEP5_SHARED_EXPERT_SPLIT_OVERLAP", "0") == "1"
+        )
         self._moe_config = moe_config
 
         self._mk_can_overlap_shared_experts = mk_can_overlap_shared_experts
@@ -92,6 +96,62 @@ class SharedExperts(torch.nn.Module):
             self._stream = aux_stream()
             if self._stream is not None:
                 logger.debug_once("Enabled separate cuda stream for MoE shared_experts")
+
+        if self._step5_split_overlap:
+            from vllm.config import get_current_vllm_config_or_none
+            config = get_current_vllm_config_or_none()
+            parallel = None if config is None else config.parallel_config
+            if (
+                config is None
+                or config.model_config.hf_text_config.model_type != "step5"
+                or parallel.tensor_parallel_size != 2
+                or parallel.data_parallel_size != 4
+                or parallel.pipeline_parallel_size != 1
+                or parallel.prefill_context_parallel_size != 1
+                or parallel.decode_context_parallel_size not in (1, 2)
+                or not parallel.enable_expert_parallel
+                or parallel.all2all_backend != "deepep_low_latency"
+                or enable_dbo or parallel.enable_dbo
+                or self._stream is not None
+                or not getattr(layer, "_hcu_split_shared_supported", False)
+            ):
+                raise ValueError(
+                    "Step5 split shared overlap requires BF16 shared expert, "
+                    "TP2/DP4/EP8/PP1/PCP1/DCP1-or-2, DeepEP-LL, no DBO "
+                    "and no auxiliary shared-expert stream"
+                )
+
+    def maybe_begin_dispatch(
+        self, shared_experts_input: torch.Tensor,
+        x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> bool:
+        """Run shared gate/up while the asynchronous dispatch is in flight."""
+        if not getattr(self, "_step5_split_overlap", False):
+            return False
+        if (
+            self.enable_dbo or self._stream is not None
+            or x_and_scale_quanted is not None
+            or shared_experts_input.dtype != torch.bfloat16
+            or not 1 <= shared_experts_input.shape[0] <= 64
+            or self._determine_shared_experts_order(shared_experts_input)
+                != SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+        ):
+            return False
+        from vllm.forward_context import (
+            get_forward_context, is_forward_context_available,
+        )
+        from .step5_overlap import is_short_uniform_decode
+        context = (
+            get_forward_context() if is_forward_context_available() else None
+        )
+        if not is_short_uniform_decode(context):
+            return False
+        assert self._split_dispatch_act is None
+        assert self._output[self._output_idx] is None
+        self._split_dispatch_act = self._layer._hcu_shared_dispatch(
+            shared_experts_input
+        )
+        return True
 
     # TODO(bnell): Hack for elastic_ep. Get rid of this
     def _set_moe_config(self, new_moe_config: FusedMoEConfig):
@@ -319,6 +379,7 @@ class SharedExperts(torch.nn.Module):
 
     @property
     def output(self) -> torch.Tensor:
+        assert getattr(self, "_split_dispatch_act", None) is None
         assert self._output[self._output_idx] is not None
         if self._output_pending_on_stream[self._output_idx]:
             assert self._stream is not None
@@ -334,6 +395,16 @@ class SharedExperts(torch.nn.Module):
         order: SharedExpertsOrder,
         x_and_scale_quanted: tuple[torch.Tensor, torch.Tensor] | None = None,
     ):
+        if getattr(self, "_split_dispatch_act", None) is not None:
+            assert order == SharedExpertsOrder.MK_INTERNAL_OVERLAPPED
+            assert x_and_scale_quanted is None
+            assert self._output[self._output_idx] is None
+            self._output[self._output_idx] = self._layer._hcu_shared_combine(
+                self._split_dispatch_act
+            )
+            self._split_dispatch_act = None
+            return None
+
         experts_order = self._determine_shared_experts_order(shared_experts_input)
 
         if order != experts_order:
