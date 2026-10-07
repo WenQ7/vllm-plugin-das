@@ -73,6 +73,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+attention_route_logger = init_logger("vllm.hcu.step5.sparse_attention")
 indexer_norm_cast_logger = init_logger("vllm.hcu.step5.indexer")
 
 _STEP5_DSA_SELECTOR = os.environ.get("VLLM_STEP5_DSA_RADIX_SELECTOR", "")
@@ -440,7 +441,7 @@ def _flash_attn_prefill(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-    return prefill_bf16(
+    result = prefill_bf16(
         query,
         key_cache,
         value_cache,
@@ -450,6 +451,13 @@ def _flash_attn_prefill(
         region_size=region_size,
         softmax_scale=softmax_scale,
     )
+    attention_route_logger.info_once(
+        "Step5 native sparse FA prefill active: KV dtype=%s, stride=%s, "
+        "query heads=%d, KV groups=%d, head_dim=%d",
+        key_cache.dtype, tuple(key_cache.stride()), query.shape[1],
+        num_kv_groups, query.shape[-1], scope="process",
+    )
+    return result
 
 
 def _flash_attn_decode(
@@ -496,7 +504,7 @@ def _flash_attn_decode(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-    return decode_bf16(
+    result = decode_bf16(
         query,
         key_cache,
         value_cache,
@@ -508,6 +516,13 @@ def _flash_attn_decode(
         softmax_scale=softmax_scale,
         num_splits=1,
     )
+    attention_route_logger.info_once(
+        "Step5 native sparse FA decode active: KV dtype=%s, stride=%s, "
+        "query heads=%d, KV groups=%d, head_dim=%d",
+        key_cache.dtype, tuple(key_cache.stride()), query.shape[1],
+        num_kv_groups, query.shape[-1], scope="process",
+    )
+    return result
 
 
 @functools.lru_cache(maxsize=64)
