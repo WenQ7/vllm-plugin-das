@@ -1980,7 +1980,6 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
         if attn_metadata.num_prefills > 0:
             packed, counts, logical_ids, request_indices = plan.prefill
             wrote_prefill_output = False
-            q_positions = attn_metadata.positions[ndt:num_tokens].to(torch.int32)
             prefill_tokens = num_tokens - ndt
             # The decode launcher captures up to max_num_seqs=32 target rows.
             # MTP3 verifies four queries per row, so the largest uniform target
@@ -1999,16 +1998,6 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                 verification=verification,
                 capturing=torch.cuda.is_current_stream_capturing(),
             )
-            prefill_kwargs = dict(
-                num_kv_groups=num_kv_groups,
-                region_size=REGION_BLOCK_SIZE,
-                softmax_scale=self.scale,
-                logical_regions=logical_ids,
-                q_positions=q_positions,
-                request_indices=request_indices,
-                block_q=128,
-                block_regions=16,
-            )
             use_flash_prefill = (
                 "prefill" in FLASH_ATTN_DSA_STAGES
                 or (
@@ -2016,11 +2005,23 @@ class Step4DSAImpl(AttentionImpl[Step4DSAMetadata]):
                     and short_query
                 )
             )
+            if not use_flash_prefill:
+                # Native FA consumes packed regions only; avoid an unused
+                # position conversion in each sparse Attention layer.
+                q_positions = attn_metadata.positions[ndt:num_tokens].to(torch.int32)
+                prefill_kwargs = dict(
+                    num_kv_groups=num_kv_groups,
+                    region_size=REGION_BLOCK_SIZE,
+                    softmax_scale=self.scale,
+                    logical_regions=logical_ids,
+                    q_positions=q_positions,
+                    request_indices=request_indices,
+                    block_q=128,
+                    block_regions=16,
+                )
             if use_flash_prefill:
-                # flash-attention-cutlass has no query-tiled prefill path, so
-                # logical_regions/q_positions/request_indices/block_q from
-                # prefill_kwargs are dropped by _flash_attn_prefill rather
-                # than forwarded (see its docstring).
+                # Native FA consumes the already-packed causal regions;
+                # query-tiled positions and request indices are unnecessary.
                 out_p, lse_p = _flash_attn_prefill(
                     query[ndt:num_tokens],
                     k_flat,
@@ -2161,7 +2162,10 @@ def build_plan(
             "CommonAttentionMetadata.positions is required by the DSA region "
             "selector; it derives each row's causal horizon from it."
         )
-        q_positions = positions[ndt : attn_metadata.num_actual_tokens].to(torch.int32)
+        fused_selector = _STEP5_DSA_SELECTOR in {"1", "radix_flash"}
+        q_positions = positions[ndt : attn_metadata.num_actual_tokens]
+        if not fused_selector:
+            q_positions = q_positions.to(torch.int32)
         # request_indices maps each score row to its block-table row. Rows are
         # group-major, so the per-token request index tiles once per KV group.
         req_of_token = attn_metadata.prefill_request_indices
@@ -2179,7 +2183,7 @@ def build_plan(
         group_request_indices = req_of_token.repeat(num_kv_groups)
         prefill_meta = (
             prefill_sparse_meta_fused
-            if _STEP5_DSA_SELECTOR in {"1", "radix_flash"}
+            if fused_selector
             else prefill_sparse_meta
         )
         prefill_tokens = attn_metadata.num_actual_tokens - ndt
@@ -2203,15 +2207,17 @@ def build_plan(
             and not PREFILL_QK_FP8
             and not PREFILL_PV_FP8
         )
+        selector_kwargs = {"num_kv_groups": num_kv_groups} if fused_selector else {}
         selected = prefill_meta(
             prefill_logits,
-            q_positions.repeat(num_kv_groups),
+            q_positions if fused_selector else q_positions.repeat(num_kv_groups),
             attn_metadata.block_table,
             group_request_indices,
             topk=topk,
             region_size=REGION_BLOCK_SIZE,
             regions_per_page=regions_per_page,
             return_logical_ids=need_logical_ids,
+            **selector_kwargs,
         )
         if need_logical_ids:
             packed, counts, logical_ids = selected

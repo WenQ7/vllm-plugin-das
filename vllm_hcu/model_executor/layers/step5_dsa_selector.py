@@ -6,6 +6,9 @@ unchanged. Torch still selects and sorts the same integer ranks.
 """
 import torch
 from vllm.triton_utils import triton, tl
+from vllm.logger import init_logger
+
+_selector_logger = init_logger("vllm.hcu.step5.sparse_selector")
 
 
 @triton.jit
@@ -229,12 +232,18 @@ def _prefill_sparse_meta_fused_kernel(
     region_size: tl.constexpr,
     regions_per_page: tl.constexpr,
     WRITE_LOGICAL_IDS: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
+    QUERY_POSITION_STRIDE: tl.constexpr,
+    BROADCAST_POSITIONS: tl.constexpr,
     BLOCK_R: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
 ) -> None:
     """Select, pack, and append the query's current region in one launch."""
     row = tl.program_id(0)
-    q_position = tl.load(q_positions_ptr + row).to(tl.int32)
+    position_row = row % QUERY_ROWS if BROADCAST_POSITIONS else row
+    q_position = tl.load(
+        q_positions_ptr + position_row * QUERY_POSITION_STRIDE
+    ).to(tl.int32)
     request = tl.load(request_ptr + row).to(tl.int32)
     current_region = tl.maximum(q_position // region_size, 0)
     visible = tl.minimum(current_region, seq_regions)
@@ -342,16 +351,25 @@ def prefill_sparse_meta_fused(
     region_size=8,
     regions_per_page,
     return_logical_ids=False,
+    num_kv_groups=1,
 ):
-    """Build exact Step5 short-prefill selection metadata in one kernel."""
+    """Build exact selection metadata from group-major scores.
+
+    Query positions may be supplied once per token; the kernel broadcasts them
+    across num_kv_groups and converts int64 positions to int32 on device.
+    Request indices remain group-major, as in the original call contract.
+    """
     rows, width = logits.shape
     topk = int(topk)
+    num_kv_groups = int(num_kv_groups)
+    if num_kv_groups < 1 or q_positions.numel() * num_kv_groups != rows:
+        raise ValueError("positions must cover each token in every KV group")
     if width <= 1:
         from .step4_dsa_kernels import prefill_sparse_meta
 
         return prefill_sparse_meta(
             logits,
-            q_positions,
+            q_positions.repeat(num_kv_groups).to(torch.int32),
             block_table,
             request_indices,
             topk=topk,
@@ -363,9 +381,9 @@ def prefill_sparse_meta_fused(
         request_indices = torch.zeros(
             rows, device=logits.device, dtype=torch.int32
         )
-    if request_indices.numel() != rows or q_positions.numel() != rows:
+    if request_indices.numel() != rows:
         raise ValueError(
-            "fused prefill metadata needs one request and position per score row"
+            "fused prefill metadata needs one request per score row"
         )
     if block_table.stride(1) != 1:
         raise ValueError("selector block-table columns must be contiguous")
@@ -377,6 +395,8 @@ def prefill_sparse_meta_fused(
         torch.empty_like(packed) if return_logical_ids else None
     )
     counts = torch.empty(rows, device=logits.device, dtype=torch.int32)
+    if rows == 0:
+        return (packed, counts, logical_ids) if return_logical_ids else (packed, counts)
     table_stride = 0 if block_table.shape[0] == 1 else block_table.stride(0)
     _prefill_sparse_meta_fused_kernel[(rows,)](
         logits,
@@ -395,9 +415,19 @@ def prefill_sparse_meta_fused(
         region_size=int(region_size),
         regions_per_page=int(regions_per_page),
         WRITE_LOGICAL_IDS=return_logical_ids,
+        QUERY_ROWS=q_positions.numel(),
+        QUERY_POSITION_STRIDE=q_positions.stride(0),
+        BROADCAST_POSITIONS=num_kv_groups != 1,
         BLOCK_R=min(2048, triton.next_power_of_2(width)),
         BLOCK_TOPK=triton.next_power_of_2(topk + 1),
     )
+    if num_kv_groups > 1:
+        _selector_logger.info_once(
+            "Step5 sparse selector position broadcast active: dtype=%s, "
+            "stride=%s, KV groups=%d",
+            q_positions.dtype, tuple(q_positions.stride()), num_kv_groups,
+            scope="process",
+        )
     if return_logical_ids:
         return packed, counts, logical_ids
     return packed, counts
