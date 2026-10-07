@@ -4,12 +4,22 @@
 The reference release remains unchanged. Prefill metadata already packs the visible
 token count per region, so splitting its slots preserves each query's causal horizon.
 """
+import os
 import torch
+from vllm.logger import init_logger
 from vllm.triton_utils import triton, tl
 from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
     NEGATIVE_INFINITY, REGION_ID_MASK, REGION_VALID_SHIFT,
     _fit_block_regions, merge_split_states,
 )
+
+bf16_tile_logger = init_logger("vllm.step5_bf16_dsa")
+bf16_tile_mode = os.environ.get("VLLM_STEP5_BF16_DSA_TUNED_TILES", "0")
+if bf16_tile_mode not in ("0", "1"):
+    raise ValueError("VLLM_STEP5_BF16_DSA_TUNED_TILES must be 0 or 1")
+BF16_TUNED_TILES = bf16_tile_mode == "1"
+
+
 def is_short_query_batch(num_tokens, max_query_len=0, *, verification=False,
                          capturing=False):
     """Keep ragged MTP verification on the device-only attention path.
@@ -276,6 +286,22 @@ def sparse_attention_short_prefill(query, key_cache, value_cache, packed_regions
     block_r = _fit_block_regions(
         min(8, triton.next_power_of_2(slots_per_split)), region_size=region_size,
         block_d=64, element_size=query.element_size())
+    # Qualified against interleaved BF16 KV on BW1101. Keep all other dtypes,
+    # layouts, split counts and shapes on their existing tile policy.
+    if (
+        BF16_TUNED_TILES
+        and num_queries in (16, 32, 64)
+        and query.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
+        and num_heads == 32 and num_kv_groups == 2 and region_size == 8
+        and topk == 513
+        and num_splits == short_query_num_splits(num_queries, num_kv_groups, topk)
+        and key_cache.stride() == value_cache.stride() == (768, 192, 1)
+    ):
+        block_r = 2 if num_queries == 64 else 4
+        bf16_tile_logger.info_once(
+            "Step5 BF16 sparse Decode tiles enabled: M16/32 BR4, M64 BR2",
+            scope="process",
+        )
     # BW1101 loses occupancy when this HD192 kernel pipelines two K/V tiles:
     # BLOCK_R=8 already consumes enough LDS that the second stage serializes
     # waves instead of hiding memory latency. One stage is also faster for the
