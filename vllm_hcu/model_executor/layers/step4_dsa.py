@@ -2111,6 +2111,7 @@ def build_plan(
     topk: int,
     num_kv_groups: int,
     regions_per_page: int,
+    context_parallel_size: int = 1,
 ) -> Step4SparsePlan:
     """Turn indexer scores into the two kernels' metadata.
 
@@ -2119,6 +2120,8 @@ def build_plan(
     maps plus a per-row request index, which is exactly what
     ``CommonAttentionMetadata`` carries.
     """
+    if context_parallel_size not in (1, 2):
+        raise ValueError("Step5 sparse selections support CP1 or experimental CP2")
     plan = Step4SparsePlan()
     plan.md = attn_metadata
     nd = attn_metadata.num_decodes
@@ -2176,7 +2179,9 @@ def build_plan(
             prefill_tokens, attn_metadata.max_query_len,
             verification=verification, capturing=capturing,
         )
-        need_logical_ids = not (
+        # DCP2 exchanges logical selections before addressing striped cache;
+        # short-query packed physical words cannot replace these logical IDs.
+        need_logical_ids = context_parallel_size == 2 or not (
             os.environ.get("VLLM_STEP5_DSA_SHORT_QUERY", "0") == "1"
             and short_query
             and not PREFILL_QK_FP8
@@ -3805,6 +3810,7 @@ class Step4Indexer:
             topk=topk,
             num_kv_groups=self.num_kv_groups,
             regions_per_page=state.regions_per_page,
+            context_parallel_size=state.context_parallel_size,
         )
         state.finish_layer()
         return width
