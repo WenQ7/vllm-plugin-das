@@ -79,10 +79,11 @@ def install_step5_bf16_tiles(target):
         if cfg is None:
             report_rejection("missing model config")
             return original(*args, **kwargs)
+        from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
         p = cfg.parallel_config
         if (cfg.model_config.hf_text_config.model_type != "step5"
             or p.tensor_parallel_size != 2 or p.data_parallel_size != 4
-            or p.pipeline_parallel_size != 1 or p.decode_context_parallel_size != 1
+            or p.pipeline_parallel_size != 1 or not step5_context_parallel_supported(cfg)
             or p.all2all_backend != "deepep_low_latency"):
             report_rejection(f"config type={cfg.model_config.hf_text_config.model_type}, TP={p.tensor_parallel_size}, DP={p.data_parallel_size}, backend={p.all2all_backend}")
             return original(*args, **kwargs)

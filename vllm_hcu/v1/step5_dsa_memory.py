@@ -16,12 +16,13 @@ def reserve_step5_dsa_memory(worker, available: int) -> int:
     if os.getenv("VLLM_STEP5_DSA_MEMORY_BUDGET", "0") != "1":
         return available
     config = worker.vllm_config
+    from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
     parallel = config.parallel_config
     architectures = getattr(config.model_config, "architectures", ()) or ()
     if not (any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
                 for a in architectures)
             and parallel.pipeline_parallel_size == 1
-            and parallel.decode_context_parallel_size == 1
+            and step5_context_parallel_supported(config)
             and getattr(parallel, "prefill_context_parallel_size", 1) == 1):
         return available
     import torch
@@ -53,7 +54,12 @@ def reserve_step5_dsa_memory(worker, available: int) -> int:
         block_sizes = {specs[i.layer_name].block_size for i in members}
         if len(block_sizes) != 1:
             raise ValueError("A Step5 DSA state requires a uniform block size")
-        block_size = block_sizes.pop()
+        # DCP2 summaries are replicated for a global logical page128 even
+        # though each physical BF16 page stores only 64 striped tokens.
+        state_cp = getattr(state, "context_parallel_size", 1)
+        if state_cp != parallel.decode_context_parallel_size:
+            raise ValueError("Step5 DSA state and KV budget context-parallel sizes differ")
+        block_size = block_sizes.pop() * state_cp
         if block_size % geometry.region_size:
             raise ValueError("A Step5 DSA region must fit inside its KV page")
         dtype_size = torch.empty((), dtype=state.dtype).element_size()

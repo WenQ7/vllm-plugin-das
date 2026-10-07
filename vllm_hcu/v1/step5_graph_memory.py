@@ -15,13 +15,14 @@ _install_lock = threading.RLock()
 def enabled(config) -> bool:
     if os.getenv("VLLM_STEP5_EXACT_GRAPH_MEMORY", "0") != "1":
         return False
+    from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
     parallel = config.parallel_config
     architectures = getattr(config.model_config, "architectures", ()) or ()
     return (
         any(a in ("Step5ForCausalLM", "Step5ForConditionalGeneration")
             for a in architectures)
         and parallel.pipeline_parallel_size == 1
-        and parallel.decode_context_parallel_size == 1
+        and step5_context_parallel_supported(config)
         and getattr(parallel, "prefill_context_parallel_size", 1) == 1
         and os.getenv("VLLM_USE_V2_MODEL_RUNNER", "0") == "1"
     )

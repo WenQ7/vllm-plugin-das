@@ -11,6 +11,7 @@ def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
         vllm_config = getattr(moe_config, "_hcu_vllm_config", None)
     if vllm_config is None:
         return None
+    from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
     parallel = vllm_config.parallel_config
     hf = getattr(vllm_config.model_config, "hf_config", None)
     architectures = getattr(
@@ -24,7 +25,7 @@ def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
         and (parallel.tensor_parallel_size, parallel.data_parallel_size)
         in ((2, 4), (4, 2))
         and parallel.pipeline_parallel_size == 1
-        and parallel.decode_context_parallel_size == 1
+        and step5_context_parallel_supported(vllm_config)
         and getattr(parallel, "prefill_context_parallel_size", 1) == 1
         and parallel.all2all_backend == "deepep_low_latency"
         and os.getenv("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"

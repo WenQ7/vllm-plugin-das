@@ -599,6 +599,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
                 torch.cuda.current_device()
             ).gcnArchName.split(":")[0]
             parallel = config.parallel_config
+            from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
             supported_parallel = (
                 parallel.tensor_parallel_size == 1
                 and parallel.data_parallel_size == 8
@@ -606,7 +607,7 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
                 parallel.tensor_parallel_size == 2
                 and parallel.data_parallel_size == 4
                 and parallel.pipeline_parallel_size == 1
-                and parallel.decode_context_parallel_size == 1
+                and step5_context_parallel_supported(config)
                 and moe_config.is_sequence_parallel
                 and moe_config.ep_size == 8
                 and os.environ.get("VLLM_STEP5_SEQUENCE_PARALLEL_MOE", "0") == "1"
