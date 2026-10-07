@@ -7,6 +7,7 @@ remain separate requirements before whole-model activation.
 """
 from __future__ import annotations
 
+import os
 import torch
 
 from vllm.config import get_current_vllm_config, CUDAGraphMode
@@ -20,7 +21,15 @@ from vllm_hcu.model_executor.layers.step4_dsa import (
 )
 from vllm_hcu.model_executor.layers.step5_dsa_compat import sparse_cache_view
 from vllm_hcu.ops.step5_dcp2_runtime import dcp2_attention
+from vllm_hcu.ops.step5_dcp2_tuning import select_short_query_splits
 from vllm_hcu.v1.step5_dcp2_cache import Step5DCP2SlidingWindowSpec
+
+
+def _env_flag(name: str, default: str) -> bool:
+    value = os.environ.get(name, default)
+    if value not in ("0", "1"):
+        raise ValueError(f"{name} must be 0 or 1")
+    return value == "1"
 
 
 class Step5DCP2MetadataBuilder(Step4DSAMetadataBuilder):
@@ -61,6 +70,8 @@ class Step5DCP2Impl(Step4DSAImpl):
             attn_type=attn_type,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name, **kwargs)
         self.sliding_window = sliding_window
+        self.tuned_short_splits = _env_flag("VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS", "1")
+        self.fused_exchange = _env_flag("VLLM_STEP5_DCP2_FUSED_EXCHANGE", "0")
 
     def forward(self, *args, **kwargs):
         raise RuntimeError("Step5 DCP2 must execute through its gathered-head custom op")
@@ -148,14 +159,14 @@ def step5_dcp2_attention(query: torch.Tensor, key: torch.Tensor,
     window = int(layer.sliding_window or 0)
     if not window and plan_token is None:
         raise RuntimeError("Step5 DCP2 sparse op requires the indexer's dependency token")
-    # Match the qualified execution bridge. Tune occupancy only after the
-    # complete model path has passed correctness and profiling.
-    splits = 2
+    # Select only from static shapes/host metadata; no Graph replay sync.
+    splits = (select_short_query_splits(tokens, md.max_query_len, window)
+              if layer.impl.tuned_short_splits else 2)
     return dcp2_attention(
         query, key, value, k, v, slots[:tokens], positions,
         md.query_start_loc, md.seq_lens, md.block_table, group,
         window=window, plan=getattr(layer, "step4_sparse_plan", None),
-        metadata=md, splits=splits,
+        metadata=md, splits=splits, fused_exchange_enabled=layer.impl.fused_exchange,
     )
 
 

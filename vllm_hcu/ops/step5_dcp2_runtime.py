@@ -14,6 +14,7 @@ import triton.language as tl
 
 from .step5_dcp2 import merge, partial
 from .step5_dcp2_exchange import pack_local_qkv, unpack_qkv_and_write_cache
+from .step5_dcp2_fused_exchange import fused_exchange
 
 
 @triton.jit
@@ -259,7 +260,7 @@ def combine_rank_states(output, lse, group, *, return_lse=False):
 def dcp2_attention(query, key, value, key_cache, value_cache, slots,
                    positions, starts, lengths, table, group, *,
                    window=0, plan=None, metadata=None, splits=1,
-                   return_lse=False):
+                   return_lse=False, fused_exchange_enabled=False):
     """Execute gathered heads/selections and return the original 32 TP heads."""
     if group.world_size != 2 or group.rank_in_group not in (0, 1):
         raise ValueError("Step5 DCP2 requires an ordered two-rank group")
@@ -272,16 +273,23 @@ def dcp2_attention(query, key, value, key_cache, value_cache, slots,
         raise ValueError("only Step5 sparse or sliding512 attention is supported")
     if key_cache.ndim != 3 or value_cache.ndim != 3:
         raise ValueError("DCP2 reader requires affine sparse-style cache views")
-    requests, qpos = query_metadata(positions, starts, lengths)
-    packed = pack_local_qkv(query, key, value)
-    gathered = group.all_gather(packed, dim=1)
-    full_q, _, _ = unpack_qkv_and_write_cache(
-        gathered, slots, key_cache, value_cache, local_query_heads=32,
-    )
-    if window:
-        regions, counts = window_regions(qpos, requests, window=window)
+    if fused_exchange_enabled and metadata is not None and 1 <= metadata.max_query_len <= 4 and tokens <= 64:
+        full_q, regions, counts, requests, qpos = fused_exchange(
+            query, key, value, key_cache, value_cache, slots,
+            positions, starts, lengths, group, window=window,
+            plan=plan, metadata=metadata,
+        )
     else:
-        regions, counts = gather_sparse_regions(plan, metadata, tokens, group)
+        requests, qpos = query_metadata(positions, starts, lengths)
+        packed = pack_local_qkv(query, key, value)
+        gathered = group.all_gather(packed, dim=1)
+        full_q, _, _ = unpack_qkv_and_write_cache(
+            gathered, slots, key_cache, value_cache, local_query_heads=32,
+        )
+        if window:
+            regions, counts = window_regions(qpos, requests, window=window)
+        else:
+            regions, counts = gather_sparse_regions(plan, metadata, tokens, group)
     states, lses, _ = partial(
         full_q, key_cache, value_cache, regions, counts, qpos, requests, table,
         rank=group.rank_in_group, window=window, splits=splits,

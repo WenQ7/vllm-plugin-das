@@ -16,6 +16,15 @@ case "$dcp_size" in
     # Qualified on real MTP3/frozen100; BS32/64 long-context performance
     # remains experimental until the initialized capacity and run are checked.
     export VLLM_STEP5_DCP2_FULL_GRAPH="${VLLM_STEP5_DCP2_FULL_GRAPH:-1}"
+    # Static shape tuning is qualified separately; fused exchange is opt-in
+    # until the complete model path has passed its native/runtime checks.
+    export VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS="${VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS:-1}"
+    export VLLM_STEP5_DCP2_FUSED_EXCHANGE="${VLLM_STEP5_DCP2_FUSED_EXCHANGE:-0}"
+    for dcp_flag in "$VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS" "$VLLM_STEP5_DCP2_FUSED_EXCHANGE"; do
+      [[ "$dcp_flag" == 0 || "$dcp_flag" == 1 ]] || {
+        echo "Step5 DCP2 optimization flags must be 0 or 1" >&2; exit 2
+      }
+    done
     export VLLM_STEP5_EXACT_GRAPH_MEMORY="${VLLM_STEP5_EXACT_GRAPH_MEMORY:-1}"
     export VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES="${VLLM_STEP5_GRAPH_MEMORY_MARGIN_BYTES:-1073741824}"
     export VLLM_STEP5_LL_DISPATCH_ALIGNMENT="${VLLM_STEP5_LL_DISPATCH_ALIGNMENT:-64}"
