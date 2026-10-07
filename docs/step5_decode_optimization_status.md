@@ -1253,3 +1253,41 @@ exchange_strided_cpu.log, context_geometry_cpu.log. The initial
 CPU interpreter used255 threads; its exact owned process was stopped and
 the same matrix relaunched with one thread, retaining the partial log and
 exchange_cpu_thread_correction.json. GPU kernels were not run.
+
+### Completed BS64 norm/FP8 fusion measurement
+
+The one V11 measured iteration completed64/64 requests, input4194304 and
+output262144 tokens, with zero preemptions and a valid common Decode window:
+254635 tokens /174.8611541800s =1456.212508685 tok/s,97.2910% coverage.
+Mean client-chunk ITL121.86794ms; observed Prefill2522.4329tok/s and
+latency1662.8010s. MTP3 acceptance was synthetic, as in V9.
+
+The original controller rejected prompt_sha256 while comparing ALL
+iterations. Independent audit found that all64 measured prompts match V9
+exactly, but all16 random warmup prompts differ. Adapter hash and measured
+shape/protocol match. Preserve that rejection: this is a measured-only
+paired comparison, not the originally required all-prompt comparison.
+CPU-only validation also ran during Prefill and is logged separately.
+The observation is1.6875% below V9's1481.2074tok/s. There is no measured
+throughput gain to justify default adoption, and one iteration with these
+qualifications cannot establish a statistically significant regression.
+Keep fusion opt-in/default off; do not repeat this expensive case.
+
+The supplied benchmark generated warmup random tokens before applying
+per-request seeds in its measured generator. Future HCU adapter calls now
+require explicit --seed and seed the global RNG before the original main.
+The previous exact adapter is retained as
+benchmark_hcu_metadata.before-warmup-seed-v1.py; completed report hashes
+have not been changed. No new model measurement has been started.
+
+After two eight-counter idle snapshots, the exact owned server tree was
+stopped; benchmark/controller handles are terminal. Current DCP2 fine8
+and QKV/cache exchange native qualifications have now started sequentially
+from a four-file immutable snapshot of88800bd, on idle GPUs. This is not
+model DCP2 activation. Results remain pending.
+
+Evidence: bs64-capacity-20261007/
+fp8-norm-fusion-v11_measured_only_audit.json, result.iterations.json,
+manifest.json, runtime_graph_log.txt, shutdown.json and
+cpu_validation_activity_v11.json; dcp2-prototype-20261007/
+current_dcp2_native_qualification_handle.json.
