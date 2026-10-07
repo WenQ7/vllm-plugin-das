@@ -2207,6 +2207,18 @@ def build_plan(
             and not PREFILL_QK_FP8
             and not PREFILL_PV_FP8
         )
+        if (
+            fused_selector and short_query
+            and os.environ.get("VLLM_STEP5_DSA_LIGHTOP_TOP512", "0") == "1"
+        ):
+            from .step5_dsa_lightop_selector import (
+                prefill_sparse_meta_lightop, supports_native_selector,
+            )
+            if supports_native_selector(
+                prefill_logits, q_positions, group_request_indices,
+                topk=topk, num_kv_groups=num_kv_groups,
+            ):
+                prefill_meta = prefill_sparse_meta_lightop
         selector_kwargs = {"num_kv_groups": num_kv_groups} if fused_selector else {}
         selected = prefill_meta(
             prefill_logits,
