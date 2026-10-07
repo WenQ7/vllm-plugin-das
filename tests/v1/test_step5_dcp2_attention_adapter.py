@@ -137,3 +137,40 @@ def test_internal_lse_bridge_validation_does_not_advertise_stock_lse(monkeypatch
         validate_dcp2_attention_layers({"stock":SimpleNamespace(impl=window.impl)})
     with pytest.raises(ValueError,match="requires"):
         validate_dcp2_attention_layers({})
+
+
+@pytest.mark.parametrize("rotary_pairs", [32, 96])
+def test_raw_qkv_fake_op_preserves_full_graph_output(rotary_pairs):
+    # Optional raw inputs preserve the output contract used by Inductor.
+    with FakeTensorMode():
+        raw = torch.empty(64, 6912, dtype=torch.bfloat16)
+        query, key, value = raw.split([6144, 384, 384], dim=-1)
+        query = query.view(64, 32, 192)
+        key, value = key.view(64, 2, 192), value.view(64, 2, 192)
+        positions = torch.empty(64, dtype=torch.int64)
+        weights = torch.empty(192, dtype=torch.float32)
+        rope_cache = torch.empty(69632, 2 * rotary_pairs, dtype=torch.bfloat16)
+        result = torch.ops.vllm.step5_dcp2_attention(
+            query, key, value, positions, None, "model.layers.3.self_attn.attn",
+            raw, weights, weights, rope_cache, rotary_pairs, 1e-6,
+        )
+        assert result.shape == (64, 32, 192)
+        assert result.dtype == torch.bfloat16
+
+
+def test_norm_exchange_requires_explicit_fused_exchange(monkeypatch):
+    from vllm_hcu.model_executor.layers import step4_dsa
+    from vllm_hcu.model_executor.layers.step5_dcp2_attention import Step5DCP2Impl
+
+    monkeypatch.setattr(step4_dsa, "_require_splitting_op", lambda: None)
+    monkeypatch.delenv("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE", raising=False)
+    monkeypatch.delenv("VLLM_STEP5_DCP2_FUSED_EXCHANGE", raising=False)
+    impl = Step5DCP2Impl(32, 192, 192**-.5, num_kv_heads=4)
+    assert not impl.fused_norm_exchange
+
+    monkeypatch.setenv("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE", "1")
+    with pytest.raises(ValueError, match="requires fused"):
+        Step5DCP2Impl(32, 192, 192**-.5, num_kv_heads=4)
+    monkeypatch.setenv("VLLM_STEP5_DCP2_FUSED_EXCHANGE", "1")
+    impl = Step5DCP2Impl(32, 192, 192**-.5, num_kv_heads=4)
+    assert impl.fused_norm_exchange

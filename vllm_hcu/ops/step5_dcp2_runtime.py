@@ -260,7 +260,7 @@ def combine_rank_states(output, lse, group, *, return_lse=False):
 def dcp2_attention(query, key, value, key_cache, value_cache, slots,
                    positions, starts, lengths, table, group, *,
                    window=0, plan=None, metadata=None, splits=1,
-                   return_lse=False, fused_exchange_enabled=False):
+                   return_lse=False, fused_exchange_enabled=False, norm_data=None):
     """Execute gathered heads/selections and return the original 32 TP heads."""
     if group.world_size != 2 or group.rank_in_group not in (0, 1):
         raise ValueError("Step5 DCP2 requires an ordered two-rank group")
@@ -273,11 +273,15 @@ def dcp2_attention(query, key, value, key_cache, value_cache, slots,
         raise ValueError("only Step5 sparse or sliding512 attention is supported")
     if key_cache.ndim != 3 or value_cache.ndim != 3:
         raise ValueError("DCP2 reader requires affine sparse-style cache views")
-    if fused_exchange_enabled and metadata is not None and 1 <= metadata.max_query_len <= 4 and tokens <= 64:
+    eligible = (fused_exchange_enabled and metadata is not None
+                and 1 <= metadata.max_query_len <= 4 and tokens <= 64)
+    if norm_data is not None and not eligible:
+        raise ValueError("Raw QKV norm exchange requires the eligible fused short-query path")
+    if eligible:
         full_q, regions, counts, requests, qpos = fused_exchange(
             query, key, value, key_cache, value_cache, slots,
             positions, starts, lengths, group, window=window,
-            plan=plan, metadata=metadata,
+            plan=plan, metadata=metadata, norm_data=norm_data,
         )
     else:
         requests, qpos = query_metadata(positions, starts, lengths)

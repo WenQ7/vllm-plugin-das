@@ -12,6 +12,7 @@ import triton
 import triton.language as tl
 
 from .step5_dcp2_exchange import _head_tensor, _cache_tensor, _cache_geometry
+from .step5_dcp2_norm_exchange import pack_norm_exchange
 
 
 @triton.jit
@@ -134,7 +135,7 @@ def _unpack_exchange(gathered, slots, query, key_cache, value_cache,
 
 
 def fused_exchange(query, key, value, kc, vc, slots, positions,
-                   starts, lengths, group, *, window=0, plan=None, metadata=None):
+                   starts, lengths, group, *, window=0, plan=None, metadata=None, norm_data=None):
     tokens = query.shape[0]
     if (group.world_size != 2 or group.rank_in_group not in (0, 1)
         or tokens < 1 or window not in (0, 512)
@@ -191,11 +192,33 @@ def fused_exchange(query, key, value, kc, vc, slots, positions,
     payload = torch.empty((tokens,pwidth),device=query.device,dtype=torch.int32)
     requests = torch.empty(tokens,device=query.device,dtype=torch.int32)
     qpos = torch.empty_like(requests)
-    _pack_exchange[(tokens,triton.cdiv(pwidth,256))](
-        query,key,value,words,dcounts,logical,pcounts,positions,starts,lengths,payload,requests,qpos,
-        query.stride(0),key.stride(0),value.stride(0),TOKENS=tokens,REQUESTS=lengths.numel(),
-        DECODE=nd,PREFILL=np,TOPK=topk,WINDOW=window,
-        REQ_BLOCK=triton.next_power_of_2(lengths.numel()),BLOCK=256,num_warps=4,num_stages=1)
+    if norm_data is None:
+        _pack_exchange[(tokens,triton.cdiv(pwidth,256))](
+            query,key,value,words,dcounts,logical,pcounts,positions,starts,lengths,payload,requests,qpos,
+            query.stride(0),key.stride(0),value.stride(0),TOKENS=tokens,REQUESTS=lengths.numel(),
+            DECODE=nd,PREFILL=np,TOPK=topk,WINDOW=window,
+            REQ_BLOCK=triton.next_power_of_2(lengths.numel()),BLOCK=256,num_warps=4,num_stages=1)
+    else:
+        packed,qw,kw,rope_cache,pairs,epsilon = norm_data
+        if (metadata is None or not 1 <= metadata.max_query_len <= 4 or tokens > 64
+            or packed.shape != (tokens,6912) or packed.dtype != torch.bfloat16
+            or packed.stride(1) != 1 or packed.stride(0) < 6912
+            or qw.shape != (192,) or kw.shape != (192,)
+            or qw.dtype != torch.float32 or kw.dtype != torch.float32
+            or not qw.is_contiguous() or not kw.is_contiguous()
+            or pairs not in (32,96) or not epsilon > 0
+            or rope_cache.ndim != 2 or rope_cache.shape[1] != 2*pairs
+            or rope_cache.dtype != torch.bfloat16 or rope_cache.stride(1) != 1
+            or any(x.device != query.device for x in (packed,qw,kw,rope_cache))):
+            raise ValueError("Step5 norm exchange requires raw BF16 TP2 QKV, FP32 weights and short-query metadata")
+        pack_norm_exchange[(tokens,9+(0 if window else triton.cdiv(2*(topk+1),256)))](
+            packed,qw,kw,rope_cache,words,dcounts,logical,pcounts,
+            positions,starts,lengths,payload,requests,qpos,
+            packed.stride(0),rope_cache.stride(0),
+            TOKENS=tokens,REQUESTS=lengths.numel(),DECODE=nd,PREFILL=np,
+            TOPK=topk,WINDOW=window,ROTARY_PAIRS=pairs,EPS=epsilon,
+            CAST_NORM=False,REQ_BLOCK=triton.next_power_of_2(lengths.numel()),
+            num_warps=4,num_stages=1)
     gathered = group.all_gather(payload,dim=1)
     full_q = torch.empty((tokens,64,192),device=query.device,dtype=torch.bfloat16)
     regions = torch.empty((4*tokens,topk),device=query.device,dtype=torch.int32)

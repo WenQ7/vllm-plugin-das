@@ -76,9 +76,14 @@ class Step5DCP2Impl(Step4DSAImpl):
         self.sliding_window = sliding_window
         self.tuned_short_splits = _env_flag("VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS", "1")
         self.fused_exchange = _env_flag("VLLM_STEP5_DCP2_FUSED_EXCHANGE", "0")
+        self.fused_norm_exchange = _env_flag("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE", "0")
+        if self.fused_norm_exchange and not self.fused_exchange:
+            raise ValueError("Step5 norm exchange requires fused DCP2 exchange")
+
         logger.info_once(
-            "Step5 DCP2 Attention: tuned_short_splits=%s fused_exchange=%s",
-            self.tuned_short_splits, self.fused_exchange, scope="process",
+            "Step5 DCP2 Attention: tuned_short_splits=%s fused_exchange=%s fused_norm_exchange=%s",
+            self.tuned_short_splits, self.fused_exchange, self.fused_norm_exchange,
+            scope="process",
         )
 
     def forward(self, *args, **kwargs):
@@ -125,6 +130,16 @@ class Step5DCP2Attention(Attention):
             return Step5DCP2SlidingWindowSpec.from_spec(spec)
         return spec
 
+    def forward_qkv(self, qkv, q_weight, k_weight, rope_cache, *, positions,
+                    rotary_pairs, epsilon, plan_token=None):
+        tokens = qkv.shape[0]
+        q,k,v = qkv.split([6144,384,384],dim=-1)
+        result = torch.ops.vllm.step5_dcp2_attention(
+            q.view(tokens,32,192),k.view(tokens,2,192),v.view(tokens,2,192),
+            positions,plan_token,self.layer_name,
+            qkv,q_weight,k_weight,rope_cache,rotary_pairs,epsilon)
+        return result.flatten(1)
+
     def forward(self, query, key, value, *, positions, plan_token=None):
         tokens = query.shape[0]
         result = torch.ops.vllm.step5_dcp2_attention(
@@ -139,7 +154,13 @@ class Step5DCP2Attention(Attention):
 def step5_dcp2_attention(query: torch.Tensor, key: torch.Tensor,
                          value: torch.Tensor, positions: torch.Tensor,
                          plan_token: torch.Tensor | None,
-                         layer_name: str) -> torch.Tensor:
+                         layer_name: str,
+                         raw_qkv: torch.Tensor | None = None,
+                         q_weight: torch.Tensor | None = None,
+                         k_weight: torch.Tensor | None = None,
+                         rope_cache: torch.Tensor | None = None,
+                         rotary_pairs: int = 32,
+                         epsilon: float = 1e-6) -> torch.Tensor:
     md, layer, cache, slots = get_attention_context(layer_name)
     if not isinstance(layer, Step5DCP2Attention):
         raise RuntimeError("DCP2 op reached an incompatible Attention layer")
@@ -170,11 +191,26 @@ def step5_dcp2_attention(query: torch.Tensor, key: torch.Tensor,
     # Select only from static shapes/host metadata; no Graph replay sync.
     splits = (select_short_query_splits(tokens, md.max_query_len, window)
               if layer.impl.tuned_short_splits else 2)
+    norm_data = None
+    if raw_qkv is not None:
+        if (not layer.impl.fused_norm_exchange
+            or any(x is None for x in (q_weight,k_weight,rope_cache))):
+            raise ValueError("Step5 raw QKV requires enabled norm exchange and its parameters")
+        if layer.impl.fused_exchange and 1 <= md.max_query_len <= 4 and tokens <= 64:
+            norm_data = (raw_qkv,q_weight,k_weight,rope_cache,rotary_pairs,epsilon)
+        else:
+            from vllm_hcu.model_executor.layers.step5_attention_ops import qknorm_rope_impl
+            query,key = qknorm_rope_impl(
+                raw_qkv,q_weight,k_weight,rope_cache,positions,
+                32,2,rotary_pairs,epsilon)
+            query=query.view(tokens,32,192)
+            key=key.view(tokens,2,192)
     return dcp2_attention(
         query, key, value, k, v, slots[:tokens], positions,
         md.query_start_loc, md.seq_lens, md.block_table, group,
         window=window, plan=getattr(layer, "step4_sparse_plan", None),
         metadata=md, splits=splits, fused_exchange_enabled=layer.impl.fused_exchange,
+        norm_data=norm_data,
     )
 
 
@@ -196,7 +232,9 @@ def validate_dcp2_attention_layers(layers):
         raise ValueError("Step5 DCP2 requires gathered-head Attention layers")
 
 
-def step5_dcp2_attention_fake(query, key, value, positions, plan_token, layer_name):
+def step5_dcp2_attention_fake(query,key,value,positions,plan_token,layer_name,
+                             raw_qkv=None,q_weight=None,k_weight=None,
+                             rope_cache=None,rotary_pairs=32,epsilon=1e-6):
     return torch.empty_like(query)
 
 

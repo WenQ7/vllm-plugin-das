@@ -495,8 +495,11 @@ class Step5Attention(nn.Module):
         self.register_buffer("step5_merged_bias", None, persistent=False)
         self.step5_merged_offsets = {}
         self.step5_merged_ready = False
+        norm_exchange_requested = os.environ.get("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE", "0")
+        if norm_exchange_requested not in ("0", "1"):
+            raise ValueError("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE must be 0 or 1")
         compiled_native_rope = False
-        if os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1":
+        if os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1" or norm_exchange_requested == "1":
             fusion_config = get_current_vllm_config()
             norm_priority = fusion_config.kernel_config.ir_op_priority.rms_norm
             compiled_native_rope = (
@@ -514,6 +517,15 @@ class Step5Attention(nn.Module):
         )
         if self.fused_qk_norm_rope:
             logger.info_once("Step5 main Attention: fused FP32-weight QK-norm + RoPE enabled.")
+        self.fused_dcp2_norm_exchange = (
+            norm_exchange_requested == "1" and self.dcp2_attention_enabled
+            and compiled_native_rope and self.use_rope
+            and self.rotary_emb.is_neox_style and self.head_dim == 192
+            and self.num_heads == 32 and self.num_kv_heads == 2
+            and self.rotary_emb.rotary_dim in (64, 192)
+        )
+        if norm_exchange_requested == "1" and not self.fused_dcp2_norm_exchange:
+            raise ValueError("Step5 fused norm exchange requires compiled native TP2/DCP2 NeoX norm/rope")
         self.max_position_embeddings = max_position
         # Step-4 uses 1/3 on full-attention layers, so take the rotary width from
         # get_rope (int(head_size * factor)) instead of assuming 1 or 1/2.
@@ -552,35 +564,46 @@ class Step5Attention(nn.Module):
                 qkv, _ = self.qkv_proj(hidden_states)
         else:
             qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if self.fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+        if self.fused_dcp2_norm_exchange:
+            if self.indexer is not None:
+                self.indexer.forward(hidden_states, positions, projected_index)
             cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
-            q, k = fused_qknorm_rope(
-                qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
-                self.num_heads, self.num_kv_heads, self.rotary_dim // 2,
-                self.q_norm.variance_epsilon,
-            )
-        else:
-            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-            q_by_head = self.q_norm(q_by_head.contiguous())
-            q = q_by_head.view(q.shape)
-
-            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-            k_by_head = self.k_norm(k_by_head.contiguous())
-            k = k_by_head.view(k.shape)
-            if self.use_rope:
-                q, k = self.rotary_emb(positions, q, k)
-        if self.indexer is not None:
-            # Publishes layer.attn.step4_sparse_plan, which the DSA backend
-            # reads. It needs hidden_states, which Attention.forward never sees.
-            self.indexer.forward(hidden_states, positions, projected_index)
-        if self.dcp2_attention_enabled:
-            attn_output = self.attn(
-                q, k, v, positions=positions,
+            attn_output = self.attn.forward_qkv(
+                qkv, self.q_norm.weight, self.k_norm.weight, cache,
+                positions=positions, rotary_pairs=self.rotary_emb.rotary_dim // 2,
+                epsilon=self.q_norm.variance_epsilon,
                 plan_token=self.step4_dsa_plan_token if self.indexer is not None else None,
             )
         else:
-            attn_output = self.attn(q, k, v)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            if self.fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+                cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+                q, k = fused_qknorm_rope(
+                    qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
+                    self.num_heads, self.num_kv_heads, self.rotary_dim // 2,
+                    self.q_norm.variance_epsilon,
+                )
+            else:
+                q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+                q_by_head = self.q_norm(q_by_head.contiguous())
+                q = q_by_head.view(q.shape)
+
+                k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+                k_by_head = self.k_norm(k_by_head.contiguous())
+                k = k_by_head.view(k.shape)
+                if self.use_rope:
+                    q, k = self.rotary_emb(positions, q, k)
+            if self.indexer is not None:
+                # Publishes layer.attn.step4_sparse_plan, which the DSA backend
+                # reads. It needs hidden_states, which Attention.forward never sees.
+                self.indexer.forward(hidden_states, positions, projected_index)
+            if self.dcp2_attention_enabled:
+                attn_output = self.attn(
+                    q, k, v, positions=positions,
+                    plan_token=self.step4_dsa_plan_token if self.indexer is not None else None,
+                )
+            else:
+                attn_output = self.attn(q, k, v)
         if self.use_head_wise_attn_gate:
             if projected_gate is None:
                 extra_dims, _ = self.g_proj(hidden_states)
