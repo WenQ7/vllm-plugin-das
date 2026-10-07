@@ -11,6 +11,7 @@ import os
 import torch
 
 from vllm.config import get_current_vllm_config, CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.distributed import get_dcp_group, get_tp_group
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -23,6 +24,9 @@ from vllm_hcu.model_executor.layers.step5_dsa_compat import sparse_cache_view
 from vllm_hcu.ops.step5_dcp2_runtime import dcp2_attention
 from vllm_hcu.ops.step5_dcp2_tuning import select_short_query_splits
 from vllm_hcu.v1.step5_dcp2_cache import Step5DCP2SlidingWindowSpec
+
+
+logger = init_logger("vllm.hcu.step5.dcp2_attention")
 
 
 def _env_flag(name: str, default: str) -> bool:
@@ -72,6 +76,10 @@ class Step5DCP2Impl(Step4DSAImpl):
         self.sliding_window = sliding_window
         self.tuned_short_splits = _env_flag("VLLM_STEP5_DCP2_TUNED_SHORT_SPLITS", "1")
         self.fused_exchange = _env_flag("VLLM_STEP5_DCP2_FUSED_EXCHANGE", "0")
+        logger.info_once(
+            "Step5 DCP2 Attention: tuned_short_splits=%s fused_exchange=%s",
+            self.tuned_short_splits, self.fused_exchange, scope="process",
+        )
 
     def forward(self, *args, **kwargs):
         raise RuntimeError("Step5 DCP2 must execute through its gathered-head custom op")

@@ -120,6 +120,9 @@ class SharedExperts(torch.nn.Module):
                     "TP2/DP4/EP8/PP1/PCP1/DCP1-or-2, DeepEP-LL, no DBO "
                     "and no auxiliary shared-expert stream"
                 )
+            logger.info_once(
+                "Step5 split shared-expert overlap enabled", scope="process"
+            )
 
     def maybe_begin_dispatch(
         self, shared_experts_input: torch.Tensor,
