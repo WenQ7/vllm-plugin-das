@@ -171,7 +171,14 @@ def apply_to_module(module: ModuleType) -> bool:
         is_channel_fp8 = (weight_key, activation_key) == channel_fp8_scheme
         if sidecar.deepep_auto:
             architectures = _model_architectures(config)
-            if "DeepseekV4ForCausalLM" not in architectures:
+            from vllm.config import get_current_vllm_config_or_none
+            from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+                step5_auto_experts_enabled,
+            )
+            step5_auto = step5_auto_experts_enabled(
+                config, get_current_vllm_config_or_none()
+            )
+            if "DeepseekV4ForCausalLM" not in architectures and not step5_auto:
                 raise ValueError(
                     "HCU Channel-FP8 deepep_auto is validated only for "
                     "DeepSeek-V4; use an explicit DeepEP high-throughput or "

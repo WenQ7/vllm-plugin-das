@@ -498,8 +498,12 @@ class Step5Attention(nn.Module):
         norm_exchange_requested = os.environ.get("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE", "0")
         if norm_exchange_requested not in ("0", "1"):
             raise ValueError("VLLM_STEP5_DCP2_FUSED_NORM_EXCHANGE must be 0 or 1")
+        pack_norm_requested = os.environ.get("VLLM_STEP5_DSA_PACK_QKNORM", "0")
+        if pack_norm_requested not in ("0", "1"):
+            raise ValueError("VLLM_STEP5_DSA_PACK_QKNORM must be 0 or 1")
         compiled_native_rope = False
-        if os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1" or norm_exchange_requested == "1":
+        if (os.environ.get("VLLM_STEP5_FUSED_QK_NORM_ROPE", "0") == "1"
+                or norm_exchange_requested == "1" or pack_norm_requested == "1"):
             fusion_config = get_current_vllm_config()
             norm_priority = fusion_config.kernel_config.ir_op_priority.rms_norm
             compiled_native_rope = (
@@ -515,14 +519,19 @@ class Step5Attention(nn.Module):
             and self.rotary_emb.is_neox_style
             and self.rotary_emb.rotary_dim in (64, 192)
         )
-        pack_norm_requested = os.environ.get("VLLM_STEP5_DSA_PACK_QKNORM", "0")
-        if pack_norm_requested not in ("0", "1"):
-            raise ValueError("VLLM_STEP5_DSA_PACK_QKNORM must be 0 or 1")
         self.fused_dsa_pack_norm = (
-            pack_norm_requested == "1" and self.fused_qk_norm_rope
+            pack_norm_requested == "1" and compiled_native_rope
+            and self.head_dim == 192 and self.use_rope
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim in (64, 192)
             and self.indexer is not None and not self.dcp2_attention_enabled
-            and self.num_heads == 32 and self.num_kv_heads == 2
+            and (self.num_heads, self.num_kv_heads) in ((32, 2), (16, 1))
         )
+        if self.fused_dsa_pack_norm:
+            logger.info_once(
+                "Step5 joint verification pack/QK-norm enabled: Q heads=%d; KV heads=%d",
+                self.num_heads, self.num_kv_heads,
+            )
         if self.fused_qk_norm_rope:
             logger.info_once("Step5 main Attention: fused FP32-weight QK-norm + RoPE enabled.")
         self.fused_dcp2_norm_exchange = (

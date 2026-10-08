@@ -604,8 +604,8 @@ class DeepEPDeepGemmMaskedExperts(DeepEPDeepGemmContiguousExperts):
                 parallel.tensor_parallel_size == 1
                 and parallel.data_parallel_size == 8
             ) or (
-                parallel.tensor_parallel_size == 2
-                and parallel.data_parallel_size == 4
+                (parallel.tensor_parallel_size, parallel.data_parallel_size)
+                in ((2, 4), (4, 2))
                 and parallel.pipeline_parallel_size == 1
                 and step5_context_parallel_supported(config)
                 and moe_config.is_sequence_parallel
@@ -1288,7 +1288,15 @@ def _make_deepep_auto_deepgemm_moe_kernel(
         get_current_vllm_config_or_none()
     )
     if experts_cls is None:
-        experts_cls = DeepEPAutoDeepGemmExperts
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            Step5AutoFP8Experts, step5_auto_experts_enabled,
+        )
+        if (not moe_quant_config.use_int8_w8a8
+                and step5_auto_experts_enabled(
+                    moe_config, get_current_vllm_config_or_none())):
+            experts_cls = Step5AutoFP8Experts
+        else:
+            experts_cls = DeepEPAutoDeepGemmExperts
     experts = experts_cls(
         moe_config=moe_config,
         quant_config=moe_quant_config,

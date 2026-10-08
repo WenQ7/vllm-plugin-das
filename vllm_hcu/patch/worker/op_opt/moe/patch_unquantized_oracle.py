@@ -169,6 +169,18 @@ def apply_to_module(module: ModuleType) -> bool:
                 if configs_available:
                     return hcu_enum.HCU_LIGHTOP_W16A16, experts_cls
 
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            step5_auto_experts_enabled,
+        )
+        if step5_auto_experts_enabled(
+            moe_config, get_current_vllm_config_or_none()
+        ):
+            from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
+                BatchedTritonExperts,
+            )
+            # Both Triton children consume canonical BF16 weights.
+            return hcu_enum.BATCHED_TRITON, BatchedTritonExperts
         backend, experts = select_backend(moe_config)
         return _normalize_backend(backend, old_enum, hcu_enum), experts
 
@@ -216,6 +228,19 @@ def apply_to_module(module: ModuleType) -> bool:
             bound_sequence_parallel_workspace,
         )
         moe_config = bound_sequence_parallel_workspace(moe_config, cfg)
+        from vllm_hcu.model_executor.layers.fused_moe.step5_deepep_auto import (
+            Step5AutoBF16Experts, step5_auto_experts_enabled,
+        )
+        if step5_auto_experts_enabled(moe_config, cfg):
+            from vllm_hcu.model_executor.layers.fused_moe.experts.dpsk_v4_deep_gemm_moe import (
+                _make_deepep_auto_deepgemm_moe_kernel,
+            )
+            return _make_deepep_auto_deepgemm_moe_kernel(
+                moe_quant_config=quant_config,
+                moe_config=moe_config,
+                routing_tables=routing_tables,
+                experts_cls=Step5AutoBF16Experts,
+            )
         if (
             os.getenv("VLLM_STEP5_HT_COMPACT_WORKSPACE", "0") == "1"
             and experts_cls is TritonExperts

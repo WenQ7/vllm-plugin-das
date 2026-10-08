@@ -48,6 +48,11 @@ def sequence_parallel_dispatch_bound(moe_config, vllm_config) -> int | None:
     if full_tokens <= 0:
         raise ValueError("Step5 dispatch requires a positive token capacity")
     local_tokens = (full_tokens + moe_parallel.sp_size - 1) // moe_parallel.sp_size
+    if os.getenv("VLLM_STEP5_LL_MOE_CHUNK_TOKENS", "0") != "0":
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_chunk import configured_chunk_tokens
+        chunk = configured_chunk_tokens(moe_config, vllm_config)
+        if chunk:
+            local_tokens = min(local_tokens, chunk)
     # Keep the original alignment unless the qualified gfx938 candidate is
     # explicitly selected. HCU DeepEP supports 192-row dispatch: its receive
     # storage need not be padded to 256 merely for the old 128-row bound.

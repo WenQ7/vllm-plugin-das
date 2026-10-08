@@ -16,9 +16,10 @@ from .step5_dsa_lightop_selector import _prepare_scores, supports_native_selecto
 def _pack_norm(IDS,P,T,R,O,C,LO,X,QW,KW,ROPE,QO,KO,
                QROWS:tl.constexpr,PS:tl.constexpr,TS:tl.constexpr,RS:tl.constexpr,
                OUTS:tl.constexpr,REGION:tl.constexpr,RPP:tl.constexpr,
-               LOGICAL:tl.constexpr,XS:tl.constexpr,CS:tl.constexpr,ROTARY:tl.constexpr,EPS:tl.constexpr):
+               LOGICAL:tl.constexpr,XS:tl.constexpr,CS:tl.constexpr,ROTARY:tl.constexpr,EPS:tl.constexpr,
+               NQ:tl.constexpr,NK:tl.constexpr):
     pid=tl.program_id(0)
-    if pid<2*QROWS:
+    if pid<NK*QROWS:
         row=pid
         q=tl.load(P+(row%QROWS)*PS).to(tl.int32)
         req=tl.load(R+row*RS).to(tl.int32)
@@ -50,8 +51,8 @@ def _pack_norm(IDS,P,T,R,O,C,LO,X,QW,KW,ROPE,QO,KO,
     
     else:
         if ROTARY==96:
-            rows=(pid-2*QROWS)*4+tl.arange(0,4)
-            token=rows//(32+2);head=rows%(32+2);is_q=head<32
+            rows=(pid-NK*QROWS)*4+tl.arange(0,4)
+            token=rows//(NQ+NK);head=rows%(NQ+NK);is_q=head<NQ
             lane=tl.arange(0,128)
             half=tl.arange(0,2)
             dims=lane[:,None]+96*half[None,:]
@@ -69,13 +70,13 @@ def _pack_norm(IDS,P,T,R,O,C,LO,X,QW,KW,ROPE,QO,KO,
             c=tl.load(ROPE+positions[:,None]*CS+lane[None,:],mask=rm,other=0).to(tl.float32)
             s=tl.load(ROPE+positions[:,None]*CS+96+lane[None,:],mask=rm,other=0).to(tl.float32)
             yr=(real*c-imag*s).to(tl.bfloat16);yi=(real*s+imag*c).to(tl.bfloat16)
-            qbase=token[:,None]*(32*192)+head[:,None]*192+lane[None,:]
-            kbase=token[:,None]*(2*192)+(head[:,None]-32)*192+lane[None,:]
+            qbase=token[:,None]*(NQ*192)+head[:,None]*192+lane[None,:]
+            kbase=token[:,None]*(NK*192)+(head[:,None]-NQ)*192+lane[None,:]
             tl.store(QO+qbase,yr,mask=rm&is_q[:,None]);tl.store(QO+qbase+96,yi,mask=rm&is_q[:,None])
             tl.store(KO+kbase,yr,mask=rm&~is_q[:,None]);tl.store(KO+kbase+96,yi,mask=rm&~is_q[:,None])
         else:
-            rows=(pid-2*QROWS)*4+tl.arange(0,4)
-            token=rows//(32+2);head=rows%(32+2);is_q=head<32
+            rows=(pid-NK*QROWS)*4+tl.arange(0,4)
+            token=rows//(NQ+NK);head=rows%(NQ+NK);is_q=head<NQ
             group=tl.arange(0,4)
             lane=tl.arange(0,32)
             half=tl.arange(0,2)
@@ -97,8 +98,8 @@ def _pack_norm(IDS,P,T,R,O,C,LO,X,QW,KW,ROPE,QO,KO,
             yr=tl.where(group[None,:,None]==0,rot_real,real).to(tl.bfloat16)
             yi=tl.where(group[None,:,None]==0,rot_imag,imag).to(tl.bfloat16)
             rm=(token[:,None,None]<QROWS)&(group[None,:,None]<3)
-            qbase=token[:,None,None]*(32*192)+head[:,None,None]*192+group[None,:,None]*64+lane[None,None,:]
-            kbase=token[:,None,None]*(2*192)+(head[:,None,None]-32)*192+group[None,:,None]*64+lane[None,None,:]
+            qbase=token[:,None,None]*(NQ*192)+head[:,None,None]*192+group[None,:,None]*64+lane[None,None,:]
+            kbase=token[:,None,None]*(NK*192)+(head[:,None,None]-NQ)*192+group[None,:,None]*64+lane[None,None,:]
             tl.store(QO+qbase,yr,mask=rm&is_q[:,None,None])
             tl.store(QO+qbase+32,yi,mask=rm&is_q[:,None,None])
             tl.store(KO+kbase,yr,mask=rm&~is_q[:,None,None])
@@ -110,12 +111,13 @@ _IDENTITIES: dict[torch.device, torch.Tensor] = {}
 def supports_main_norm_selector(logits, positions, requests, main_norm):
     qkv, qw, kw, cache, rotary_pairs, epsilon = main_norm
     m = positions.numel()
+    nk = {3456: 1, 6912: 2}.get(qkv.shape[1], 0) if qkv.ndim == 2 else 0
     return (
         supports_native_selector(
-            logits, positions, requests, topk=512, num_kv_groups=2
+            logits, positions, requests, topk=512, num_kv_groups=nk
         )
         and 1 <= m <= 64 and positions.stride(0) == 1
-        and qkv.ndim == 2 and qkv.shape == (m, 6912)
+        and nk in (1, 2) and qkv.ndim == 2 and qkv.shape == (m, nk * 3456)
         and qkv.dtype == torch.bfloat16 and qkv.stride(1) == 1
         and qw.shape == kw.shape == (192,)
         and qw.dtype == kw.dtype == torch.float32
@@ -148,8 +150,10 @@ def prefill_meta_with_main_norm(
     normalized = torch.empty_like(logits)
     packed = torch.empty((rows, 513), device=logits.device, dtype=torch.int32)
     counts = torch.empty(rows, device=logits.device, dtype=torch.int32)
-    q = qkv.new_empty((m, 6144))
-    k = qkv.new_empty((m, 384))
+    nk = qkv.shape[1] // 3456
+    nq = nk * 16
+    q = qkv.new_empty((m, nq * 192))
+    k = qkv.new_empty((m, nk * 192))
     _prepare_scores[(rows, triton.cdiv(width, 1024))](
         logits, normalized, positions, lengths,
         rows, m, positions.stride(0), width, 8, 1024, num_warps=4,
@@ -158,12 +162,12 @@ def prefill_meta_with_main_norm(
         normalized, lengths, identity.expand(rows, 1), ids,
         triton.next_power_of_2(max(1, width)), None,
     )
-    _pack_norm[(rows + triton.cdiv(m * 34, 4),)](
+    _pack_norm[(rows + triton.cdiv(m * (nq + nk), 4),)](
         ids, positions, table, requests, packed, counts, packed,
         qkv, qw, kw, cache, q, k,
         m, positions.stride(0), table.stride(0), requests.stride(0),
         packed.stride(0), 8, regions_per_page, False,
-        qkv.stride(0), cache.stride(0), rotary_pairs, epsilon,
+        qkv.stride(0), cache.stride(0), rotary_pairs, epsilon, nq, nk,
         num_warps=4, enable_fp_fusion=True,
     )
     return packed, counts, q, k

@@ -39,13 +39,15 @@ def _radix_topk_threshold_gfx938(
     arithmetic and tie semantics are otherwise identical to the vendored
     kernel.
     """
+    # Graph buffers cover max_model_len; skip masked tiles beyond this row's
+    # causal horizon. The skipped tiles contribute zero to every histogram.
     threshold = budget.to(tl.int64) * 0
     remaining = budget
     bucket_ids = tl.arange(0, 256)
     for radix_pass in tl.static_range(4):
         shift = 32 - 8 * (radix_pass + 1)
         histogram = tl.zeros((256,), dtype=tl.int32)
-        for base in tl.range(0, seq_regions, BLOCK_R):
+        for base in tl.range(0, visible, BLOCK_R):
             regions = base + tl.arange(0, BLOCK_R)
             live = regions < visible
             scores = tl.load(
@@ -274,7 +276,7 @@ def _prefill_sparse_meta_fused_kernel(
         )
         cursor = 0
         ties_taken = 0
-        for base in tl.range(0, seq_regions, BLOCK_R):
+        for base in tl.range(0, visible, BLOCK_R):
             regions = base + tl.arange(0, BLOCK_R)
             live = regions < visible
             scores = tl.load(

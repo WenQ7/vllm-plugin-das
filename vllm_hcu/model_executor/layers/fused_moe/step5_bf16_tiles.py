@@ -82,7 +82,7 @@ def install_step5_bf16_tiles(target):
         from vllm_hcu.step5_dcp2_config import step5_context_parallel_supported
         p = cfg.parallel_config
         if (cfg.model_config.hf_text_config.model_type != "step5"
-            or p.tensor_parallel_size != 2 or p.data_parallel_size != 4
+            or (p.tensor_parallel_size, p.data_parallel_size) not in ((2, 4), (4, 2))
             or p.pipeline_parallel_size != 1 or not step5_context_parallel_supported(cfg)
             or p.all2all_backend != "deepep_low_latency"):
             report_rejection(f"config type={cfg.model_config.hf_text_config.model_type}, TP={p.tensor_parallel_size}, DP={p.data_parallel_size}, backend={p.all2all_backend}")

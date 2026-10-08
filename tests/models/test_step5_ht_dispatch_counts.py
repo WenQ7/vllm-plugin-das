@@ -46,8 +46,8 @@ def test_fresh_dispatch_counts_and_fallbacks():
     mark=scope["mark_fresh_dispatch_metadata"];prepare=scope["prepare_compact_metadata"]
     rows=[]
     supported=scope["compact_workspace_parallelism_supported"]
-    assert supported(1,8) and supported(2,4)
-    assert not supported(4,2) and not supported(8,1)
+    assert supported(1,8) and supported(2,4) and supported(4,2)
+    assert not supported(8,1) and not supported(4,4)
     def setup(offset=4):
      ids=torch.tensor([[4,5,0,-1],[6,7,0,-1],[4,7,0,-1]],dtype=torch.int64)
      map=torch.full((12,),-1,dtype=torch.int32);map[offset:offset+4]=torch.arange(4,dtype=torch.int32)

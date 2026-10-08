@@ -112,8 +112,8 @@ def apply_to_module(module: ModuleType) -> bool:
             scoped = (
                 draft.model_type == "step5_mtp"
                 and self.num_speculative_steps == 3
-                and parallel.tensor_parallel_size == 2
-                and parallel.data_parallel_size == 4
+                and (parallel.tensor_parallel_size, parallel.data_parallel_size)
+                in ((2, 4), (4, 2))
                 and parallel.pipeline_parallel_size == 1
                 and step5_context_parallel_supported(self.vllm_config)
                 and parallel.prefill_context_parallel_size == 1
@@ -134,8 +134,9 @@ def apply_to_module(module: ModuleType) -> bool:
                 cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
                 self._step5_draft_full_graph_enabled = True
                 module.logger.info(
-                    "Step5 TP2 MTP draft graph: FULL_DECODE_ONLY; "
+                    "Step5 MTP draft graph: FULL_DECODE_ONLY; TP=%s; DP=%s; "
                     "DCP=%s; draft attention support=%s",
+                    parallel.tensor_parallel_size, parallel.data_parallel_size,
                     parallel.decode_context_parallel_size, support.name,
                 )
         return original_cg_init(self, cudagraph_mode)

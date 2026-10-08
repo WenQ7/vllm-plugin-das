@@ -26,8 +26,8 @@ def aligned_expert_rows(counts: torch.Tensor, alignment: int = 256) -> int:
 
 def compact_workspace_parallelism_supported(tp_size: int, dp_size: int) -> bool:
     # Both layouts use all eight ranks for EP, so post-dispatch expert counts
-    # provide the same exact workspace bound on TP1/DP8 and TP2/DP4.
-    return (tp_size, dp_size) in ((1, 8), (2, 4))
+    # provide the same exact workspace bound on TP1/DP8, TP2/DP4 and TP4/DP2.
+    return (tp_size, dp_size) in ((1, 8), (2, 4), (4, 2))
 
 @dataclass
 class Step5HTDispatchTokensMetadata(ExpertTokensMetadata):

@@ -2237,7 +2237,7 @@ def build_plan(
         selector_kwargs = {"num_kv_groups": num_kv_groups} if fused_selector else {}
         joint_norm = False
         if (
-            main_qknorm is not None and fused_selector and verification and short_query
+            main_qknorm is not None and fused_selector and short_query
             and prefill_tokens == attn_metadata.num_actual_tokens
             and not need_logical_ids and context_parallel_size == 1
             and prefill_meta is not prefill_sparse_meta_fused
@@ -4496,10 +4496,10 @@ def step5_dsa_index_qknorm(
     if indexer is None:
         raise RuntimeError(f"{layer_name}: no Step4Indexer registered")
     main_norm = (qkv, q_weight, k_weight, cos_sin_cache, rotary_pairs, epsilon)
-    # Only the qualified TP2 layout can share its norm launch with metadata.
+    # Keep QKV head geometry aligned with the indexer provider groups.
     width = indexer.run(
         hidden_states, positions, projected_index,
-        main_qknorm=main_norm if (num_q_heads, num_kv_heads) == (32, 2) else None,
+        main_qknorm=main_norm if (num_q_heads, num_kv_heads) in ((32, 2), (16, 1)) else None,
     )
     plan_token.fill_(width)
     plan = indexer.owner.attn.step4_sparse_plan
