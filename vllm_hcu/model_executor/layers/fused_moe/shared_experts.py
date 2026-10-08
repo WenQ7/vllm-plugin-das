@@ -101,14 +101,28 @@ class SharedExperts(torch.nn.Module):
             from vllm.config import get_current_vllm_config_or_none
             config = get_current_vllm_config_or_none()
             parallel = None if config is None else config.parallel_config
+            profile_supported = False
+            self._step5_split_auto = False
+            if parallel is not None:
+                tp_dp_dcp = (
+                    parallel.tensor_parallel_size,
+                    parallel.data_parallel_size,
+                    parallel.decode_context_parallel_size,
+                )
+                profile_supported = (
+                    tp_dp_dcp in ((2, 4, 1), (2, 4, 2), (4, 2, 1))
+                )
+                from vllm_hcu.patch.config import get_hcu_config
+                self._step5_split_auto = bool(
+                    getattr(parallel, "_vllm_hcu_deepep_auto", False)
+                    or get_hcu_config(config).deepep_auto
+                )
             if (
                 config is None
                 or config.model_config.hf_text_config.model_type != "step5"
-                or parallel.tensor_parallel_size != 2
-                or parallel.data_parallel_size != 4
+                or not profile_supported
                 or parallel.pipeline_parallel_size != 1
                 or parallel.prefill_context_parallel_size != 1
-                or parallel.decode_context_parallel_size not in (1, 2)
                 or not parallel.enable_expert_parallel
                 or parallel.all2all_backend != "deepep_low_latency"
                 or enable_dbo or parallel.enable_dbo
@@ -117,7 +131,8 @@ class SharedExperts(torch.nn.Module):
             ):
                 raise ValueError(
                     "Step5 split shared overlap requires BF16 shared expert, "
-                    "TP2/DP4/EP8/PP1/PCP1/DCP1-or-2, DeepEP-LL, no DBO "
+                    "TP2/DP4/EP8/DCP1-or-2 or TP4/DP2/EP8/DCP1, "
+                    "PP1/PCP1, DeepEP-LL (including Auto), no DBO "
                     "and no auxiliary shared-expert stream"
                 )
             logger.info_once(
@@ -149,10 +164,21 @@ class SharedExperts(torch.nn.Module):
         )
         if not is_short_uniform_decode(context):
             return False
+        if (
+            getattr(self, "_step5_split_auto", False)
+            and not getattr(context, "deepep_auto_use_low_latency", False)
+        ):
+            # A local short query is insufficient when another DP rank is
+            # prefilling. Only the globally selected LL forward can split.
+            return False
         assert self._split_dispatch_act is None
         assert self._output[self._output_idx] is None
         self._split_dispatch_act = self._layer._hcu_shared_dispatch(
             shared_experts_input
+        )
+        logger.info_once(
+            "Step5 split shared dispatch executed: local M=%s",
+            shared_experts_input.shape[0], scope="local",
         )
         return True
 
