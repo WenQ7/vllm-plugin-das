@@ -40,12 +40,12 @@ a different physical topology.
 ## Qualified same-service results
 
 These measurements use the bounded mixed projections and small-M QKV path,
-with shared auxiliary/split overlap and custom AllReduce disabled.
+with shared auxiliary/split overlap disabled and custom AllReduce enabled.
 
 | Global BS | BS per DP | Prefill tok/s | Maximum TTFT s | Decode tok/s | Chunk ITL ms |
 |---|---|---|---|---|---|
-|16|8|11229.44|93.38|520.25|86.07|
-|32|16|11231.23|186.72|872.60|102.97|
+|16|8|11228.85|93.38|525.00|85.29|
+|32|16|11229.68|186.75|894.59|100.41|
 
 Prefill is a separate output 1 measurement. Prefill values observed during the
 output 4096 Decode run are not substituted for it. ITL is the interval between
@@ -69,9 +69,16 @@ The installed DeepGEMM interface rejects native GEMM/combine overlap, and vLLM
 rejects DBO with this MTP3 graph configuration. These are not enabled.
 
 Native TP4 custom AllReduce passed 11 BF16/FP32 shapes and changed-input Graph
-checks on both four-card groups. Whole-model and ordinary-sampling checks are
-pending; STEP5_CUSTOM_ALL_REDUCE=on is an explicit experimental opt-in.
-Component speedup alone is not adoption evidence.
+checks on both four-card groups. One same-service whole-model round completed
+all four Prefill/Decode cases with no preemption. Relative to the previous bounded
+projection profile, Decode improved 0.914% at BS16 and 2.521% at BS32; Prefill
+changed by less than 0.02%. Custom AllReduce is enabled by default in this profile;
+STEP5_CUSTOM_ALL_REDUCE=off restores the prior collective path.
+
+A candidate-only ordinary MTP check against cached outputs from the previous
+bounded profile also scored 31/32 with identical per-question judgments, no
+truncation and no preemption. Only 4/32 token sequences were identical; output
+text can change with floating-point reduction order. This is a fixed subset check.
 
 A fixed 32-question ordinary MTP GSM8K subset scored 31/32 before and after the
 combined QKV/mixed changes, with no truncation or preemption. Floating-point
@@ -79,8 +86,9 @@ output text differs. This is an integration subset, not full accuracy certificat
 
 Current evidence root: /workspace/step5-tp4-optimization-20261008.
 Key reports: bounded-mixed-model-performance-qualified-v1.json,
-ordinary-sampling-paired-qualified-v1.json, tp2-to-tp4-coverage-audit-v10.json,
-decode-trace-native-qualified-v1.json and custom-ar-native-qualified-v1.json.
+ordinary-sampling-paired-qualified-v1.json, tp4-final-scope-audit-v1.json,
+decode-trace-native-qualified-v1.json, custom-ar-native-qualified-v1.json,
+custom-ar-model-performance-qualified-v1.json and custom-ar-ordinary-qualified-v1.json.
 The steady trace has 331474 GPU events across all 8 ranks in a 1212.198ms common
 BS32 window. Cumulative overlapping kernel durations are not exclusive wall time.
 

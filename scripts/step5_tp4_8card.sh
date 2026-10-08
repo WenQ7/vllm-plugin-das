@@ -67,7 +67,7 @@ export VLLM_STEP5_QKV_FP8_CALIBRATION_FILE="${STEP5_QKV_CALIBRATION:-/workspace/
 [[ -f "$VLLM_STEP5_QKV_FP8_CALIBRATION_FILE" ]] || { echo "Missing QKV calibration file" >&2; exit 2; }
 [[ -f "${VLLM_TUNED_CONFIG_FOLDER}/E=44,N=1536,device_name=BW1101.json" ]] || { echo "Missing Step5 MoE tuning config" >&2; exit 2; }
 ar_args=()
-case "${STEP5_CUSTOM_ALL_REDUCE:-off}" in
+case "${STEP5_CUSTOM_ALL_REDUCE:-on}" in
   off) ar_args=(--disable-custom-all-reduce) ;;
   on) ;;
   *) echo "STEP5_CUSTOM_ALL_REDUCE must be on or off" >&2; exit 2 ;;
