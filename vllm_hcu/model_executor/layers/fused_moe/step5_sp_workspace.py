@@ -83,3 +83,34 @@ def bound_sequence_parallel_workspace(moe_config, vllm_config):
         moe_config.max_num_tokens, bound,
     )
     return bounded
+
+def step5_auto_ll_dispatch_bound(moe_config, vllm_config) -> int | None:
+    """Bound only Auto LL by the decoded input after sequence-parallel slicing."""
+    if os.getenv("VLLM_STEP5_AUTO_SP_LL_WORKSPACE", "0") != "1":
+        return None
+    from vllm_hcu.step5_auto_graph import step5_auto_decode_graph_enabled
+    if not step5_auto_decode_graph_enabled(vllm_config, allow_draft=False):
+        return None
+    mp = moe_config.moe_parallel_config
+    if not (mp.is_sequence_parallel and mp.sp_size == 4 and mp.ep_size == 8):
+        return None
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if int(getattr(speculative, "num_speculative_tokens", 0)) != 3:
+        raise ValueError("Step5 Auto SP LL capacity requires MTP3")
+    sequences = int(vllm_config.scheduler_config.max_num_seqs)
+    if sequences <= 0:
+        raise ValueError("Step5 Auto SP LL capacity requires positive max_num_seqs")
+    # FULL Decode descriptors use <= max_num_seqs queries, at most four
+    # tokens per request. A mixed/Prefill batch is globally dispatched via HT.
+    # The same private capacity is passed to the handle, LL prepare/finalize,
+    # and then the experts factory; the HT token budget is never narrowed.
+    full_tokens = sequences * 4
+    local_tokens = (full_tokens + mp.sp_size - 1) // mp.sp_size
+    alignment = 64
+    bound = ((local_tokens + alignment - 1) // alignment) * alignment
+    from vllm.logger import init_logger
+    init_logger("vllm.hcu.step5_sp_workspace").info_once(
+        "Step5 Auto SP LL workspace: full Decode bound=%d; "
+        "per-dispatcher bound=%d; HT budget unchanged",
+        full_tokens, bound)
+    return bound

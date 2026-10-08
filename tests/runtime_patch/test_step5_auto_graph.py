@@ -253,3 +253,33 @@ def test_real_runner_reserves_before_upstream_profile(monkeypatch):
     runner.profile_run()
     assert calls == [("reserve", runner.vllm_config, "device"),
                      ("upstream", 16384)]
+
+@pytest.mark.parametrize("sequences,expected", [(1,64),(16,64),(32,64),(64,64),(65,128),(128,128)])
+def test_auto_ll_bound_covers_every_padded_request_shape(cfg,monkeypatch,sequences,expected):
+    import importlib.util
+    path=ROOT / "vllm_hcu/model_executor/layers/fused_moe/step5_sp_workspace.py"
+    spec=importlib.util.spec_from_file_location("sp_bound_under_test",path)
+    sp=importlib.util.module_from_spec(spec);spec.loader.exec_module(sp)
+    module=ModuleType("vllm_hcu.step5_auto_graph")
+    module.step5_auto_decode_graph_enabled=graph.step5_auto_decode_graph_enabled
+    monkeypatch.setitem(sys.modules,module.__name__,module)
+    monkeypatch.setenv("VLLM_STEP5_AUTO_SP_LL_WORKSPACE","1")
+    cfg.scheduler_config.max_num_seqs=sequences
+    cfg.scheduler_config.max_num_batched_tokens=16384
+    cfg.speculative_config=NS(num_speculative_tokens=3)
+    moe=NS(max_num_tokens=16384,moe_parallel_config=NS(
+        is_sequence_parallel=True,sp_size=4,ep_size=8))
+    assert sp.step5_auto_ll_dispatch_bound(moe,cfg)==expected
+    for reqs in range(1,sequences+1):
+        for query in (1,2,3,4):
+            assert (reqs*query+3)//4 <= expected
+    assert moe.max_num_tokens==cfg.scheduler_config.max_num_batched_tokens==16384
+
+
+def test_auto_ll_bound_is_noop_without_opt_in(cfg,monkeypatch):
+    import importlib.util
+    path=ROOT / "vllm_hcu/model_executor/layers/fused_moe/step5_sp_workspace.py"
+    spec=importlib.util.spec_from_file_location("sp_disabled_under_test",path)
+    sp=importlib.util.module_from_spec(spec);spec.loader.exec_module(sp)
+    monkeypatch.setenv("VLLM_STEP5_AUTO_SP_LL_WORKSPACE","0")
+    assert sp.step5_auto_ll_dispatch_bound(None,None) is None
