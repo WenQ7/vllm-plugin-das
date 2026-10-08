@@ -24,7 +24,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
 
-logger = init_logger(__name__)
+logger = init_logger("vllm.hcu.step5.qkv_fp8")
 
 
 @torch.no_grad()
@@ -151,6 +151,11 @@ class Step5QKVFp8LinearMethod(UnquantizedLinearMethod):
             raise ValueError("Step5 QKV FP8 scale mode must be amax, mse or output_mse")
         self.kernel = None
         self.use_lightop_quant = False
+        small_qkv = os.environ.get("VLLM_STEP5_TP4_SMALL_QKV_FP8", "0")
+        if small_qkv not in {"0", "1"}:
+            raise ValueError("VLLM_STEP5_TP4_SMALL_QKV_FP8 must be 0 or 1")
+        self.tp4_small_qkv_fp8 = small_qkv == "1"
+
 
     @torch.no_grad()
     def process_weights_after_loading(self, layer: nn.Module) -> None:
@@ -161,6 +166,16 @@ class Step5QKVFp8LinearMethod(UnquantizedLinearMethod):
             return
         hidden = layer.input_size
         width = sum(layer.output_partition_sizes)
+        if self.tp4_small_qkv_fp8:
+            config = get_current_vllm_config()
+            parallel = config.parallel_config
+            if (hidden != 4096 or width != 3456
+                    or parallel.tensor_parallel_size != 4
+                    or parallel.data_parallel_size != 2
+                    or not parallel.enable_expert_parallel
+                    or parallel.decode_context_parallel_size != 1
+                    or not henvs.custom_ops_enabled()):
+                raise ValueError("Step5 small QKV is qualified only for TP4 DP2 EP8 DCP1 with HCU custom ops")
         original = layer.weight
         if tuple(original.shape) == (hidden, width):
             weight_nn = original
@@ -210,6 +225,20 @@ class Step5QKVFp8LinearMethod(UnquantizedLinearMethod):
             lightop_fp8_runtime.ensure_registered(
                 torch.float8_e4m3fn, direct_register_custom_op
             )
+        if self.tp4_small_qkv_fp8:
+            if (not self.use_lightop_quant
+                    or getattr(type(self.kernel), "_hcu_fp8_backend", None) != "lightop"):
+                raise ValueError("Step5 small QKV requires the qualified LightOp FP8 backend")
+            arch = torch.cuda.get_device_properties(layer.weight.device).gcnArchName
+            if arch.split(":")[0] != "gfx938":
+                raise ValueError("Step5 small QKV is qualified only on gfx938")
+            from vllm_hcu.ops.step5_small_qkv_fp8 import ensure_registered
+            ensure_registered()
+            logger.info_once(
+                "Step5 TP4 small QKV fusion enabled for M1/4/8/16/32/64; source=%s",
+                __file__,
+                scope="process",
+            )
         logger.info_once(
             "Step5 QKV W8A8 enabled: FP8 per-channel weights, per-token activations; "
             "indexer, gate and output projection retain their original precision.",
@@ -230,6 +259,15 @@ class Step5QKVFp8LinearMethod(UnquantizedLinearMethod):
             return self.kernel.apply_weights(layer, x, bias)
         original_shape = x.shape
         x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        if self.tp4_small_qkv_fp8 and bias is None:
+            # vLLM compiles one symbolic range for Prefill and Decode.  A
+            # Python shape branch here specializes to the large tracing input
+            # and removes the Decode kernel from that range.  Keep routing
+            # inside the opaque op, with the original native path as fallback.
+            output = torch.ops.vllm.step5_tp4_small_qkv_fp8(
+                x_2d, layer.weight, layer.weight_scale,
+            )
+            return output.reshape(*original_shape[:-1], layer.weight.shape[1])
         quantized, scale = lightop_fp8_runtime.quantize(
             x_2d, torch.float8_e4m3fn, direct_register_custom_op
         )
