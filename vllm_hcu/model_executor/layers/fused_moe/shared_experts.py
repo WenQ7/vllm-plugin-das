@@ -5,6 +5,7 @@
 """HCU-owned v0.25.1 shared-expert execution."""
 
 import inspect
+import os
 from collections.abc import Callable
 from enum import IntEnum
 
@@ -26,6 +27,15 @@ from vllm.v1.worker.ubatching import (
 )
 
 logger = init_logger(__name__)
+
+# Batches of at least this many tokens (prefill) run the shared expert on the
+# aux stream launched after the routed experts, so it overlaps the DP combine
+# (NCCL reduce-scatter); the runner joins it right before the shared add (see
+# wait_late).  Launched any earlier it only competes with compute kernels for
+# CUs.  Smaller batches (decode) keep the configured order.  0 disables.  Not a
+# VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
+# custom op, not the traced graph, so it must not change the compile hash.
+_LATE_STREAM_MIN_TOKENS = int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
 
 
 class SharedExpertsOrder(IntEnum):
@@ -60,6 +70,7 @@ class SharedExperts(torch.nn.Module):
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
+        self._output_pending_late: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -161,6 +172,8 @@ class SharedExperts(torch.nn.Module):
             )
         if self._disable_shared_experts_overlap:
             return SharedExpertsOrder.NO_OVERLAP
+        if self._late_stream(hidden_states):
+            return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
 
         should_run_shared_in_aux_stream = self._should_run_shared_in_aux_stream(
             hidden_states
@@ -195,6 +208,20 @@ class SharedExperts(torch.nn.Module):
         return not torch._C._is_alias_of(
             routed_input, shared_input
         ) or not self.requires_input_preservation(shared_input)
+
+    def _late_stream(self, hidden_states: torch.Tensor) -> bool:
+        return (
+            _LATE_STREAM_MIN_TOKENS > 0
+            and self._stream is not None
+            and hidden_states.shape[0] >= _LATE_STREAM_MIN_TOKENS
+        )
+
+    def wait_late(self) -> None:
+        """Join a late-launched shared expert (see _LATE_STREAM_MIN_TOKENS)."""
+        if self._output_pending_late[self._output_idx]:
+            assert self._stream is not None
+            current_stream().wait_stream(self._stream)
+            self._output_pending_late[self._output_idx] = False
 
     def _should_run_shared_in_aux_stream(
         self,
@@ -239,6 +266,7 @@ class SharedExperts(torch.nn.Module):
             if (
                 henvs.VLLM_HCU_USE_CUSTOM_OPS
                 and henvs.VLLM_HCU_SHARED_EXPERTS_EARLY_LAUNCH
+                and not self._late_stream(shared_experts_input)
             ):
                 self._launch_in_aux_stream(
                     shared_experts_input,
@@ -311,7 +339,20 @@ class SharedExperts(torch.nn.Module):
 
         assert self._output[self._output_idx] is None
 
-        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+        if order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED and self._late_stream(
+            shared_experts_input
+        ):
+            # Start only once the routed experts are done: the aux stream waits
+            # on the main stream as of now, not as of the sync at layer entry.
+            assert self._stream is not None
+            self._stream.wait_stream(current_stream())
+            with torch.cuda.stream(self._stream):
+                self._output[self._output_idx] = self._run_layer(
+                    shared_experts_input,
+                    x_and_scale_quanted=x_and_scale_quanted,
+                )
+            self._output_pending_late[self._output_idx] = True
+        elif order == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
             self._output[self._output_idx] = self._run_in_aux_stream(
                 shared_experts_input,
                 x_and_scale_quanted=x_and_scale_quanted,

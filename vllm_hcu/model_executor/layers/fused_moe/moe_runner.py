@@ -1071,14 +1071,21 @@ class MoERunner(MoERunnerInterface):
     ) -> torch.Tensor:
         """Final MoE output when the finalize hook did not already fuse it."""
         if self.do_naive_dispatch_combine:
-            if not self._fused_output_is_reduced:
+            if not self._fused_output_is_reduced and _ep_fused_rows(hidden_states):
+                self._wait_late_shared_experts()
                 reduced = _ep_fused_all_reduce(hidden_states, shared_output)
                 if reduced is not None:
                     return reduced
             hidden_states = get_ep_group().combine(hidden_states, False)
+        # A late-launched shared expert overlaps the combine above.
+        self._wait_late_shared_experts()
         # Unfused tail, identical to forward() for this configuration.
         shared_output = self._maybe_reduce_shared_expert_output(shared_output)
         return self._maybe_reduce_final_output(shared_output + hidden_states, None)
+
+    def _wait_late_shared_experts(self) -> None:
+        if self._shared_experts is not None:
+            self._shared_experts.wait_late()
 
     def _maybe_combine(
         self,
@@ -1098,6 +1105,7 @@ class MoERunner(MoERunnerInterface):
             hidden_states = get_ep_group().combine(
                 hidden_states, self.moe_config.is_sequence_parallel
             )
+        self._wait_late_shared_experts()
 
         needs_fallback_pcp_collective = (
             self.moe_config.pcp_size > 1
