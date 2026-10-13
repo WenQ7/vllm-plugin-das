@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -44,6 +45,36 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# Prefill (>= this many tokens summed over DP ranks; 0 disables): naive DP/EP
+# dispatch -> experts -> combine pipelined over two halves of the source DP
+# ranks.  The all-gather of half 1 runs under the experts of half 0 and the
+# reduce of half 0 under the experts of half 1, all comm on a side stream with
+# the same grouped NCCL broadcast/reduce as all_gatherv/reduce_scatterv, so the
+# result is bit-identical.  DP8 8192-token layer: 16.4 -> 15.2 ms.  The caller
+# joins the side stream with join_dp_moe_pipe() (after launching a late shared
+# expert, which then overlaps the last reduce).  Not VLLM_HCU_*: eager-only
+# inside the MoE custom op, must not change the compile hash.
+_DP_MOE_PIPE_MIN_TOKENS = int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
+_dp_pipe_stream: torch.cuda.Stream | None = None
+# (side stream, tensors it still reads/writes) until the main stream joins it.
+_dp_pipe_pending: tuple | None = None
+_dp_pipe_announced = False
+
+
+def join_dp_moe_pipe() -> None:
+    global _dp_pipe_pending
+    if _dp_pipe_pending is not None:
+        torch.cuda.current_stream().wait_stream(_dp_pipe_pending[0])
+        _dp_pipe_pending = None
+
+
+def _nccl_dtype(t: torch.Tensor):
+    from vllm.distributed.device_communicators.pynccl_wrapper import ncclDataTypeEnum
+
+    if t.element_size() == 1:
+        t = t.view(torch.uint8)
+    return ncclDataTypeEnum.from_torch(t.dtype)
 
 #
 # This file defines a set of base classes used to make MoE kernels more modular.
@@ -1438,6 +1469,178 @@ class FusedMoEKernelModularImpl:
 
         return output
 
+    def _dp_pipe_apply(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        local_num_experts: int,
+        expert_map: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """See _DP_MOE_PIPE_MIN_TOKENS.  None: not applicable, nothing done."""
+        global _dp_pipe_stream, _dp_pipe_pending
+        from vllm.distributed import get_dp_group
+        from vllm.distributed.device_communicators.pynccl_wrapper import (
+            buffer_type,
+            cudaStream_t,
+            ncclRedOpTypeEnum,
+        )
+        from vllm.forward_context import get_forward_context
+        from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+        from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
+            TopKWeightAndReduceNoOP,
+        )
+
+        pf = self.prepare_finalize
+        fe = self.fused_experts
+        if not (
+            type(pf) is naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular
+            and not pf.is_sequence_parallel
+            and pf._lora_context is None
+            and getattr(fe, "_lora_context", None) is None
+            and fe.activation_format() == FusedMoEActivationFormat.Standard
+            and not fe.expects_unquantized_inputs
+            and isinstance(fe.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP)
+            and not dbo_enabled()
+        ):
+            return None
+        dp_meta = get_forward_context().dp_metadata
+        if dp_meta is None:
+            return None
+        sizes = dp_meta.get_chunk_sizes_across_dp_rank()
+        if sizes is None or sum(sizes) < _DP_MOE_PIPE_MIN_TOKENS:
+            return None
+        dp = get_dp_group()
+        comm = getattr(dp.device_communicator, "pynccl_comm", None)
+        if comm is None or comm.disabled or len(sizes) < 2:
+            return None
+        assert sizes[dp.rank_in_group] == hidden_states.shape[0]
+        join_dp_moe_pipe()
+        global _dp_pipe_announced
+        if not _dp_pipe_announced:
+            _dp_pipe_announced = True
+            print(f"[dp_moe_pipe] active: sizes={sizes}", flush=True)
+
+        a1q, scales, a1q_scale = naive_dp_ep._quantize_and_setup_dispatch(
+            hidden_states, fe.quant_config
+        )
+        local = [a1q, topk_weights, topk_ids] + (scales or [])
+        W = len(sizes)
+        offs = [0]
+        for n in sizes:
+            offs.append(offs[-1] + n)
+        M = offs[-1]
+        gath = [
+            torch.empty((M,) + t.shape[1:], dtype=t.dtype, device=t.device)
+            for t in local
+        ]
+        if scales:
+            a1q_scale = gath[3]
+        K = hidden_states.shape[1]
+        moe_out = torch.empty((M, K), dtype=hidden_states.dtype, device=a1q.device)
+        result = torch.empty_like(hidden_states)
+
+        if _dp_pipe_stream is None:
+            _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
+        side = _dp_pipe_stream
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+        nccl, ncomm = comm.nccl, comm.comm
+        side_s = cudaStream_t(side.cuda_stream)
+        groups = [range(0, W // 2), range(W // 2, W)]
+
+        ag_ev = []
+        for grp in groups:
+            nccl.ncclGroupStart()
+            for src, dst in zip(local, gath):
+                for root in grp:
+                    sl = dst[offs[root] : offs[root + 1]]
+                    nccl.ncclBroadcast(
+                        buffer_type(src.data_ptr()),
+                        buffer_type(sl.data_ptr()),
+                        sl.numel(),
+                        _nccl_dtype(src),
+                        root,
+                        ncomm,
+                        side_s,
+                    )
+            nccl.ncclGroupEnd()
+            ev = torch.cuda.Event()
+            ev.record(side)
+            ag_ev.append(ev)
+
+        moe_ev = []
+        for grp, ev in zip(groups, ag_ev):
+            cur.wait_event(ev)
+            a, b = offs[grp[0]], offs[grp[-1] + 1]
+            if b > a:
+                _, _, N, Kw, top_k = fe.moe_problem_size(
+                    gath[0][a:b], w1, w2, gath[2][a:b]
+                )
+                if self.N > 0:
+                    N, Kw = self.N, self.K
+                workspace13, workspace2, _ = self._allocate_buffers(
+                    hidden_states.dtype,
+                    a1q.device,
+                    b - a,
+                    b - a,
+                    N,
+                    Kw,
+                    top_k,
+                    global_num_experts,
+                    local_num_experts,
+                    None,
+                    activation,
+                )
+                fe.apply(
+                    output=moe_out[a:b],
+                    hidden_states=gath[0][a:b],
+                    w1=w1,
+                    w2=w2,
+                    topk_weights=gath[1][a:b],
+                    topk_ids=gath[2][a:b],
+                    activation=activation,
+                    global_num_experts=global_num_experts,
+                    expert_map=expert_map,
+                    a1q_scale=(
+                        a1q_scale[a:b]
+                        if a1q_scale is not None and a1q_scale.numel() > 1
+                        else a1q_scale
+                    ),
+                    a2_scale=fe.a2_scale,
+                    workspace13=workspace13,
+                    workspace2=workspace2,
+                    expert_tokens_meta=None,
+                    apply_router_weight_on_input=False,
+                )
+            ev = torch.cuda.Event()
+            ev.record(cur)
+            moe_ev.append(ev)
+
+        sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
+        for grp, ev in zip(groups, moe_ev):
+            side.wait_event(ev)
+            nccl.ncclGroupStart()
+            for root in grp:
+                ch = moe_out[offs[root] : offs[root + 1]]
+                nccl.ncclReduce(
+                    buffer_type(ch.data_ptr()),
+                    buffer_type(result.data_ptr()),
+                    ch.numel(),
+                    _nccl_dtype(ch),
+                    sum_op,
+                    root,
+                    ncomm,
+                    side_s,
+                )
+            nccl.ncclGroupEnd()
+        _dp_pipe_pending = (side, local, gath, moe_out, result)
+        return result
+
     def apply(
         self,
         hidden_states: torch.Tensor,
@@ -1482,11 +1685,30 @@ class FusedMoEKernelModularImpl:
         Returns:
         - torch.Tensor: The output tensor after applying the MoE layer.
         """
-        output = torch.empty_like(hidden_states)
-
         local_num_experts = w1.shape[0]
         if global_num_experts == -1:
             global_num_experts = local_num_experts
+
+        if (
+            _DP_MOE_PIPE_MIN_TOKENS > 0
+            and quanted_hidden_states is None
+            and not apply_router_weight_on_input
+        ):
+            piped = self._dp_pipe_apply(
+                hidden_states,
+                w1,
+                w2,
+                topk_ids,
+                topk_weights,
+                activation,
+                global_num_experts,
+                local_num_experts,
+                expert_map,
+            )
+            if piped is not None:
+                return piped
+
+        output = torch.empty_like(hidden_states)
 
         a1q, a1q_scale, expert_tokens_meta, topk_ids, topk_weights = self._prepare(
             quanted_hidden_states
