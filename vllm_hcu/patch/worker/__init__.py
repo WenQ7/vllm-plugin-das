@@ -390,6 +390,9 @@ _FRAMEWORK_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(
         _adapter("framework_opt", "patch_draft_speculator_inputs"),
     ),
+    _CallbackSpec(
+        _adapter("framework_opt", "patch_mtp_prefill_tail"),
+    ),
     _CallbackSpec(_adapter("framework_opt", "patch_gpu_ubatch_wrapper")),
     _CallbackSpec(_adapter("framework_opt", "patch_ubatch_utils")),
     _CallbackSpec(_adapter("framework_opt", "patch_all2all"), feature="deepep"),
