@@ -312,6 +312,43 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
 
 
 # Largest M per call; vLLM's MoE chunk size, so normally a single chunk.
+
+@triton.jit
+def _ep_gather_sorted_kernel(a_ptr, s_ptr, sids_ptr, nvalid_ptr, out_ptr, outs_ptr, M,
+                             K: tl.constexpr, ROWS: tl.constexpr, BK: tl.constexpr):
+    r0 = tl.program_id(0) * ROWS
+    if r0 >= tl.load(nvalid_ptr):
+        return
+    rows = r0 + tl.arange(0, ROWS)
+    tok = tl.load(sids_ptr + rows) & 0xFFFFFF
+    ok = tok < M
+    tok = tl.where(ok, tok, 0)
+    tl.store(outs_ptr + rows, tl.load(s_ptr + tok, mask=ok, other=0.0))
+    for k in tl.static_range(0, K, BK):
+        cols = k + tl.arange(0, BK)
+        cm = cols[None, :] < K
+        v = tl.load(a_ptr + tok[:, None].to(tl.int64) * K + cols[None, :], mask=ok[:, None] & cm,
+                    other=0)
+        tl.store(out_ptr + rows[:, None].to(tl.int64) * K + cols[None, :], v, mask=cm)
+
+
+def ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, ws=None):
+    """A rows (fp8) + per-token scales in sorted (BM-padded) order, for GEMM1 a_sorted.
+    Padding rows inside nvalid are zero; rows past nvalid are not written. With real
+    (scattered) routing the gathering GEMM1 is A-load bound; on contiguous A a different
+    config wins: M=32768 GEMM1 2.87 -> 2.22 ms + 0.20 ms gather, full call -7.5%, bitwise
+    identical. (A token-sorted microbench hides this: there the gather is already contiguous.)"""
+    M, K = a_q.shape
+    buf = _carve(ws, (rows * K + 4 * rows,), torch.uint8, a_q.device)
+    a_g = buf[:rows * K].view(a_q.dtype).view(rows, K)
+    s_g = buf[rows * K:].view(torch.float32).view(rows, 1)
+    ROWS = 32
+    _ep_gather_sorted_kernel[(triton.cdiv(rows, ROWS),)](
+        a_q.view(torch.uint8), a_s.reshape(-1), sorted_ids, nvalid, a_g.view(torch.uint8), s_g,
+        M, K, ROWS, min(2048, triton.next_power_of_2(K)), num_warps=4)
+    return a_g, s_g
+
+
 CHUNK = int(os.environ.get("EP_FUSED_MOE_CHUNK", "32768"))
 
 
@@ -354,6 +391,8 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     assert cfg2["BLOCK_SIZE_M"] == bm
     use_mls = bool(cfg2.get("bottom_a_use_mls_load", False))
     cfg2 = {k: v for k, v in cfg2.items() if k not in ("bottom_a_use_mls_load", "a_sorted")}
+    presort = bool(cfg1.get("a_presort", False))
+    cfg1 = {k: v for k, v in cfg1.items() if k != "a_presort"}
 
     if hidden_states.dtype in (torch.bfloat16, torch.float16):
         a_q, a_s = per_token_quant_triton(hidden_states, quant_dtype=FP8)
@@ -365,9 +404,17 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
 
     dev = hidden_states.device
     cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
-    _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
-          expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
-          ck_topk=topk)
+    if presort and a_s.numel() == M:
+        # A gathered into sorted order first (lives in workspace2, dead before act_q).
+        a_g, s_g = ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, workspace2)
+        _gemm(a_g, w1, cache1, s_g, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+              expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
+              ck_topk=topk, a_sorted=True)
+        del a_g, s_g
+    else:
+        _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+              expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
+              ck_topk=topk)
     act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
                                        7.0 if gemm1_limit is None else gemm1_limit,
                                        q=_carve(workspace2, (rows, N // 2), FP8, dev))
