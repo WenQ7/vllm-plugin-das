@@ -100,6 +100,100 @@ def _ep_masked_moe_sum_kernel(
     tl.store(out_ptr + t.to(tl.int64) * N + offs, acc.to(out_ptr.dtype.element_ty))
 
 
+# Direct combine for large M (HCU_EP_DIRECT_SUM=min M, 0 disables), used when the
+# caller provides scratch rows right after out (direct_scratch, set by the DP MoE pipe).
+# GEMM2 stores each token's first local route straight into out[token] and only the
+# further routes of tokens with 2+ local experts into compact scratch rows;
+# _ep_direct_fix_kernel adds those (and zero-fills tokens with no local route). Same
+# fp32 sum order as ep_masked_moe_sum, so bit-exact, without the (M, topk, K) round trip.
+# If the scratch would overflow (very skewed routing), device-side gates run the
+# cache3 + masked-sum path instead, so no host sync is needed.
+DIRECT_MIN = int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+direct_scratch = None
+_DIRECT_BIG = 2**31 - 1
+DIRECT_TPP = 1
+_direct_announced = False
+
+
+@triton.jit
+def _ep_direct_info_kernel(ids_ptr, emap_ptr, info_ptr, inv_ptr, ctr_ptr, M,
+                           TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    # info[t] = first local k (TOPK if none) | local route count << 4; inv[t, :] = -1
+    # (routes the sort drops, e.g. duplicate ids in padding rows, stay -1).
+    if tl.program_id(0) == 0:
+        tl.store(ctr_ptr, 0)
+    t = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tm = t < M
+    c = tl.zeros((BLOCK,), tl.int32)
+    f = tl.full((BLOCK,), TOPK, tl.int32)
+    for k in tl.static_range(TOPK):
+        e = tl.load(ids_ptr + t * TOPK + k, mask=tm, other=0)
+        loc = tl.load(emap_ptr + e, mask=tm, other=-1) >= 0
+        f = tl.where(loc & (f == TOPK), k, f)
+        c += loc.to(tl.int32)
+        tl.store(inv_ptr + t * TOPK + k, -1, mask=tm)
+    tl.store(info_ptr + t, f | (c << 4), mask=tm)
+
+
+@triton.jit
+def _ep_direct_rows_kernel(sids_ptr, nvalid_ptr, info_ptr, rows_ptr, inv_ptr, ctr_ptr, M, XOFF,
+                           BOUND, TOPK: tl.constexpr, BIG: tl.constexpr, BLOCK: tl.constexpr):
+    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pm = p < BOUND
+    s = tl.load(sids_ptr + p, mask=pm, other=0)
+    t = s & 0x00FFFFFF
+    k = s >> 24
+    ok = pm & (p < tl.load(nvalid_ptr)) & (t < M)
+    f = tl.load(info_ptr + t, mask=ok, other=0) & 15
+    extra = ok & (k != f)
+    e32 = extra.to(tl.int32)
+    slot = tl.atomic_add(ctr_ptr, tl.sum(e32, 0)) + tl.cumsum(e32, 0) - e32
+    row = tl.where(extra, XOFF + slot, t)
+    tl.store(rows_ptr + p, tl.where(ok, row, BIG), mask=pm)
+    tl.store(inv_ptr + t * TOPK + k, slot, mask=extra)
+
+
+@triton.jit
+def _ep_direct_gate_kernel(nvalid_ptr, ctr_ptr, gate_ptr, CAP):
+    # gate = [nvalid for the direct GEMM2, nvalid for the fallback GEMM2, fallback on]
+    nv = tl.load(nvalid_ptr)
+    over = tl.load(ctr_ptr) > CAP
+    tl.store(gate_ptr, tl.where(over, 0, nv))
+    tl.store(gate_ptr + 1, tl.where(over, nv, 0))
+    tl.store(gate_ptr + 2, over.to(tl.int32))
+
+
+@triton.jit
+def _ep_direct_fix_kernel(out_ptr, x_ptr, c3_ptr, ids_ptr, emap_ptr, info_ptr, inv_ptr, gate_ptr,
+                          M, N: tl.constexpr, TOPK: tl.constexpr, BLOCK_N: tl.constexpr,
+                          TPP: tl.constexpr):
+    # TPP tokens per program: most tokens have exactly one local route and need nothing.
+    over = tl.load(gate_ptr + 2) != 0
+    offs = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    for i in range(TPP):
+        t = tl.program_id(0) * TPP + i
+        if t < M:
+            info = tl.load(info_ptr + t)
+            c = info >> 4
+            if over | (c != 1):
+                acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+                if over:  # cache3 fallback: ep_masked_moe_sum
+                    for k in tl.static_range(TOPK):
+                        e = tl.load(ids_ptr + t * TOPK + k)
+                        if tl.load(emap_ptr + e) >= 0:
+                            acc += tl.load(c3_ptr + (t.to(tl.int64) * TOPK + k) * N
+                                           + offs).to(tl.float32)
+                elif c > 1:  # first local route is already in out[t]
+                    f = info & 15
+                    acc += tl.load(out_ptr + t.to(tl.int64) * N + offs).to(tl.float32)
+                    for k in tl.static_range(TOPK):
+                        if k > f:
+                            j = tl.load(inv_ptr + t * TOPK + k).to(tl.int64)
+                            if j >= 0:
+                                acc += tl.load(x_ptr + j * N + offs).to(tl.float32)
+                tl.store(out_ptr + t.to(tl.int64) * N + offs, acc.to(out_ptr.dtype.element_ty))
+
+
 @functools.lru_cache(maxsize=None)
 def _num_cus(dev):
     return torch.cuda.get_device_properties(dev).multi_processor_count
@@ -419,20 +513,86 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                                        7.0 if gemm1_limit is None else gemm1_limit,
                                        q=_carve(workspace2, (rows, N // 2), FP8, dev))
     del cache1
-    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev, avoid=out)
+    if out is None:
+        out = torch.empty((M, K), dtype=out_dtype, device=dev)
+    add = shared_add_provider(out) if shared_add_provider is not None else None
+    if (DIRECT_MIN and M >= DIRECT_MIN and routed_scaling_factor == 1.0 and add is None
+            and "PERSISTENT_PROGRAMS" not in cfg2):
+        xoff = _ep_direct_xoff(out, topk_ids)
+        if xoff is not None:
+            global _direct_announced
+            if not _direct_announced:
+                _direct_announced = True
+                print(f"[ep_fused_moe] direct combine: M={M} scratch={direct_scratch.shape[0]}",
+                      flush=True)
+            _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, expert_map,
+                               sorted_ids, sorted_w, expert_ids, nvalid, compute_type, cfg2,
+                               use_mls, out, xoff, workspace13)
+            return out
+    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
           scale_bias_with_routed_weight=True)
-    if out is None:
-        out = torch.empty((M, K), dtype=out_dtype, device=dev)
-    add = shared_add_provider(out) if shared_add_provider is not None else None
     ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor,
                       *(add or ()))
     return out
 
 
+def _ep_direct_xoff(out, topk_ids):
+    """Row offset of direct_scratch from out when the direct combine applies, else None."""
+    x = direct_scratch
+    M, K = out.shape
+    if (x is None or x.dtype != out.dtype or x.device != out.device or x.dim() != 2
+            or x.shape[1] != K or not x.is_contiguous() or not out.is_contiguous()
+            or not topk_ids.is_contiguous()):
+        return None
+    rb = K * out.element_size()
+    d = x.data_ptr() - out.data_ptr()
+    # GEMM2 addresses scratch rows from out's pointer with 32-bit offsets.
+    if d < M * rb or d % rb or d + x.numel() * x.element_size() >= 2**31:
+        return None
+    return d // rb
+
+
+def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, expert_map,
+                       sorted_ids, sorted_w, expert_ids, nvalid, compute_type, cfg2, use_mls,
+                       out, xoff, workspace13):
+    """GEMM2 + local top-k sum without the (M, topk, K) cache; see DIRECT_MIN."""
+    M, topk = topk_ids.shape
+    K = out.shape[1]
+    dev = out.device
+    x = direct_scratch
+    ints = torch.empty((M + M * topk + sorted_ids.numel() + 4,), dtype=torch.int32, device=dev)
+    info, inv = ints[:M], ints[M:M + M * topk]
+    rows2 = ints[M + M * topk:M + M * topk + sorted_ids.numel()]
+    ctr, gate = ints[-4:-3], ints[-3:]
+    _ep_direct_info_kernel[(triton.cdiv(M, 1024),)](topk_ids, expert_map, info, inv, ctr, M,
+                                                     TOPK=topk, BLOCK=1024, num_warps=4)
+    _ep_direct_rows_kernel[(triton.cdiv(sorted_ids.numel(), 1024),)](
+        sorted_ids, nvalid, info, rows2, inv, ctr, M, xoff, sorted_ids.numel(), TOPK=topk,
+        BIG=_DIRECT_BIG, BLOCK=1024, num_warps=4)
+    _ep_direct_gate_kernel[(1,)](nvalid, ctr, gate, x.shape[0], num_warps=1)
+    # num_valid_tokens (= topk_ids.numel()) only masks rows >= it: make it never mask.
+    fake_ids = torch.empty((1, 1), dtype=torch.int32, device=dev).expand(_DIRECT_BIG - 1, 1)
+    _gemm(act_q, w2, out, act_s, w2_scale, topk_weights, fake_ids, rows2, sorted_w,
+          expert_ids, gate[0:1], 1, compute_type, cfg2, a_sorted=True,
+          bottom_a_use_mls_load=use_mls, ck_sorting=False, ck_topk=topk,
+          scale_bias_with_routed_weight=True)
+    # Fallback (scratch overflow) GEMM2 into cache3: exits at once unless gate[1] > 0.
+    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev)
+    _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+          expert_ids, gate[1:2], 1, compute_type, cfg2, a_sorted=True,
+          bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
+          scale_bias_with_routed_weight=True)
+    bn = SUM_CFG["BLOCK_N"]
+    _ep_direct_fix_kernel[(triton.cdiv(M, DIRECT_TPP), K // bn)](
+        out, x, cache3, topk_ids, expert_map, info, inv, gate, M, N=K, TOPK=topk, BLOCK_N=bn,
+        TPP=DIRECT_TPP, num_warps=SUM_CFG["num_warps"])
+
+
 def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, w1_scale, w2_scale,
+                     **kw):
                      **kw):
     global _announced
     if not _announced:

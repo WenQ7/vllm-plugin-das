@@ -56,6 +56,7 @@ logger = init_logger(__name__)
 # expert, which then overlaps the last reduce).  Not VLLM_HCU_*: eager-only
 # inside the MoE custom op, must not change the compile hash.
 _DP_MOE_PIPE_MIN_TOKENS = int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
+_EP_DIRECT_SUM = int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
 _dp_pipe_stream: torch.cuda.Stream | None = None
 # (side stream, tensors it still reads/writes) until the main stream joins it.
 _dp_pipe_pending: tuple | None = None
@@ -1541,7 +1542,18 @@ class FusedMoEKernelModularImpl:
         if scales:
             a1q_scale = gath[3]
         K = hidden_states.shape[1]
-        moe_out = torch.empty((M, K), dtype=hidden_states.dtype, device=a1q.device)
+        groups = [range(0, W // 2), range(W // 2, W)]
+        # HCU_EP_DIRECT_SUM: spare rows right after moe_out serve as the direct
+        # combine's scratch (see ep_fused_moe.DIRECT_MIN); one half's MoE at a time.
+        S = (
+            max(offs[g[-1] + 1] - offs[g[0]] for g in groups if len(g))
+            if _EP_DIRECT_SUM
+            else 0
+        )
+        if S:
+            from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe as _ep_mod
+        moe_full = torch.empty((M + S, K), dtype=hidden_states.dtype, device=a1q.device)
+        moe_out = moe_full[:M]
         result = torch.empty_like(hidden_states)
 
         if _dp_pipe_stream is None:
@@ -1551,7 +1563,6 @@ class FusedMoEKernelModularImpl:
         side.wait_stream(cur)
         nccl, ncomm = comm.nccl, comm.comm
         side_s = cudaStream_t(side.cuda_stream)
-        groups = [range(0, W // 2), range(W // 2, W)]
 
         ag_ev = []
         for grp in groups:
@@ -1596,6 +1607,8 @@ class FusedMoEKernelModularImpl:
                     None,
                     activation,
                 )
+                if S:
+                    _ep_mod.direct_scratch = moe_full[M:]
                 fe.apply(
                     output=moe_out[a:b],
                     hidden_states=gath[0][a:b],
@@ -1617,6 +1630,8 @@ class FusedMoEKernelModularImpl:
                     expert_tokens_meta=None,
                     apply_router_weight_on_input=False,
                 )
+                if S:
+                    _ep_mod.direct_scratch = None
             ev = torch.cuda.Event()
             ev.record(cur)
             moe_ev.append(ev)
