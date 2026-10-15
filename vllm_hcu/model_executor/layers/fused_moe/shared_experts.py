@@ -24,6 +24,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
+    dbo_enabled,
 )
 
 logger = init_logger(__name__)
@@ -214,6 +215,8 @@ class SharedExperts(torch.nn.Module):
             _LATE_STREAM_MIN_TOKENS > 0
             and self._stream is not None
             and hidden_states.shape[0] >= _LATE_STREAM_MIN_TOKENS
+            # Microbatched: the combine already overlaps the other microbatch.
+            and not dbo_enabled()
         )
 
     def wait_late(self) -> None:

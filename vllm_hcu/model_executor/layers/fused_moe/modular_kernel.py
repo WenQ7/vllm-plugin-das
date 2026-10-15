@@ -41,6 +41,8 @@ from vllm.v1.worker.ubatching import (
     dbo_maybe_run_recv_hook,
     dbo_register_recv_hook,
     dbo_yield,
+    dbo_yield_and_switch_from_comm_to_compute,
+    dbo_yield_and_switch_from_compute_to_comm,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -1498,6 +1500,10 @@ class FusedMoEKernelModularImpl:
 
         pf = self.prepare_finalize
         fe = self.fused_experts
+        # Microbatched (HCU_DBO_MIN_TOKENS, vllm_hcu.v1.hcu_dbo): one group, its
+        # dispatch and combine on the ubatch comm stream overlapping the other
+        # microbatch's compute instead of this one's.
+        dbo = dbo_enabled()
         if not (
             type(pf) is naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular
             and not pf.is_sequence_parallel
@@ -1506,14 +1512,13 @@ class FusedMoEKernelModularImpl:
             and fe.activation_format() == FusedMoEActivationFormat.Standard
             and not fe.expects_unquantized_inputs
             and isinstance(fe.finalize_weight_and_reduce_impl(), TopKWeightAndReduceNoOP)
-            and not dbo_enabled()
         ):
             return None
         dp_meta = get_forward_context().dp_metadata
         if dp_meta is None:
             return None
         sizes = dp_meta.get_chunk_sizes_across_dp_rank()
-        if sizes is None or sum(sizes) < _DP_MOE_PIPE_MIN_TOKENS:
+        if sizes is None or (not dbo and sum(sizes) < _DP_MOE_PIPE_MIN_TOKENS):
             return None
         dp = get_dp_group()
         comm = getattr(dp.device_communicator, "pynccl_comm", None)
@@ -1524,7 +1529,7 @@ class FusedMoEKernelModularImpl:
         global _dp_pipe_announced
         if not _dp_pipe_announced:
             _dp_pipe_announced = True
-            print(f"[dp_moe_pipe] active: sizes={sizes}", flush=True)
+            print(f"[dp_moe_pipe] active: sizes={sizes} dbo={dbo}", flush=True)
 
         a1q, scales, a1q_scale = naive_dp_ep._quantize_and_setup_dispatch(
             hidden_states, fe.quant_config
@@ -1542,7 +1547,7 @@ class FusedMoEKernelModularImpl:
         if scales:
             a1q_scale = gath[3]
         K = hidden_states.shape[1]
-        groups = [range(0, W // 2), range(W // 2, W)]
+        groups = [range(W)] if dbo else [range(0, W // 2), range(W // 2, W)]
         # HCU_EP_DIRECT_SUM: spare rows right after moe_out serve as the direct
         # combine's scratch (see ep_fused_moe.DIRECT_MIN); one half's MoE at a time.
         S = (
@@ -1556,16 +1561,11 @@ class FusedMoEKernelModularImpl:
         moe_out = moe_full[:M]
         result = torch.empty_like(hidden_states)
 
-        if _dp_pipe_stream is None:
-            _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
-        side = _dp_pipe_stream
-        cur = torch.cuda.current_stream()
-        side.wait_stream(cur)
         nccl, ncomm = comm.nccl, comm.comm
-        side_s = cudaStream_t(side.cuda_stream)
+        sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
 
-        ag_ev = []
-        for grp in groups:
+        def broadcast(grp, stream) -> None:
+            st = cudaStream_t(stream.cuda_stream)
             nccl.ncclGroupStart()
             for src, dst in zip(local, gath):
                 for root in grp:
@@ -1577,68 +1577,60 @@ class FusedMoEKernelModularImpl:
                         _nccl_dtype(src),
                         root,
                         ncomm,
-                        side_s,
+                        st,
                     )
             nccl.ncclGroupEnd()
-            ev = torch.cuda.Event()
-            ev.record(side)
-            ag_ev.append(ev)
 
-        moe_ev = []
-        for grp, ev in zip(groups, ag_ev):
-            cur.wait_event(ev)
+        def experts(grp) -> None:
             a, b = offs[grp[0]], offs[grp[-1] + 1]
-            if b > a:
-                _, _, N, Kw, top_k = fe.moe_problem_size(
-                    gath[0][a:b], w1, w2, gath[2][a:b]
-                )
-                if self.N > 0:
-                    N, Kw = self.N, self.K
-                workspace13, workspace2, _ = self._allocate_buffers(
-                    hidden_states.dtype,
-                    a1q.device,
-                    b - a,
-                    b - a,
-                    N,
-                    Kw,
-                    top_k,
-                    global_num_experts,
-                    local_num_experts,
-                    None,
-                    activation,
-                )
-                if S:
-                    _ep_mod.direct_scratch = moe_full[M:]
-                fe.apply(
-                    output=moe_out[a:b],
-                    hidden_states=gath[0][a:b],
-                    w1=w1,
-                    w2=w2,
-                    topk_weights=gath[1][a:b],
-                    topk_ids=gath[2][a:b],
-                    activation=activation,
-                    global_num_experts=global_num_experts,
-                    expert_map=expert_map,
-                    a1q_scale=(
-                        a1q_scale[a:b]
-                        if a1q_scale is not None and a1q_scale.numel() > 1
-                        else a1q_scale
-                    ),
-                    a2_scale=fe.a2_scale,
-                    workspace13=workspace13,
-                    workspace2=workspace2,
-                    expert_tokens_meta=None,
-                    apply_router_weight_on_input=False,
-                )
-                if S:
-                    _ep_mod.direct_scratch = None
-            ev = torch.cuda.Event()
-            ev.record(cur)
-            moe_ev.append(ev)
+            if b <= a:
+                return
+            _, _, N, Kw, top_k = fe.moe_problem_size(
+                gath[0][a:b], w1, w2, gath[2][a:b]
+            )
+            if self.N > 0:
+                N, Kw = self.N, self.K
+            workspace13, workspace2, _ = self._allocate_buffers(
+                hidden_states.dtype,
+                a1q.device,
+                b - a,
+                b - a,
+                N,
+                Kw,
+                top_k,
+                global_num_experts,
+                local_num_experts,
+                None,
+                activation,
+            )
+            if S:
+                _ep_mod.direct_scratch = moe_full[M:]
+            fe.apply(
+                output=moe_out[a:b],
+                hidden_states=gath[0][a:b],
+                w1=w1,
+                w2=w2,
+                topk_weights=gath[1][a:b],
+                topk_ids=gath[2][a:b],
+                activation=activation,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                a1q_scale=(
+                    a1q_scale[a:b]
+                    if a1q_scale is not None and a1q_scale.numel() > 1
+                    else a1q_scale
+                ),
+                a2_scale=fe.a2_scale,
+                workspace13=workspace13,
+                workspace2=workspace2,
+                expert_tokens_meta=None,
+                apply_router_weight_on_input=False,
+            )
+            if S:
+                _ep_mod.direct_scratch = None
 
-        sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
-        for grp, ev in zip(groups, moe_ev):
-            side.wait_event(ev)
+        def reduce(grp, stream) -> None:
+            st = cudaStream_t(stream.cuda_stream)
             nccl.ncclGroupStart()
             for root in grp:
                 ch = moe_out[offs[root] : offs[root + 1]]
@@ -1650,9 +1642,46 @@ class FusedMoEKernelModularImpl:
                     sum_op,
                     root,
                     ncomm,
-                    side_s,
+                    st,
                 )
             nccl.ncclGroupEnd()
+
+        if dbo:
+            # Every buffer here was allocated on the compute stream, which waits
+            # for the combine before this returns, so none is freed early.
+            dbo_yield_and_switch_from_compute_to_comm()
+            broadcast(groups[0], torch.cuda.current_stream())
+            dbo_yield_and_switch_from_comm_to_compute()
+            experts(groups[0])
+            dbo_yield_and_switch_from_compute_to_comm()
+            reduce(groups[0], torch.cuda.current_stream())
+            dbo_yield_and_switch_from_comm_to_compute()
+            return result
+
+        if _dp_pipe_stream is None:
+            _dp_pipe_stream = torch.cuda.Stream(device=a1q.device)
+        side = _dp_pipe_stream
+        cur = torch.cuda.current_stream()
+        side.wait_stream(cur)
+
+        ag_ev = []
+        for grp in groups:
+            broadcast(grp, side)
+            ev = torch.cuda.Event()
+            ev.record(side)
+            ag_ev.append(ev)
+
+        moe_ev = []
+        for grp, ev in zip(groups, ag_ev):
+            cur.wait_event(ev)
+            experts(grp)
+            ev = torch.cuda.Event()
+            ev.record(cur)
+            moe_ev.append(ev)
+
+        for grp, ev in zip(groups, moe_ev):
+            side.wait_event(ev)
+            reduce(grp, side)
         _dp_pipe_pending = (side, local, gath, moe_out, result)
         return result
 

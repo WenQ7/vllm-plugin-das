@@ -126,6 +126,10 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
                 "official MRV2 did not initialize the selected HCU PCP manager"
             )
         self._init_host_seq_lens()
+        if self.ubatch_runner is not None:
+            from vllm_hcu.v1.hcu_dbo import install_runner
+
+            install_runner(self)
 
     # ------------------------------------------------------------------
     # Host mirror of num_computed_tokens.
