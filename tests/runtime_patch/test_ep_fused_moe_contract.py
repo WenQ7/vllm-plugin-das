@@ -206,6 +206,8 @@ def test_gathered_route_reduction_does_not_alias_output(output_offset):
         "ep_sorting": lambda *a: (None, None, None, None, rows),
         "_gemm": gemm,
         "ep_swiglustep_quant": lambda *a, q: (q, None),
+        "DIRECT_MIN": 0,
+        "direct_scratch": None,
         "ep_masked_moe_sum": reduce,
         "shared_add_provider": None,
     }

@@ -529,7 +529,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                                sorted_ids, sorted_w, expert_ids, nvalid, compute_type, cfg2,
                                use_mls, out, xoff, workspace13)
             return out
-    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev)
+    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev, avoid=out)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
@@ -580,7 +580,7 @@ def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, exper
           bottom_a_use_mls_load=use_mls, ck_sorting=False, ck_topk=topk,
           scale_bias_with_routed_weight=True)
     # Fallback (scratch overflow) GEMM2 into cache3: exits at once unless gate[1] > 0.
-    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev)
+    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev, avoid=out)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, gate[1:2], 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
@@ -592,7 +592,6 @@ def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, exper
 
 
 def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, w1_scale, w2_scale,
-                     **kw):
                      **kw):
     global _announced
     if not _announced:

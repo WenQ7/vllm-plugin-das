@@ -1,0 +1,116 @@
+From 684a73fcddb8b18f3c0a7414bf654eccbf3843c3 Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Mon, 12 Oct 2026 03:14:02 +0800
+Subject: [PATCH 1/5] step5: DSA indexer q/k/z/w projection inside the qkvg fp8
+ GEMM
+
+VLLM_HCU_STEP5_QKV_INDEXER=1: the indexer's 1540 projection rows per rank are
+appended to the fused qkvg weight before fp8 quantization, so the 23 DSA layers
+run one W8A8 GEMM (N 3584 -> 5120) instead of the fp8 qkvg GEMM plus the bf16
+indexer GEMM (M=64: 25.9 vs 39.0 us). Step4Indexer.pre_projected makes
+_project take the qkvg column view instead of hidden_states.
+
+bs32 64k/4k: prefill ~13210 -> ~13377 tok/s, decode ~1487 -> 1480-1509.
+Prompt NLL 0.6506 (base 0.6501); long-context tail NLL ~+0.001.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index cb28528..c357993 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -3797,6 +3797,11 @@ class Step4Indexer:
+         num_attention_heads: int,
+     ) -> None:
+         self.owner = owner
++        # Set by the owner when its own projection GEMM also produces the
++        # indexer's q | k | z | w columns (Step5 VLLM_HCU_STEP5_QKV_INDEXER):
++        # forward then receives that [tokens, 1540]-wide view instead of
++        # hidden_states, and _project skips its GEMM.
++        self.pre_projected = False
+         self.geometry = geometry
+         self.state = state
+         self.slot = dsa_slot
+@@ -3986,11 +3991,11 @@ class Step4Indexer:
+         proxy = self.geometry.proxy_dim
+ 
+         q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(hidden_states.dtype)
+-        merged = self._merged_projection(hidden_states.dtype)
+-        if merged is not None:
++        merged = None if self.pre_projected else self._merged_projection(hidden_states.dtype)
++        if merged is not None or self.pre_projected:
+             # One GEMM for q | k | z | w; the outputs are column views of it.
+             nq = self.num_heads * proxy
+-            out = F.linear(hidden_states, merged)
++            out = hidden_states if self.pre_projected else F.linear(hidden_states, merged)
+             index_q = out[:, :nq]
+             index_k = out[:, nq : nq + proxy]
+             index_z = out[:, nq + proxy : nq + 2 * proxy]
+@@ -4031,7 +4036,7 @@ class Step4Indexer:
+             # norm's store makes that idempotent pass skippable (q_prerounded).
+             round_q=True,
+             # Row-strided z is fine: the summary kernels take its row stride.
+-            contiguous_z=merged is None,
++            contiguous_z=raw_weights is None,
+         )
+ 
+         # Round the fp32 weight to the activation dtype *before* the GEMM and
+diff --git a/model_executor/models/step5_text.py b/model_executor/models/step5_text.py
+index fffc761..b5ecb1a 100644
+--- a/model_executor/models/step5_text.py
++++ b/model_executor/models/step5_text.py
+@@ -161,6 +161,10 @@ FUSED_ROUTER_SHARED = (
+ # shared expert (fused into the router kernel), router, indexer, eh_proj and
+ # lm_head stay bf16.
+ FP8_DENSE = os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
++# DSA layers: the indexer's q | k | z | w projection (1540 rows per TP4 rank)
++# appended to the fused qkvg weight, so one fp8 W8A8 GEMM replaces the fp8
++# qkvg GEMM plus the indexer's bf16 GEMM. Needs FP8_DENSE and the fused qkvg.
++QKV_INDEXER = os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
+ 
+ # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
+ # load time, the scheme of the other layers' checkpoint experts, so they run the
+@@ -718,7 +722,26 @@ class Step5Attention(nn.Module):
+     def _quantize_qkvg(self) -> None:
+         from vllm.models.step5.nvidia.ops.fp8_dense import quantize_weight_fp8
+ 
+-        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(self.qkvg_weight)
++        w = self.qkvg_weight
++        if QKV_INDEXER and self.indexer is not None:
++            # [q; k; z; w] as in Step4Indexer._merged_projection (w rounded to
++            # bf16 first), stored [out, in]; qkvg_weight is [in, out].
++            parts = (
++                self.sparse_indexer_q.weight,
++                self.sparse_indexer_k.weight,
++                self.sparse_indexer_z.weight,
++                self.sparse_indexer_w.weight.to(w.dtype),
++            )
++            idx = torch.cat([t.detach().to(w.dtype) for t in parts], 0)
++            self.idx_off = w.shape[1]
++            self.idx_n = idx.shape[0]
++            w = torch.cat([w, idx.t()], 1)
++            self.indexer.pre_projected = True
++            for lin in (
++                self.sparse_indexer_q, self.sparse_indexer_k, self.sparse_indexer_z
++            ):
++                _free_weight(lin.weight)
++        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(w)
+         self.qkvg_weight = None
+         _free_weight(self.qkv_proj.weight)
+         _free_weight(self.g_proj.weight)
+@@ -762,8 +785,13 @@ class Step5Attention(nn.Module):
+             q, k = self.rotary_emb(positions, q, k)
+         if self.indexer is not None:
+             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
+-            # reads. It needs hidden_states, which Attention.forward never sees.
+-            self.indexer.forward(hidden_states, positions)
++            # reads. It needs hidden_states, which Attention.forward never sees
++            # (or, with QKV_INDEXER, its projection's columns of qkvg).
++            if self.indexer.pre_projected:
++                idx = qkvg[..., self.idx_off : self.idx_off + self.idx_n]
++                self.indexer.forward(idx, positions)
++            else:
++                self.indexer.forward(hidden_states, positions)
+         attn_output = self.attn(q, k, v)
+         return self._gate_o_proj(attn_output, extra_dims, hidden_states)
+ 

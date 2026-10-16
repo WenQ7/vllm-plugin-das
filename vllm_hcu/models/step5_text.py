@@ -292,6 +292,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         """Compute ``mlp``'s gate_up + SwigluStep together with the logits for
         decode-sized inputs; ``mlp.forward`` on the same input picks it up."""
         from vllm_hcu.ops.step5.router_gemm import (
+            RSG_MAX_M,
             make_router_shared_workspace,
             router_shared_swiglustep,
         )
@@ -299,6 +300,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
         assert mlp.limit is not None
         # A list, not an attribute: keep the MLP out of this module's children.
         self._fused_shared = [mlp]
+        mlp.enable_fused_router_shared(RSG_MAX_M)
         self._rsg = router_shared_swiglustep
         if self.weight.is_cuda:
             self._rsg_workspace = make_router_shared_workspace(
@@ -483,6 +485,7 @@ class Step5MLP(nn.Module):
         # buffers holding the same values. The stream check rejects a stale
         # entry when the shared expert runs on the aux stream before the router.
         self.fused_act: tuple[int, torch.Size, torch.Tensor] | None = None
+        self._fused_router_shared_max_m: int | None = None
         self.limit = None
         layer_idx = extract_layer_index(prefix)
         swiglu_limits_shared = getattr(config, "swiglu_limits_shared", None)
@@ -494,6 +497,20 @@ class Step5MLP(nn.Module):
         ):
             self.limit = swiglu_limits_shared[layer_idx]
             self.act_fn = SwigluStepAndMul(limit=self.limit)
+
+    def enable_fused_router_shared(self, max_m: int) -> None:
+        """Keep short fused-router batches on the stream that made the act."""
+        self._fused_router_shared_max_m = max_m
+
+    def requires_main_stream_for_fused_activation(
+        self, hidden_states: torch.Tensor
+    ) -> bool:
+        max_m = getattr(self, "_fused_router_shared_max_m", None)
+        return (
+            max_m is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] <= max_m
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         fused, self.fused_act = self.fused_act, None

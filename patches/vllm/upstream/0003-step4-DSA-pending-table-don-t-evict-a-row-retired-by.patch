@@ -1,0 +1,44 @@
+From 6a9ad969083377bd0c4d676386be7f5b6a17da8b Mon Sep 17 00:00:00 2001
+From: yaoyuping <yaoyuping@hygon.cn>
+Date: Tue, 13 Oct 2026 18:51:52 +0800
+Subject: [PATCH 3/5] step4 DSA pending table: don't evict a row retired by the
+ previous step first
+
+Retired rows (regions closed on draft tokens) were aged 2^40 steps into the
+past, so they were always recycled before any other row. Finished requests
+never release their last tail row, so once ~2*max_num_seqs requests had
+finished the dead rows filled the table and the only retired rows left were
+the previous step's; the next acquire() recycled one before its owner
+rolled back into it -> 'no pending tokens for region slot' (EngineDead at
+TP4DP2 8000x64 MTP3 after ~100 requests per DP). Now a row retired by the
+previous step ages like a normal touch, so dead rows go first.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/model_executor/layers/step4_dsa.py b/model_executor/layers/step4_dsa.py
+index c91472b..6d51f01 100644
+--- a/model_executor/layers/step4_dsa.py
++++ b/model_executor/layers/step4_dsa.py
+@@ -2420,12 +2420,20 @@ class Step4PendingTable:
+             self._touched[row] = self.step - (1 << 40)
+ 
+     def _free_row(self) -> int:
++        # A row retired by the previous step is still live: the rollback that
++        # needs it is only seen this step, possibly after some other request's
++        # acquire() got here first. Age it like a normal touch; only rows
++        # retired earlier than that are dead and go first.
++        fresh_retired = self.step - 1 - (1 << 40)
+         oldest_row, oldest_step = -1, self.step
+         for row in range(self.capacity):
+             if self._slot_of_row[row] < 0:
+                 return row
+-            if self._touched[row] < oldest_step:
+-                oldest_row, oldest_step = row, self._touched[row]
++            touched = self._touched[row]
++            if touched >= fresh_retired and touched < 0:
++                touched += 1 << 40
++            if touched < oldest_step:
++                oldest_row, oldest_step = row, touched
+         if oldest_row < 0:
+             raise RuntimeError(
+                 f"Step-4 DSA: all {self.capacity} pending region buffers are in use "

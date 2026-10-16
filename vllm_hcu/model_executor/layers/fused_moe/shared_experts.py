@@ -155,10 +155,32 @@ class SharedExperts(torch.nn.Module):
             and parallel_config.all2all_backend != "allgather_reducescatter"
         ) or parallel_config.use_fi_nvl_two_sided_kernels
 
+    def _requires_main_stream_for_fused_activation(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        """Return whether a producer left an activation on the main stream."""
+        layer = getattr(self, "_layer", None)
+        requires_main_stream = getattr(
+            layer,
+            "requires_main_stream_for_fused_activation",
+            None,
+        )
+        return bool(requires_main_stream(hidden_states)) if callable(
+            requires_main_stream
+        ) else False
+
     def _determine_shared_experts_order(
         self,
         hidden_states: torch.Tensor,
     ) -> SharedExpertsOrder:
+        # A fused router can produce the shared gate_up + activation on the
+        # current stream before the runner invokes this layer. Running the
+        # shared expert on the auxiliary stream would fail the stream handoff
+        # check and recompute both operations, so serialize this short path.
+        if self._requires_main_stream_for_fused_activation(hidden_states):
+            return SharedExpertsOrder.NO_OVERLAP
+
         force_stream = bool(
             henvs.VLLM_HCU_USE_CUSTOM_OPS
             and (
