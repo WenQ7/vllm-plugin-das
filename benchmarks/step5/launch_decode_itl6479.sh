@@ -16,5 +16,6 @@ export STEP5_TOKENIZER="${STEP5_TOKENIZER:-/opt/xuwq_step5_new_20261018/tokenize
 export STEP5_STATE_DIR="${STEP5_STATE_DIR:-/var/lib/xuwq_step5_itl6479_native}"
 export STEP5_CACHE_DIR="${STEP5_CACHE_DIR:-/var/cache/xuwq_step5}"
 export STEP5_DECODE_PROFILE=itl6479
-export STEP5_DECODE_PLACEMENT="${STEP5_DECODE_PLACEMENT:-$repo_root/benchmarks/step5/assets/expert_placement_decode_real_c64_ep16.pt}"
+: "${STEP5_DECODE_PLACEMENT:?Set STEP5_DECODE_PLACEMENT to the external Decode placement .pt file}"
+export STEP5_DECODE_PLACEMENT
 exec bash "$repo_root/benchmarks/step5/launch_multinode.sh" decode "$rank"

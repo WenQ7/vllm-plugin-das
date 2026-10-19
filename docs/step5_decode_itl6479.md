@@ -27,8 +27,8 @@ ITL是相邻流式chunk的间隔；等效TPOT为23.1585ms，二者口径不同�
   `VLLM_HCU_DP_PACKED_AG=1`显式启用，默认关闭；已有单节点IPC路径优先。
 - `router_gemm.py`：`HCU_STEP5_ROUTER_SHARED_MAX_M=32`限制路由/共享激活融合范围，
   默认仍为64。共享专家沿用已有`HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=64`配置。
-- 专家映射位于`benchmarks/step5/assets/expert_placement_decode_real_c64_ep16.pt`，
-  shape为[88,352]，由本次真实Decode路由统计拟合。它与原先缺失的
+- 专家映射`expert_placement_decode_real_c64_ep16.pt`是外部运行资产，不纳入源码仓库。
+  性能资料包将其放在`assets/`，shape为[88,352]，由本次真实Decode路由统计拟合。它与原先缺失的
   `expert_placement_prefill.pt`是不同文件。
 
 ## 原生启动
@@ -37,10 +37,12 @@ ITL是相邻流式chunk的间隔；等效TPOT为23.1585ms，二者口径不同�
 # 在xuwq_vllm_1017容器内，每节点分别运行rank0/1/2/3。
 export STEP5_STATE_DIR=/var/lib/xuwq_step5_itl6479_native
 export STEP5_TOKENIZER=/opt/xuwq_step5_new_20261018/tokenizer-bytelevel
+export STEP5_DECODE_PLACEMENT=/opt/xuwq_step5_itl6479_native/assets/expert_placement_decode_real_c64_ep16.pt
 bash benchmarks/step5/launch_decode_itl6479.sh 0
 ```
 
 启动入口通过插件已有checkpoint loader加载上述PT映射，启用打包AG并设置融合上限。
+四节点容器必须均能读取`STEP5_DECODE_PLACEMENT`指定的文件；未指定时脚本直接报错。
 无需worker extension、RPC注入或另行安装优化库。权重、缓存和日志应放在数据盘支撑的目录。
 
 **验证范围：64.79ms来自此前运行时扩展方案。原生版保留相同算法和参数，

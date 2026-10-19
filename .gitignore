@@ -223,6 +223,8 @@ benchmarks/**/*.json
 # Reviewed Step5 launch configuration and aggregate measurements (no dataset).
 !benchmarks/step5/ep_table_decode_candidate.json
 !benchmarks/step5/results-20261019.json
+# Calibrated expert-placement tensors are external runtime artifacts.
+benchmarks/step5/assets/*.pt
 
 # Linting
 actionlint
