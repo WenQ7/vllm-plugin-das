@@ -138,6 +138,13 @@ _DSA_INDEXER_SUBSTRINGS = (
 # Escape hatch back to the pre-DSA dense path, for A/B against this backend.
 DISABLE_DSA = is_dsa_disabled()
 
+# Apply placement while checkpoint tensors stream through the plugin loader.
+EXPERT_PLACEMENT = os.environ.get("VLLM_STEP5_EXPERT_PLACEMENT", "")
+_PLACED_TENSOR = re.compile(
+    r"layers\.(\d+)\.moe\.(?:(?:gate|up|down)_proj\.weight(?:_scale(?:_inv)?)?"
+    r"|gate\.weight|router_bias)$"
+)
+
 # Run qkv_proj and g_proj as one GEMM. Both weights become column views of one
 # [hidden, qkv + heads] buffer, so the loaders fill it in place and no
 # post-load step is needed (AutoWeightsLoader may call load_weights twice).
@@ -167,6 +174,11 @@ FUSED_ROUTER_SHARED = henvs.optional_custom_op_enabled(
 # lm_head stay bf16.
 FP8_DENSE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FP8_DENSE", "0") == "1"
+)
+
+# Append DSA q/k/z/w rows to the fused channel-FP8 QKV/gate projection.
+QKV_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_QKV_INDEXER", "0") == "1"
 )
 
 # Quantize the bf16 routed experts (layers 88-90) to fp8 per output channel at
@@ -213,6 +225,42 @@ def _unignore_bf16_experts(quant_config: QuantizationConfig | None) -> None:
     if len(kept) != len(ignore):
         logger.info_once("step5: quantizing the bf16 routed experts to fp8")
     quant_config.ignore = kept
+
+
+def _place_experts(
+    weights: Iterable[tuple[str, torch.Tensor]], moe_layer_ids: list[int]
+) -> Iterable[tuple[str, torch.Tensor]]:
+    """EXPERT_PLACEMENT: index dim 0 of each packed expert tensor and of the
+    router weight/bias with the layer's physical-to-logical map. Done on the
+    stream rather than on the loaded parameters because load_weights may run
+    more than once over parts of the checkpoint."""
+    physical_to_logical = torch.load(
+        EXPERT_PLACEMENT, map_location="cpu", weights_only=True
+    )["physical_to_logical_map"]
+    if (
+        physical_to_logical.ndim != 2
+        or physical_to_logical.shape[0] != len(moe_layer_ids)
+        or physical_to_logical.shape[1] == 0
+        or physical_to_logical.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("Step5 expert placement must be an integer [MoE layers, experts] map")
+    physical_to_logical = physical_to_logical.to(torch.int64)
+    identity = torch.arange(physical_to_logical.shape[1])
+    for row in physical_to_logical:
+        if not torch.equal(row.sort().values, identity):
+            raise ValueError("Step5 expert placement row is not a permutation")
+    rows = dict(zip(moe_layer_ids, physical_to_logical))
+    logger.info_once("step5: expert placement loaded from %s", EXPERT_PLACEMENT)
+    for name, w in weights:
+        if ".moe.experts." in name:
+            raise ValueError("Step5 expert placement needs packed experts")
+        m = _PLACED_TENSOR.search(name)
+        if m is not None and int(m.group(1)) in rows:
+            row = rows[int(m.group(1))]
+            if w.ndim == 0 or w.shape[0] != row.numel():
+                raise ValueError(f"Step5 expert placement shape mismatch: {name} {w.shape}")
+            w = w[row.to(w.device)]
+        yield name, w
 
 
 def _quantize_bf16_experts(
@@ -792,7 +840,26 @@ class Step5Attention(nn.Module):
     def _quantize_qkvg(self) -> None:
         from vllm_hcu.ops.step5.fp8_dense import quantize_weight_fp8
 
-        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(self.qkvg_weight)
+        w = self.qkvg_weight
+        if QKV_INDEXER and self.indexer is not None:
+            # [q; k; z; w] as in Step4Indexer._merged_projection (w rounded to
+            # bf16 first), stored [out, in]; qkvg_weight is [in, out].
+            parts = (
+                self.sparse_indexer_q.weight,
+                self.sparse_indexer_k.weight,
+                self.sparse_indexer_z.weight,
+                self.sparse_indexer_w.weight.to(w.dtype),
+            )
+            idx = torch.cat([t.detach().to(w.dtype) for t in parts], 0)
+            self.idx_off = w.shape[1]
+            self.idx_n = idx.shape[0]
+            w = torch.cat([w, idx.t()], 1)
+            self.indexer.pre_projected = True
+            for lin in (
+                self.sparse_indexer_q, self.sparse_indexer_k, self.sparse_indexer_z
+            ):
+                _free_weight(lin.weight)
+        self.qkvg_wq, self.qkvg_ws = quantize_weight_fp8(w)
         self.qkvg_weight = None
         _free_weight(self.qkv_proj.weight)
         _free_weight(self.g_proj.weight)
@@ -840,8 +907,13 @@ class Step5Attention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
-            # reads. It needs hidden_states, which Attention.forward never sees.
-            self.indexer.forward(hidden_states, positions)
+            # reads. It needs hidden_states, which Attention.forward never sees
+            # (or, with QKV_INDEXER, its projection's columns of qkvg).
+            if self.indexer.pre_projected:
+                idx = qkvg[..., self.idx_off : self.idx_off + self.idx_n]
+                self.indexer.forward(idx, positions)
+            else:
+                self.indexer.forward(hidden_states, positions)
         attn_output = self.attn(q, k, v)
         return self._gate_o_proj(attn_output, extra_dims, hidden_states)
 
@@ -1426,6 +1498,13 @@ class Step5Model(nn.Module):
         )
 
         disable_moe_stacked_params = [data[1] for data in expert_params_mapping]
+        if EXPERT_PLACEMENT:
+            if get_pp_group().world_size != 1:
+                raise ValueError("Step5 expert placement requires PP=1")
+            weights = _place_experts(
+                weights,
+                [i for i, layer in enumerate(self.layers) if layer.use_moe],
+            )
         if FP8_BF16_MOE:
             weights = _quantize_bf16_experts(weights)
 

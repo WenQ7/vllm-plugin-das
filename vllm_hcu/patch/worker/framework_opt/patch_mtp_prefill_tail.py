@@ -101,6 +101,17 @@ def _trim(self, input_batch, last_hidden_states, dp_sync):
         positions=input_batch.positions[gidx],
         max_query_len=int(n.max()),
     )
+    # Clean vLLM batches carry the HCU mirrors as dynamic attributes, so
+    # dataclasses.replace does not preserve them. The retained tail ends at
+    # the same sequence position; its computed prefix grows by the dropped
+    # query tokens. Keep this metadata on the plugin-owned path as well.
+    seq_lens_cpu = getattr(input_batch, "seq_lens_cpu", None)
+    new_batch.seq_lens_cpu = seq_lens_cpu
+    new_batch.num_computed_tokens_cpu = (
+        seq_lens_cpu - torch.from_numpy(n.astype(np.int32))
+        if seq_lens_cpu is not None else None
+    )
+    new_batch.block_tables_np = getattr(input_batch, "block_tables_np", None)
     if dp_sync is not None:
         across = dp_sync.num_tokens_across_dp.clone()
         across[self.dp_rank] = total

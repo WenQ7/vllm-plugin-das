@@ -214,21 +214,30 @@ def _patch_slicing() -> None:
         stop = ubatch_slice.request_slice.stop
         qlens = np.diff(ub.query_start_loc_np).astype(np.int32)
         upd = {"max_query_len": int(qlens.max(initial=0))}
-        if input_batch.seq_lens_cpu is not None:
+        mirrors = {}
+        if getattr(input_batch, "seq_lens_cpu", None) is not None:
             seq_lens = input_batch.seq_lens_cpu[start:stop].clone()
             # Same truncation as _slice_seq_lens: only tokens past this
             # microbatch's end are missing from the straddling request.
             cut = int(input_batch.query_start_loc_np[stop]) - ubatch_slice.token_slice.stop
             if cut > 0:
                 seq_lens[-1] -= cut
-            upd["seq_lens_cpu"] = seq_lens
-            upd["num_computed_tokens_cpu"] = seq_lens - torch.from_numpy(qlens)
+            mirrors["seq_lens_cpu"] = seq_lens
+            mirrors["num_computed_tokens_cpu"] = seq_lens - torch.from_numpy(qlens)
         else:
-            upd["seq_lens_cpu"] = None
-            upd["num_computed_tokens_cpu"] = None
-        if input_batch.block_tables_np is not None:
-            upd["block_tables_np"] = tuple(t[start:stop] for t in input_batch.block_tables_np)
-        return dataclasses.replace(ub, **upd)
+            mirrors["seq_lens_cpu"] = None
+            mirrors["num_computed_tokens_cpu"] = None
+        tables = getattr(input_batch, "block_tables_np", None)
+        mirrors["block_tables_np"] = (
+            tuple(t[start:stop] for t in tables) if tables is not None else None
+        )
+        # The clean vLLM InputBatch dataclass has no HCU host-mirror fields.
+        # Attach them after replacement, as HcuGPUModelRunnerV2 does, rather
+        # than requiring a source-patched upstream dataclass constructor.
+        ub = dataclasses.replace(ub, **upd)
+        for name, value in mirrors.items():
+            setattr(ub, name, value)
+        return ub
 
     _slice_input_batch._hcu_dbo = True
     uu._slice_input_batch = _slice_input_batch
@@ -247,7 +256,7 @@ def install_runner(runner) -> None:
         if (
             runner._hsl_enabled
             and input_batch is runner._hsl_batch
-            and input_batch.seq_lens_cpu is None
+            and getattr(input_batch, "seq_lens_cpu", None) is None
         ):
             runner._hsl_resolve()
             runner._hsl_attach(input_batch)
@@ -287,7 +296,9 @@ def _noop() -> None:
 
 
 def _patch_dsa() -> None:
-    mod = sys.modules.get("vllm.model_executor.layers.step4_dsa")
+    # Step5 registers its plugin-owned DSA backend directly. There is no
+    # requirement for a corresponding module in the installed vLLM tree.
+    mod = sys.modules.get("vllm_hcu.model_executor.layers.step4_dsa")
     if mod is None:
         return
     state_cls = mod.Step4DSAState

@@ -68,6 +68,7 @@ from vllm_hcu.model_executor.layers.step4_dsa_kernels import (
     indexer_logits,
     indexer_norm_rope,
     merge_split_states,
+    prefill_indexer_logits,
     prefill_sparse_meta,
     round_activations_e4m3,
     sparse_attention_decode,
@@ -143,6 +144,13 @@ DENSE_EQUIV = os.environ.get("VLLM_STEP4_DSA_DENSE_EQUIV", "0") == "1"
 # freed immediately, which is why the default is still 0; set
 # VLLM_STEP4_DSA_Q_CHUNK to a positive token count to trade it back.
 INDEXER_Q_CHUNK = int(os.environ.get("VLLM_STEP4_DSA_Q_CHUNK", "0"))
+
+# Prefill indexer scoring through ``prefill_indexer_logits`` (causal tile skip, fp8
+# MFMA on the already-e4m3 q and summary keys) instead of the bf16 full-rectangle
+# ``indexer_logits``. 0 restores the old path, e.g. to bisect a selection change.
+PREFILL_FP8_INDEXER = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_STEP4_DSA_PREFILL_FP8_INDEXER", "1") == "1"
+)
 
 # Decode score width, in regions, for the CUDA-graph-captured path. A graph
 # replays the launch arguments it recorded, so the [rows, regions] score tensor
@@ -2450,18 +2458,28 @@ class Step4PendingTable:
         the whole region by the closing step) must survive until that is known,
         so it stays readable through get() and is only recycled -- oldest
         retirement first, ahead of every live row -- when a row is needed.
+        Rows retired in the previous step retain their normal age until the
+        next schedule has had a chance to protect a speculative rollback.
         """
         row = self._row_of_slot.get(slot)
         if row is not None:
             self._touched[row] = self.step - (1 << 40)
 
     def _free_row(self) -> int:
+        # A row retired by the previous step is still live: the rollback that
+        # needs it is only seen this step, possibly after some other request's
+        # acquire() got here first. Age it like a normal touch; only rows
+        # retired earlier than that are dead and go first.
+        fresh_retired = self.step - 1 - (1 << 40)
         oldest_row, oldest_step = -1, self.step
         for row in range(self.capacity):
             if self._slot_of_row[row] < 0:
                 return row
-            if self._touched[row] < oldest_step:
-                oldest_row, oldest_step = row, self._touched[row]
+            touched = self._touched[row]
+            if touched >= fresh_retired and touched < 0:
+                touched += 1 << 40
+            if touched < oldest_step:
+                oldest_row, oldest_step = row, touched
         if oldest_row < 0:
             raise RuntimeError(
                 f"Step-4 DSA: all {self.capacity} pending region buffers are in use "
@@ -3885,6 +3903,11 @@ class Step4Indexer:
         num_attention_heads: int,
     ) -> None:
         self.owner = owner
+        # Set by the owner when its own projection GEMM also produces the
+        # indexer's q | k | z | w columns (Step5 VLLM_HCU_STEP5_QKV_INDEXER):
+        # forward then receives that [tokens, 1540]-wide view instead of
+        # hidden_states, and _project skips its GEMM.
+        self.pre_projected = False
         self.geometry = geometry
         self.state = state
         self.slot = dsa_slot
@@ -4074,11 +4097,11 @@ class Step4Indexer:
         proxy = self.geometry.proxy_dim
 
         q_norm_w, k_norm_w, k_norm_b, w_weight = self._cast_params(hidden_states.dtype)
-        merged = self._merged_projection(hidden_states.dtype)
-        if merged is not None:
+        merged = None if self.pre_projected else self._merged_projection(hidden_states.dtype)
+        if merged is not None or self.pre_projected:
             # One GEMM for q | k | z | w; the outputs are column views of it.
             nq = self.num_heads * proxy
-            out = F.linear(hidden_states, merged)
+            out = hidden_states if self.pre_projected else F.linear(hidden_states, merged)
             index_q = out[:, :nq]
             index_k = out[:, nq : nq + proxy]
             index_z = out[:, nq + proxy : nq + 2 * proxy]
@@ -4119,7 +4142,7 @@ class Step4Indexer:
             # norm's store makes that idempotent pass skippable (q_prerounded).
             round_q=True,
             # Row-strided z is fine: the summary kernels take its row stride.
-            contiguous_z=merged is None,
+            contiguous_z=raw_weights is None,
         )
 
         # Round the fp32 weight to the activation dtype *before* the GEMM and
@@ -4497,7 +4520,17 @@ class Step4Indexer:
             )
         prefill_logits = None
         if md.num_prefills > 0:
-            prefill_logits = torch.zeros(
+            # Only columns below a row's causal horizon are ever read by the
+            # selector and the scorer writes all of them, so the zero fill is a
+            # dead 128-256 MB store per layer -- except under DENSE_EQUIV, which
+            # relies on the zeros, and the old path with Q chunking (also fine,
+            # kept zeroed for bisecting).
+            alloc = (
+                torch.empty
+                if PREFILL_FP8_INDEXER and not DENSE_EQUIV and INDEXER_Q_CHUNK == 0
+                else torch.zeros
+            )
+            prefill_logits = alloc(
                 (groups * num_prefill_tokens, max(width_prefill, 1)),
                 dtype=torch.float32,
                 device=device,
@@ -4509,11 +4542,28 @@ class Step4Indexer:
             # a paging/metadata bug and nothing else.
             return prefill_logits, decode_logits, max(width_decode, width_prefill)
 
+        prefill_q8 = None
         for plan in sched.requests:
             if plan.nscore == 0:
                 continue
-            keys = summary[plan.score_slots].to(index_q.dtype)
             decode = plan.row < num_decodes
+            if PREFILL_FP8_INDEXER and not decode and INDEXER_Q_CHUNK == 0:
+                if prefill_q8 is None:
+                    # One cast for all prefill rows; exact, q is already e4m3-valued.
+                    prefill_q8 = index_q[num_decode_tokens:].to(torch.float8_e4m3fn)
+                first = plan.tok_start - num_decode_tokens
+                prefill_indexer_logits(
+                    prefill_q8[first : first + plan.qlen],
+                    weights[plan.tok_start : plan.tok_start + plan.qlen],
+                    summary[plan.score_slots],
+                    first_position=plan.past,
+                    region_size=REGION_BLOCK_SIZE,
+                    out=prefill_logits,
+                    out_row_base=first,
+                    out_group_stride=num_prefill_tokens,
+                )
+                continue
+            keys = summary[plan.score_slots].to(index_q.dtype)
             out = decode_logits if decode else prefill_logits
             stride = num_decodes if decode else num_prefill_tokens
             base = plan.row if decode else plan.tok_start - num_decode_tokens
