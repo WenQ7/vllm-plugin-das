@@ -338,6 +338,9 @@ class FP32ReplicatedLinear(ReplicatedLinear):
 class BF16FP32RouterLinear(ReplicatedLinear):
     """Router with a bf16 weight and fp32 logits (see ``BF16_ROUTER``)."""
 
+    # The second result is an activation, unlike ReplicatedLinear's extra bias.
+    returns_fused_shared_activation = True
+
     def __init__(self, input_size: int, output_size: int, prefix: str = ""):
         super().__init__(
             input_size,
@@ -588,6 +591,16 @@ class Step5MLP(nn.Module):
             max_m is not None
             and hidden_states.ndim == 2
             and hidden_states.shape[0] <= max_m
+        )
+
+    def cache_fused_router_activation(
+        self, hidden_states: torch.Tensor, activation: torch.Tensor
+    ) -> None:
+        """Consume the explicit router result in the internal MoE path."""
+        self.fused_act = (
+            torch.cuda.current_stream().cuda_stream,
+            hidden_states.shape,
+            activation,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

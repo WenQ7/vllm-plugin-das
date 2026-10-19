@@ -1312,7 +1312,19 @@ class MoERunner(MoERunnerInterface):
                 self._maybe_fuse_gate_weights()
                 router_logits = F.linear(hidden_states, self._combined_gate_weight)
             else:
-                router_logits, _ = self.gate(hidden_states)
+                router_logits, gate_aux = self.gate(hidden_states)
+                if gate_aux is not None and getattr(
+                    self.gate, "returns_fused_shared_activation", False
+                ):
+                    shared_layer = (
+                        self._shared_experts._layer
+                        if self._shared_experts is not None else None
+                    )
+                    receive_activation = getattr(
+                        shared_layer, "cache_fused_router_activation", None
+                    )
+                    if callable(receive_activation):
+                        receive_activation(hidden_states, gate_aux)
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
