@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Native plugin integration of the 64.79ms candidate; four-node retest pending.
+# Native C64/MTP3 profile; the effective EP16 table is checked before startup.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 rank="${1:-}"

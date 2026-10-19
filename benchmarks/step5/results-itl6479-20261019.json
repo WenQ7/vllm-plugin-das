@@ -61,6 +61,55 @@
     "finalize_overlap": false
   },
   "excluded_experiments": "63.188ms was a later warmup only; its formal round was interrupted by p5c4 reboot. Neither is included in this result.",
-  "current_cluster": "Benchmark processes stopped on p5c1-3; p5c4 rebooted and /data is unmounted. Four-node normal service cannot be restored before storage recovery. Reboot cause unconfirmed.",
-  "native_integration_status": "Integrated into vllm_hcu; native four-node end-to-end performance retest pending p5c4 storage recovery"
+  "current_cluster": "p5c4 /data/container recovered. All owned review diagnostics and model services stopped; prior native formal retest failed performance parity.",
+  "native_integration_status": "Performance restored after correcting deployment E22 table: native formal64.5636ms/2785.1913tps. ITL<60ms still pending.",
+  "native_retest": {
+    "commit": "ae60f22bedd28143a976e851246b8bf1ccf25a16",
+    "parallel": "DP4TP4EP16",
+    "input_tokens": 65536,
+    "output_tokens": 4096,
+    "concurrency": 64,
+    "mtp_tokens": 3,
+    "itl_ms": 114.33022837203234,
+    "decode_tps": 1571.6222999207891,
+    "itl_p99_ms": 120.76744750258511,
+    "complete_requests": 64,
+    "preemptions": 0,
+    "jit_events": 0,
+    "cache_updates": 0,
+    "historical_reproduction": {
+      "itl_ms": 64.815687128228,
+      "decode_tps": 2774.0949637899653,
+      "itl_p99_ms": 70.39563964586705
+    },
+    "parity_passed": false,
+    "regression_root_cause": "Not yet established",
+    "runtime_config_fidelity": false,
+    "effective_table_issue": "E44-only D5 table in incorrectly constructed incremental deployment archive; Git ae60 already contains E22."
+  },
+  "native_e22_retest": {
+    "measured_at": "2026-10-20",
+    "base_python_commit": "ae60f22bedd28143a976e851246b8bf1ccf25a16",
+    "only_change": "Effective MoE table changed to exactGit E22 table",
+    "table_sha256": "a3a65756f57d8d95fdb4462e31112a3834ce342e6711253642b0775094314844",
+    "parallel": "DP4TP4EP16",
+    "input_tokens": 65536,
+    "output_tokens": 4096,
+    "concurrency": 64,
+    "mtp_tokens": 3,
+    "strict_fa_dsa": true,
+    "worker_extension": false,
+    "full_warmup_itl_ms": 65.02239797715816,
+    "formal_itl_ms": 64.56359897622431,
+    "formal_itl_p99_ms": 69.55293906852603,
+    "decode_tps": 2785.191273954527,
+    "prefill_tps_same_decode_instance": 23718.382685156485,
+    "complete_requests": 64,
+    "preemptions": 0,
+    "jit_events": 0,
+    "cache_updates": 0,
+    "acceptance": 0.6019530805147477,
+    "regression_restored": true,
+    "under60ms": false
+  }
 }

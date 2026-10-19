@@ -17,7 +17,8 @@ model_dir="${STEP5_MODEL_DIR:-/data/model/Step5-Channel-FP8-w8a8}"
 export PYTHONPATH="$source_dir${PYTHONPATH:+:$PYTHONPATH}"
 export EP_FUSED_MOE_TABLE="${STEP5_EP_TABLE:-$source_dir/vllm_hcu/model_executor/layers/fused_moe/ep_table.json}"
 export HOME="$STEP5_STATE_DIR/$phase/home"
-export TMPDIR="$STEP5_STATE_DIR/tmp"
+# ZMQ appends a UUID to TMPDIR for Unix sockets (107-byte path limit).
+export TMPDIR="${STEP5_TMP_DIR:-/var/tmp/xuwq_step5}"
 export XDG_CACHE_HOME="${STEP5_CACHE_DIR:-$STEP5_STATE_DIR/cache}"
 export HF_HOME="$XDG_CACHE_HOME/huggingface"
 export VLLM_CACHE_ROOT="$XDG_CACHE_HOME/vllm"
@@ -67,10 +68,15 @@ if [[ "$phase" == prefill ]]; then
     export NCCL_MAX_NCHANNELS=32
 else
     tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
+    if [[ -n "${STEP5_DECODE_NCCL_CHANNELS:-}" ]]; then
+        case "$STEP5_DECODE_NCCL_CHANNELS" in 1|2|4|8|16|32|64) ;; *) printf 'Unsupported Decode NCCL channel count\n' >&2; exit 2 ;; esac
+        export NCCL_MIN_NCHANNELS="$STEP5_DECODE_NCCL_CHANNELS"
+        export NCCL_MAX_NCHANNELS="$STEP5_DECODE_NCCL_CHANNELS"
+    fi
     if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 ]]; then
         export VLLM_HCU_DP_PACKED_AG=1
-        export HCU_STEP5_ROUTER_SHARED_MAX_M=32
-        export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=64
+        export HCU_STEP5_ROUTER_SHARED_MAX_M="${STEP5_ROUTER_SHARED_MAX_M:-32}"
+        export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_SHARED_STREAM_MIN_TOKENS:-64}"
         export VLLM_STEP5_EXPERT_PLACEMENT="${STEP5_DECODE_PLACEMENT:?Set the measured Decode expert placement file}"
     fi
 fi
@@ -97,6 +103,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'EP_FUSED_MOE_TABLE=%q\n' "$EP_FUSED_MOE_TABLE"
     printf 'VLLM_HCU_DP_PACKED_AG=%q HCU_STEP5_ROUTER_SHARED_MAX_M=%q HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=%q\n' "${VLLM_HCU_DP_PACKED_AG:-0}" "${HCU_STEP5_ROUTER_SHARED_MAX_M:-64}" "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS"
     printf 'VLLM_STEP5_EXPERT_PLACEMENT=%q\n' "${VLLM_STEP5_EXPERT_PLACEMENT:-}"
+    printf 'NCCL_MIN_NCHANNELS=%q NCCL_MAX_NCHANNELS=%q\n' "${NCCL_MIN_NCHANNELS:-auto}" "${NCCL_MAX_NCHANNELS:-auto}"
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0
@@ -104,6 +111,7 @@ fi
 if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 && "$phase" == decode ]]; then
     [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
 fi
+python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE"
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" \
     "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$MIOPEN_USER_DB_PATH"
 exec "${command[@]}"
