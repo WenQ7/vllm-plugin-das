@@ -63,11 +63,14 @@ export HCU_MTP_PREFILL_TAIL=1536 HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096
 export HCU_DP_MOE_PIPE_MIN_TOKENS=0 HCU_DBO_MIN_TOKENS=0 HCU_EP_DIRECT_SUM=0
 export HCU_STEP5_EXPERT_GRID=0
 export HCU_STEP5_FUSED_ROUTER_STREAM=0
+export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
     tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len=70000; gpu_util=0.875
     case "$tokens" in 4096|8192|16384|32768) ;; *) printf 'Unsupported Prefill batched-token limit\n' >&2; exit 2 ;; esac
+    export EP_FUSED_MOE_CHUNK="${STEP5_PREFILL_MOE_CHUNK:-32768}"
+    case "$EP_FUSED_MOE_CHUNK" in 16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill MoE chunk size\n' >&2; exit 2 ;; esac
     export HCU_DP_MOE_PIPE_MIN_TOKENS="${STEP5_PREFILL_PIPE_MIN_TOKENS:-0}"
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
     export NCCL_MAX_NCHANNELS=32
@@ -116,6 +119,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'HCU_DP_MOE_PIPE_MIN_TOKENS=%q\n' "$HCU_DP_MOE_PIPE_MIN_TOKENS"
     printf 'HCU_STEP5_EXPERT_GRID=%q\n' "$HCU_STEP5_EXPERT_GRID"
     printf 'HCU_STEP5_FUSED_ROUTER_STREAM=%q\n' "$HCU_STEP5_FUSED_ROUTER_STREAM"
+    printf 'EP_FUSED_MOE_CHUNK=%q\n' "$EP_FUSED_MOE_CHUNK"
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0

@@ -188,3 +188,11 @@ Graph重放。它验证局部调度，不能替代整模型质量和正式性能
 Graph重放与同一路由融合核的串行执行逐位一致。另有6项保护条件及4项Linux启动
 参数检查通过。详情见`results-fused-router-stream-check-20261020.json`；这些数据
 没有整模型吞吐或ITL成绩。
+
+Prefill另提供`STEP5_PREFILL_MOE_CHUNK=16384|32768|65536|131072|262144`，
+默认32768。它设置既有`EP_FUSED_MOE_CHUNK`，控制DP汇集后单次专家调用的分块，
+与每DP的`STEP5_PREFILL_BATCHED_TOKENS`含义不同。例如DP16、batched tokens8192
+会汇集到131072行，默认拆成4次M32768专家调用；把调度批量设为16384后，默认拆成
+8次M32768调用。Decode启动入口固定保持32768，避免继承Prefill实验的分块值。
+8项Linux启动参数检查已通过；更大分块仍需空闲GPU数值/性能检查和完整C64测量，
+此参数的加入不代表已经取得Prefill性能提升。
