@@ -114,5 +114,46 @@
     "under60ms": false,
     "formal_manifest": "native-itl6479-20261020-013236/measured-round2/decode_bs64_manifest.json",
     "interpretation": "Restores historical performance; one formal round, not a sub60ms or full-model quality result. Shared activation handoff fix is absent from this causal retest."
+  },
+  "native_full_git_candidate": {
+    "measured_at": "2026-10-20",
+    "trial": "native-itl6479-20261020-030318",
+    "source_commit": "b4137e4760c8029b6820dab6ddee3a06a6c1eda2",
+    "complete_git_files_verified_per_node": 844,
+    "archive_files_per_node": 850,
+    "default_ep16_table_entries": 21,
+    "worker_extension": false,
+    "pt_in_source": false,
+    "parallel": "DP4TP4EP16",
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 4096,
+    "mtp_tokens": 3,
+    "strict_fa_dsa": true,
+    "knobs": {
+      "router_shared_max_m": 64,
+      "shared_stream_min_tokens": 4096,
+      "nccl_min_channels": 4,
+      "nccl_max_channels": 4
+    },
+    "complete_requests": 64,
+    "preemptions": 0,
+    "jit_events": 0,
+    "cache_updates": 0,
+    "formal_itl_ms": 66.39940338830725,
+    "formal_itl_p99_ms": 71.56093540834263,
+    "decode_tps": 2709.9074541183118,
+    "prefill_tps_same_decode_instance": 15469.879015044016,
+    "acceptance": 0.6019530805147477,
+    "selected": false,
+    "under60ms": false,
+    "interpretation": "Complete Git-native startup works without an extension. The combined activation/RSG64/serial/NCCL4 configuration is slower than native E22-only64.5636ms and is not selected; it does not isolate the activation fix performance."
+  },
+  "native_shared_order_validation": {
+    "cpu_cases_passed": 3,
+    "test_sha256": "15cd46196728a383a217a7c7341e58a46d743926d6548bafdb51a43c0ac9131a",
+    "uses_real_shared_experts_wrapper": true,
+    "uses_real_quant_method_scheduling": true,
+    "full_model_quality_validated": false
   }
 }

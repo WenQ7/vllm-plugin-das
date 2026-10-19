@@ -61,30 +61,56 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
     load_general_plugins()
     apply_worker_patches()
     from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
     from vllm_hcu.models.step5_text import Step5MLP
+    import vllm_hcu.model_executor.layers.fused_moe.shared_experts as shared_runtime
 
     monkeypatch.setattr(torch.cuda, 'current_stream', lambda: SimpleNamespace(cuda_stream=77))
+    monkeypatch.setattr(shared_runtime.henvs, 'VLLM_HCU_USE_CUSTOM_OPS', False)
     shared = Step5MLP.__new__(Step5MLP)
     torch.nn.Module.__init__(shared)
     shared.fused_act = None
     shared.gate_up_proj = Projection(gate=True)
     shared.act_fn = lambda x: x[..., :x.shape[-1] // 2]
     shared.down_proj = Projection()
+    shared._fused_router_shared_max_m = 64 if declares_activation else None
+
+    # Exercise the real ordering and output-consumption wrapper. The gate runs
+    # after maybe_sync, and NO_OVERLAP must consume the activation after it.
+    wrapper = SharedExperts.__new__(SharedExperts)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.enable_dbo = False
+    wrapper._layer = shared
+    wrapper._stream = None
+    wrapper._output = [None, None]
+    wrapper._output_pending_on_stream = [False, False]
+    wrapper._output_pending_late = [False, False]
+    wrapper._moe_config = SimpleNamespace(moe_parallel_config=SimpleNamespace(
+        enable_eplb=False, use_fi_nvl_two_sided_kernels=False,
+    ))
+    wrapper._mk_can_overlap_shared_experts = lambda: False
+    wrapper._is_multistream_safe = lambda: False
 
     runner = MoERunner.__new__(MoERunner)
     torch.nn.Module.__init__(runner)
     runner.gate = Router(declares_activation, returns_aux)
-    runner._shared_experts = SimpleNamespace(_layer=shared)
+    runner._shared_experts = wrapper
     runner._fse_fuse_gate = False
+    runner._ep_fused_combine = False
     runner.moe_config = SimpleNamespace(pcp_size=1)
-    runner.routed_experts = SimpleNamespace(_ensure_moe_quant_config_init=lambda: None)
-    runner._maybe_sync_shared_experts_stream = lambda *args, **kwargs: None
+    quant_method = SimpleNamespace(is_monolithic=False, topk_indices_dtype=torch.int32)
+    runner.routed_experts = SimpleNamespace(
+        _ensure_moe_quant_config_init=lambda: None,
+        quant_method=quant_method,
+        forward_modular=lambda **kwargs: torch.zeros_like(kwargs['x']),
+    )
+    runner.router = SimpleNamespace(select_experts=lambda **kwargs: (
+        torch.ones((kwargs['hidden_states'].shape[0], 1)),
+        torch.zeros((kwargs['hidden_states'].shape[0], 1), dtype=torch.int32),
+    ))
     runner._sequence_parallel_context = lambda: nullcontext()
     runner._maybe_dispatch = lambda x, logits: (x, logits)
     runner._pcp_routing_inputs = lambda *args: nullcontext(None)
-    runner._apply_quant_method = lambda **kwargs: (
-        shared(kwargs['shared_experts_input']), torch.zeros_like(kwargs['hidden_states'])
-    )
     runner._maybe_combine = lambda shared_output, routed_output: shared_output + routed_output
 
     for value in [1., 2.]:
@@ -93,4 +119,5 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
         expected = x * 7 if declares_activation and returns_aux else x
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
         assert shared.fused_act is None
+        assert wrapper._output == [None, None]
     assert shared.gate_up_proj.calls == (0 if declares_activation and returns_aux else 2)
