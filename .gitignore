@@ -220,6 +220,9 @@ hip_compat.h
 
 # Benchmark dataset
 benchmarks/**/*.json
+# Reviewed Step5 launch configuration and aggregate measurements (no dataset).
+!benchmarks/step5/ep_table_decode_candidate.json
+!benchmarks/step5/results-20261019.json
 
 # Linting
 actionlint

@@ -219,3 +219,9 @@ python -m pytest -q tests/model_executor/test_step5_upstream_delta.py \
 The `hcu` cases compare causal FP8 scores against a PyTorch reference and compare
 resident packed selections, ties and padding against the radix implementation
 on a live device. They do not require model weights or the placement asset.
+
+## Four-node performance record
+
+See [Step5 four-node tuning](step5_multinode_tuning.md) for the EP16/E22 table,
+separate Prefill/Decode configurations, measured C64 results, and the optional
+Decode candidate that was not promoted to the default configuration.
