@@ -201,6 +201,7 @@ _MOE_FOUNDATION_CALLBACKS: tuple[_CallbackSpec, ...] = (
 
 _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_mhc_backend")),
+    _CallbackSpec(_adapter("core_fix", "patch_mhc_fused_rmsnorm")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_aiter_cache")),
     _CallbackSpec(_adapter("core_fix", "patch_minimax_m3_sparse_decode")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v32_config")),
@@ -215,6 +216,7 @@ _CORE_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_dspark_metadata")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_flashmla_sparse")),
     _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_rocm_wo_a_layout")),
+    _CallbackSpec(_adapter("core_fix", "patch_deepseek_v4_pcp")),
     _CallbackSpec(_adapter("core_fix", "patch_gpt_oss_mlp_block")),
     _CallbackSpec(_adapter("core_fix", "patch_glm5next_channel_fp8")),
     _CallbackSpec(_adapter("core_fix", "patch_qwen3_5_mamba_state_dtype")),
@@ -257,6 +259,12 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_fla_chunk_o")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer")),
     _CallbackSpec(_adapter("op_opt", "patch_mamba_mixer2")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_kda_gemm_warmup")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_kda_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_cpu_metadata")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_eplb_model")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_reference_paths")),
+    _CallbackSpec(_adapter("op_opt", "patch_kimi_k3_mla_gate")),
     # All GDN deltas bind Qwen's module-local symbols/class only.  The
     # canonical causal-conv module and the shared GDN base remain vLLM-owned
     # so Kimi, Olmo, MambaMixer, MambaMixer2, and ShortConv are not patched by
@@ -266,6 +274,7 @@ _OP_CALLBACKS: tuple[_CallbackSpec, ...] = (
     _CallbackSpec(_adapter("op_opt", "patch_gdn_base")),
     _CallbackSpec(_adapter("op_opt", "patch_gdn_linear_attention")),
     _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_conv_weight")),
+    _CallbackSpec(_adapter("op_opt", "patch_glm5next_kda_strided_recurrent")),
     _CallbackSpec(_adapter("op_opt", "patch_gate_linear")),
     _CallbackSpec(_adapter("op_opt", "patch_activation")),
     _CallbackSpec(_adapter("op_opt", "patch_layers_utils")),
