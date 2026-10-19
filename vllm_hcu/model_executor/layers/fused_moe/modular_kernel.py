@@ -52,8 +52,10 @@ logger = init_logger(__name__)
 # dispatch -> experts -> combine pipelined over two halves of the source DP
 # ranks.  The all-gather of half 1 runs under the experts of half 0 and the
 # reduce of half 0 under the experts of half 1, all comm on a side stream with
-# the same grouped NCCL broadcast/reduce as all_gatherv/reduce_scatterv, so the
-# result is bit-identical.  DP8 8192-token layer: 16.4 -> 15.2 ms.  The caller
+# grouped NCCL broadcast/reduce. Newer vLLM uses native uniform collectives
+# for equal sizes, so BF16 reduction association and performance may differ;
+# validate numerical tolerance and the complete MoE (including shared overlap).
+# The caller
 # joins the side stream with join_dp_moe_pipe() (after launching a late shared
 # expert, which then overlaps the last reduce).  Not VLLM_HCU_*: eager-only
 # inside the MoE custom op, must not change the compile hash.
