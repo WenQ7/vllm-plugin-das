@@ -262,6 +262,7 @@ class SharedExperts(torch.nn.Module):
             self._output[index] = project(activation)
         self._output_pending_on_stream[index] = True
         self._output_pending_fused_router[index] = True
+        logger.info_once("Step5 fused-router shared down projection: auxiliary stream active")
         return True
 
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
