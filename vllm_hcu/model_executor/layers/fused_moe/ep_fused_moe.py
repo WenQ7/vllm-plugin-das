@@ -33,6 +33,8 @@ from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 
 FP8 = torch.float8_e4m3fn
 _announced = False
+STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
+_step5_grid_announced = False
 
 
 @triton.jit
@@ -244,7 +246,8 @@ shared_add_provider = None
 @triton.jit
 def _ep_sort_kernel(ids_ptr, w_ptr, emap_ptr, sids_ptr, sw_ptr, eids_ptr, nvalid_ptr, M,
                     TOPK: tl.constexpr, LE_P: tl.constexpr, BM: tl.constexpr,
-                    BLOCK_R: tl.constexpr):
+                    BLOCK_R: tl.constexpr, WRITE_LAYOUT: tl.constexpr = False,
+                    layout_ptr=None):
     # Same layout as moe_sorting_fwd with a local expert mask, for small M: one
     # program per local expert x. Every program histograms all routes to find
     # where x's block starts, then writes x's routes (in route order), its
@@ -271,6 +274,9 @@ def _ep_sort_kernel(ids_ptr, w_ptr, emap_ptr, sids_ptr, sw_ptr, eids_ptr, nvalid
     tl.store(sw_ptr + start + n + j, tl.zeros((BM,), tl.float32), mask=pm)
     for b in range(start // BM, (start + npad) // BM):
         tl.store(eids_ptr + b, x)
+    if WRITE_LAYOUT:
+        tl.store(layout_ptr + x * 2, start // BM)
+        tl.store(layout_ptr + x * 2 + 1, npad // BM)
     if x == 0:
         tl.store(nvalid_ptr, tl.sum(padded, axis=0))
 
@@ -281,7 +287,8 @@ def _ep_sort_kernel(ids_ptr, w_ptr, emap_ptr, sids_ptr, sw_ptr, eids_ptr, nvalid
 EP_SORT_MAX_ROUTES = int(os.environ.get("EP_FUSED_MOE_SORT_MAX_ROUTES", "2048"))
 
 
-def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm, expert_map=None):
+def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm, expert_map=None,
+               expert_layout=None):
     """moe_sorting_ck with buffers bounded by the *local* expert count.
 
     Only local experts occupy the sorted layout, so its length is at most
@@ -305,8 +312,10 @@ def ep_sorting(topk_ids, topk_weights, expert_mask, global_E, local_E, bm, exper
             topk_ids, topk_weights, expert_map, sorted_ids, sorted_w, expert_ids, nvalid, M,
             TOPK=topk, LE_P=triton.next_power_of_2(local_E), BM=bm,
             BLOCK_R=triton.next_power_of_2(routes),
+            WRITE_LAYOUT=expert_layout is not None, layout_ptr=expert_layout,
             num_warps=1 if routes <= 256 else 8)
         return sorted_ids, sorted_w, expert_ids, nvalid, bound
+    assert expert_layout is None, "Expert-grid metadata requires the small-route sorter"
     sorted_ids = torch.empty((full,), dtype=torch.int32, device=dev)
     sorted_w = torch.empty((full,), dtype=torch.float32, device=dev)
     expert_ids = torch.empty((triton.cdiv(full, bm),), dtype=torch.int32, device=dev)
@@ -392,7 +401,13 @@ def _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted
 
 
 def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
-          expert_ids, nvalid, top_k, compute_type, config, **kw):
+          expert_ids, nvalid, top_k, compute_type, config, expert_layout=None, **kw):
+    if expert_layout is not None:
+        from .step5_expert_grid import invoke_expert_grid
+
+        return invoke_expert_grid(
+            A, B, C, A_scale, B_scale, sorted_ids, expert_layout, topk_ids, config,
+            a_sorted=kw.get("a_sorted", False), c_sorted=kw.get("c_sorted", False))
     if "PERSISTENT_PROGRAMS" in config:
         kw.pop("scale_bias_with_routed_weight", None)  # only acts on a bias; there is none
         _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
@@ -493,8 +508,27 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     else:
         a_q, a_s = hidden_states, a1_scale.view(-1, 1) if a1_scale.numel() > 1 else a1_scale
 
-    sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(
-        topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
+    expert_layout = None
+    if (M == 256 and configs is None and STEP5_EXPERT_GRID
+            and EP_SORT_MAX_ROUTES >= M * topk):
+        from .step5_expert_grid import can_use_expert_grid, expert_grid_configs
+
+        if (topk_weights.is_contiguous()
+                and can_use_expert_grid(a_q, a_s, w1, w2, w1_scale, w2_scale,
+                                       topk_ids, out_dtype)):
+            cfg1, cfg2 = expert_grid_configs()
+            bm, presort, use_mls = 16, False, False
+            expert_layout = torch.empty((E, 2), dtype=torch.int32, device=a_q.device)
+            global _step5_grid_announced
+            if not _step5_grid_announced:
+                _step5_grid_announced = True
+                print("[step5_expert_grid] active: E22 M256 BM16 workers4", flush=True)
+    sorting_args = (topk_ids, topk_weights, expert_mask, G, E, bm, expert_map)
+    if expert_layout is None:
+        sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(*sorting_args)
+    else:
+        sorted_ids, sorted_w, expert_ids, nvalid, rows = ep_sorting(
+            *sorting_args, expert_layout=expert_layout)
 
     dev = hidden_states.device
     cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
@@ -508,7 +542,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     else:
         _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
               expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
-              ck_topk=topk)
+              ck_topk=topk, expert_layout=expert_layout)
     act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
                                        7.0 if gemm1_limit is None else gemm1_limit,
                                        q=_carve(workspace2, (rows, N // 2), FP8, dev))
@@ -516,7 +550,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     if out is None:
         out = torch.empty((M, K), dtype=out_dtype, device=dev)
     add = shared_add_provider(out) if shared_add_provider is not None else None
-    if (DIRECT_MIN and M >= DIRECT_MIN and routed_scaling_factor == 1.0 and add is None
+    if (expert_layout is None and DIRECT_MIN and M >= DIRECT_MIN and routed_scaling_factor == 1.0 and add is None
             and "PERSISTENT_PROGRAMS" not in cfg2):
         xoff = _ep_direct_xoff(out, topk_ids)
         if xoff is not None:
@@ -533,7 +567,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
-          scale_bias_with_routed_weight=True)
+          scale_bias_with_routed_weight=True, expert_layout=expert_layout)
     ep_masked_moe_sum(cache3, out, topk_ids, expert_map, routed_scaling_factor,
                       *(add or ()))
     return out
