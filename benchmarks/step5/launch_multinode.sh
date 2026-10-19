@@ -34,6 +34,7 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eno2}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NCCL_SOCKET_IFNAME}"
 unset NCCL_TOPO_FILE NCCL_IB_DISABLE NCCL_MAX_NCHANNELS NCCL_MIN_NCHANNELS
 unset VLLM_STEP5_EXPERT_PLACEMENT
+unset VLLM_HCU_DP_PACKED_AG HCU_STEP5_ROUTER_SHARED_MAX_M
 unset VLLM_PLUGINS ROCBLAS_TENSILE_LIBPATH HIPBLASLT_TUNING_OVERRIDE_FILE
 export GPU_MAX_HW_QUEUES=4
 export VLLM_HCU_USE_CUSTOM_QUANTIZATION_GEMM=1
@@ -66,6 +67,12 @@ if [[ "$phase" == prefill ]]; then
     export NCCL_MAX_NCHANNELS=32
 else
     tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
+    if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 ]]; then
+        export VLLM_HCU_DP_PACKED_AG=1
+        export HCU_STEP5_ROUTER_SHARED_MAX_M=32
+        export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=64
+        export VLLM_STEP5_EXPERT_PLACEMENT="${STEP5_DECODE_PLACEMENT:?Set the measured Decode expert placement file}"
+    fi
 fi
 extra=(--api-server-count 1)
 if [[ "$rank" != 0 ]]; then
@@ -88,9 +95,14 @@ command=(python3 -u -m vllm.entrypoints.cli.main serve "$model_dir"
     --limit-mm-per-prompt '{"image":0}' "${extra[@]}")
 if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'EP_FUSED_MOE_TABLE=%q\n' "$EP_FUSED_MOE_TABLE"
+    printf 'VLLM_HCU_DP_PACKED_AG=%q HCU_STEP5_ROUTER_SHARED_MAX_M=%q HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=%q\n' "${VLLM_HCU_DP_PACKED_AG:-0}" "${HCU_STEP5_ROUTER_SHARED_MAX_M:-64}" "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS"
+    printf 'VLLM_STEP5_EXPERT_PLACEMENT=%q\n' "${VLLM_STEP5_EXPERT_PLACEMENT:-}"
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0
+fi
+if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 && "$phase" == decode ]]; then
+    [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
 fi
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" \
     "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$MIOPEN_USER_DB_PATH"

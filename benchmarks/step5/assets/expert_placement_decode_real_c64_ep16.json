@@ -1,0 +1,18 @@
+{
+  "file": "expert_placement_decode_real_c64_ep16.pt",
+  "sha256": "431089b03db8fa4f6a3b2bc5cd73a0ac44683444303d2fe88ec10e355f53fa04",
+  "shape": [
+    88,
+    352
+  ],
+  "logical_experts": 352,
+  "physical_experts": 352,
+  "ep_size": 16,
+  "local_experts": 22,
+  "calibration": "Real C64 Decode routing,65536 input/4096 output,MTP3",
+  "original_plan_sha256": "37d13b47480dee98df48d8e74f2d29d6d72495f247b40bbe74385ddb107f7622",
+  "historical_itl_ms": 64.79339598736354,
+  "historical_decode_tps": 2763.5630570209355,
+  "historical_implementation": "Runtime worker extension; native integration end-to-end retest pending",
+  "original_prefill_placement_used": false
+}

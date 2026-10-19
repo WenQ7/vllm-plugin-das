@@ -3,6 +3,9 @@
 记录日期：2026-10-19。硬件为四节点、每节点四张 BW1300_LC（gfx938），总计16卡。
 模型为 Step5-Channel-FP8-w8a8，channel FP8 W8A8 权重、FP8 E4M3 KV。
 
+后续64.79ms Decode正式轮、对应原生集成与验证范围见
+[`step5_decode_itl6479.md`](step5_decode_itl6479.md)。下文保留此前各轮的历史记录。
+
 推荐保留 EP16/E22 参数表与以下分阶段配置：Prefill 使用 DP16/TP1/EP16，
 Decode 使用 DP4/TP4/EP16。本轮 Decode 三参数候选未确认稳定加速，不提升为默认。
 

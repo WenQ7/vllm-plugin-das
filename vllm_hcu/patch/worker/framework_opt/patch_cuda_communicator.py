@@ -201,6 +201,13 @@ def apply_to_module(module: ModuleType) -> bool:
             tcp_store_group,
             use_all2all,
         )
+        self._hcu_dp_packed_ag = (
+            henvs.optional_custom_op_enabled(
+                os.environ.get("VLLM_HCU_DP_PACKED_AG", "0") == "1"
+            )
+            and unique_name.split(":")[0] == "dp"
+            and 2 <= self.world_size <= 16
+        )
         try:
             _maybe_init_ep_custom_allreduce(self, unique_name)
             _maybe_init_dp_ipc_all_gather(self, unique_name)
@@ -237,6 +244,16 @@ def apply_to_module(module: ModuleType) -> bool:
     @functools.wraps(all_gatherv)
     def hcu_all_gatherv(self, input_, dim=0, sizes=None):
         ag = getattr(self, "_hcu_ipc_ag", None)
+        if getattr(self, "_hcu_dp_packed_ag", False) and ag is None:
+            from vllm_hcu.distributed.device_communicators.packed_all_gather import (
+                packed_step5_all_gatherv,
+            )
+
+            packed = packed_step5_all_gatherv(
+                self, input_, all_gatherv, dim=dim, sizes=sizes
+            )
+            if packed is not None:
+                return packed
         if ag is not None and dim == 0:
             single = isinstance(input_, torch.Tensor)
             tensors = [input_] if single else list(input_)
