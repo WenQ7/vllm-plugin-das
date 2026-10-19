@@ -154,3 +154,37 @@ Prefill独立测试支持`STEP5_PREFILL_BATCHED_TOKENS=4096|8192|16384|32768`及
 `STEP5_PREFILL_PIPE_MIN_TOKENS=0|16384|32768|65536|131072|262144`。
 默认仍是8192和0。这些开关不改变Decode配置；流水候选仍需16-rank数值和整模型
 验证，不能将已有代码注释里的旧版微测收益视为当前版本的成绩。
+
+## 原生 DP16 Prefill 独立结果
+
+2026-10-20，以提交`0fb5f652`的完整Git部署运行DP16/TP1/EP16，四节点各4卡，
+C64、每DP4请求、输入65536/输出1、MTP3配置、FA DSA、FP8 KV、关闭前缀缓存。
+batched-token上限8192，NCCL max channels32、pipeline关闭、无专家映射PT。
+两轮完整预热排除后，三轮正式Prefill分别为29057.1713、29068.0756、29007.7270tps，
+平均29044.3246tps，样本标准差32.1600tps。各轮64/64成功、零抢占；每轮结束后、
+下一轮开始前独立检查四节点，测量窗口内均无JIT或缓存更新。
+
+数据见`benchmarks/step5/results-prefill-native-20261020.json`。此成绩来自正常启动的
+主体代码，未使用worker extension或RPC热替换。与此前独立实例的29085.03tps接近，
+不是新的吞吐提升；更大batched-token上限的整模型比较仍在进行。
+
+## 融合路由后的共享下投影重叠候选
+
+`HCU_STEP5_FUSED_ROUTER_STREAM`默认关闭。显式启用时，内部路由器先返回共享激活，
+主体在生产者流上取出并清空缓存，再让辅助流等待生产者、登记张量生命周期，只执行
+共享下投影。独立的激活张量允许主流继续路由、DP dispatch及专家计算；消费共享输出
+前等待辅助流。共享输出用独立状态跟踪，避免被串行路径重复计算或提前交给EP combine。
+DBO、序列并行、PCP、禁用共享流及非默认EPLB等受保护场景保留原路径。
+
+这是默认关闭的候选，尚无整模型性能成绩；不能视为达到60ms或提高吞吐。
+对应Decode启动设置为`STEP5_ROUTER_SHARED_MAX_M=64`与
+`STEP5_DECODE_FUSED_ROUTER_STREAM=1`，仍通过插件自身入口启动。
+`check_fused_router_stream.py`检查真实MoERunner/SharedExperts/Step5MLP交接：
+路由专家测试替身会覆盖输入，检查下投影实际流、单次消费、缓存清空和更换输入后的
+Graph重放。它验证局部调度，不能替代整模型质量和正式性能测试。
+
+已完成14项CPU检查，及GPU上M16/32/64/65、K4096、路由352、共享中间维384的
+实际交接检查。M64确认在辅助流执行，M65确认走原路径；36次零输入/更换输入的
+Graph重放与同一路由融合核的串行执行逐位一致。另有6项保护条件及4项Linux启动
+参数检查通过。详情见`results-fused-router-stream-check-20261020.json`；这些数据
+没有整模型吞吐或ITL成绩。
