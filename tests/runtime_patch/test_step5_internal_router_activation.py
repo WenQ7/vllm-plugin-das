@@ -81,7 +81,9 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
     monkeypatch.setattr(shared_runtime, 'current_stream', lambda: active[0])
     monkeypatch.setattr(torch.cuda, 'stream', use_stream)
     monkeypatch.setattr(torch.Tensor, 'record_stream', lambda x, s: events.append(('record', s.cuda_stream)))
-    monkeypatch.setattr(shared_runtime, '_FUSED_ROUTER_STREAM', fused_stream)
+    # Set after module import, matching executor-side worker environment setup.
+    monkeypatch.setenv('HCU_STEP5_FUSED_ROUTER_STREAM', '1' if fused_stream else '0')
+    monkeypatch.setenv('VLLM_HCU_USE_CUSTOM_OPS', '1')
     monkeypatch.setattr(shared_runtime.henvs, 'VLLM_HCU_USE_CUSTOM_OPS', False)
     shared = Step5MLP.__new__(Step5MLP)
     torch.nn.Module.__init__(shared)

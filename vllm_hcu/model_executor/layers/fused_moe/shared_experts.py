@@ -37,9 +37,15 @@ logger = init_logger(__name__)
 # VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
 # custom op, not the traced graph, so it must not change the compile hash.
 _LATE_STREAM_MIN_TOKENS = int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
-_FUSED_ROUTER_STREAM = henvs.optional_custom_op_enabled(
-    os.environ.get("HCU_STEP5_FUSED_ROUTER_STREAM", "0") == "1"
-)
+
+
+def _fused_router_stream_enabled() -> bool:
+    # Worker unpickling can import this module before the executor installs
+    # its environment. Resolve at use time so an early import cannot freeze
+    # the feature off for the lifetime of that worker.
+    return henvs.optional_custom_op_enabled(
+        os.environ.get("HCU_STEP5_FUSED_ROUTER_STREAM", "0") == "1"
+    )
 
 
 class SharedExpertsOrder(IntEnum):
@@ -236,7 +242,7 @@ class SharedExperts(torch.nn.Module):
         hidden_states, which routed experts are allowed to overwrite.
         """
         if (
-            not _FUSED_ROUTER_STREAM
+            not _fused_router_stream_enabled()
             or self.enable_dbo
             or self._stream is None
             or self._disable_shared_experts_overlap
@@ -262,7 +268,10 @@ class SharedExperts(torch.nn.Module):
             self._output[index] = project(activation)
         self._output_pending_on_stream[index] = True
         self._output_pending_fused_router[index] = True
-        logger.info_once("Step5 fused-router shared down projection: auxiliary stream active")
+        logger.info_once(
+            "Step5 fused-router shared down projection: auxiliary stream active",
+            scope="process",
+        )
         return True
 
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:

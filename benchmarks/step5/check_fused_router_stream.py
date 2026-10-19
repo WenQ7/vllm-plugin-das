@@ -5,6 +5,7 @@ shared down projection must read its independent router activation instead.
 This validates ordering and changed-input graph replay, not model quality.
 """
 import json
+import os
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -125,7 +126,7 @@ def call(x):
     projection_streams.clear()
     producer = torch.cuda.current_stream().cuda_stream
     output = runner._forward_impl(x, None, x)
-    wanted = wrapper._stream.cuda_stream if se._FUSED_ROUTER_STREAM and x.shape[0] <= 64 else producer
+    wanted = wrapper._stream.cuda_stream if os.environ['HCU_STEP5_FUSED_ROUTER_STREAM']=='1' and x.shape[0] <= 64 else producer
     assert projection_streams == [wanted], (projection_streams, wanted)
     assert shared.fused_act is None
     assert wrapper._output == [None, None]
@@ -140,10 +141,10 @@ with torch.inference_mode():
         source = torch.randn(m, K, device='cuda', dtype=torch.bfloat16) * .2
         x = source.clone()
         for _ in range(3):
-            se._FUSED_ROUTER_STREAM = False
+            os.environ['HCU_STEP5_FUSED_ROUTER_STREAM'] = '0'
             x.copy_(source)
             expected = call(x).clone()
-            se._FUSED_ROUTER_STREAM = True
+            os.environ['HCU_STEP5_FUSED_ROUTER_STREAM'] = '1'
             x.copy_(source)
             actual = call(x)
             torch.cuda.synchronize()
@@ -155,10 +156,10 @@ with torch.inference_mode():
         replays = []
         for amplitude in [0., .2, 1.]:
             source.copy_(torch.randn_like(source) * amplitude)
-            se._FUSED_ROUTER_STREAM = False
+            os.environ['HCU_STEP5_FUSED_ROUTER_STREAM'] = '0'
             x.copy_(source)
             expected = call(x).clone()
-            se._FUSED_ROUTER_STREAM = True
+            os.environ['HCU_STEP5_FUSED_ROUTER_STREAM'] = '1'
             for _ in range(3):
                 out.zero_()
                 x.copy_(source)
