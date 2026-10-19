@@ -150,7 +150,7 @@ def build_bundle(repo: Path, ref: str, output: Path, hcu_ops: Path, tokenizer: P
     (output/'source-git-tree.json').write_text(json.dumps({'commit':commit,'files':expected},indent=2),encoding='utf-8')
     (output/'source-sha256.json').write_text(json.dumps({name:hashlib.sha256(data).hexdigest() for name,(data,_) in entries.items()},indent=2),encoding='utf-8')
     (output/'prepare_runtime.py').write_text(PREPARE,encoding='utf-8')
-    (output/'server_step5.sh').write_text(SERVER,encoding='utf-8')
+    (output/'server_step5.sh').write_bytes(SERVER.encode('utf-8'))
     (output/'README.txt').write_text(
         f'Pinned Step5 source: {commit}\n'
         'The source archive contains the complete Git tree, the supplied CP312 extension and tokenizer.\n'

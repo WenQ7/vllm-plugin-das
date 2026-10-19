@@ -40,6 +40,7 @@ def repository(tmp_path):
 def test_unchanged_asset_comes_from_complete_pinned_tree(tmp_path,repository):
     repo,library,tokenizer=repository;output=tmp_path/'bundle'
     manifest=PACKAGE.build_bundle(repo,'HEAD',output,library,tokenizer)
+    assert b'\r\n' not in (output/'server_step5.sh').read_bytes()
     with tarfile.open(output/'source-runtime.tar.gz') as archive:
         actual=archive.extractfile('source/'+TABLE).read()
     assert actual==run_git(repo,'show','HEAD:'+TABLE)
