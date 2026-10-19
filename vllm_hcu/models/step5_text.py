@@ -603,19 +603,32 @@ class Step5MLP(nn.Module):
             activation,
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def pop_fused_router_activation(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Take a fresh activation on its producer stream, before any handoff."""
         fused, self.fused_act = self.fused_act, None
         if (
             fused is not None
             and fused[0] == torch.cuda.current_stream().cuda_stream
             and fused[1] == hidden_states.shape
         ):
-            intermediate_act = fused[2]
-        else:
+            return fused[2]
+        return None
+
+    def forward_fused_router_activation(
+        self, activation: torch.Tensor
+    ) -> torch.Tensor:
+        """The shared down projection reads only this independent activation."""
+        output, _ = self.down_proj(activation)
+        return output
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        intermediate_act = self.pop_fused_router_activation(hidden_states)
+        if intermediate_act is None:
             gate_up, _ = self.gate_up_proj(hidden_states)
             intermediate_act = self.act_fn(gate_up)
-        output, _ = self.down_proj(intermediate_act)
-        return output
+        return self.forward_fused_router_activation(intermediate_act)
 
 
 class Step5Attention(nn.Module):

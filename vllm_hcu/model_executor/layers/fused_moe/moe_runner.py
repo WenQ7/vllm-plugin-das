@@ -1325,6 +1325,9 @@ class MoERunner(MoERunnerInterface):
                     )
                     if callable(receive_activation):
                         receive_activation(hidden_states, gate_aux)
+                        self._shared_experts.maybe_launch_fused_router_activation(
+                            hidden_states
+                        )
 
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once

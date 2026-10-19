@@ -62,6 +62,7 @@ export VLLM_STEP4_DSA_FLASH_ATTN=prefill,decode
 export HCU_MTP_PREFILL_TAIL=1536 HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096
 export HCU_DP_MOE_PIPE_MIN_TOKENS=0 HCU_DBO_MIN_TOKENS=0 HCU_EP_DIRECT_SUM=0
 export HCU_STEP5_EXPERT_GRID=0
+export HCU_STEP5_FUSED_ROUTER_STREAM=0
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
@@ -74,6 +75,8 @@ else
     tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
     export HCU_STEP5_EXPERT_GRID="${STEP5_DECODE_EXPERT_GRID:-0}"
     case "$HCU_STEP5_EXPERT_GRID" in 0|1) ;; *) printf 'Unsupported Decode expert-grid switch\n' >&2; exit 2 ;; esac
+    export HCU_STEP5_FUSED_ROUTER_STREAM="${STEP5_DECODE_FUSED_ROUTER_STREAM:-0}"
+    case "$HCU_STEP5_FUSED_ROUTER_STREAM" in 0|1) ;; *) printf 'Unsupported Decode fused-router stream switch\n' >&2; exit 2 ;; esac
     if [[ -n "${STEP5_DECODE_NCCL_CHANNELS:-}" ]]; then
         case "$STEP5_DECODE_NCCL_CHANNELS" in 1|2|4|8|16|32|64) ;; *) printf 'Unsupported Decode NCCL channel count\n' >&2; exit 2 ;; esac
         export NCCL_MIN_NCHANNELS="$STEP5_DECODE_NCCL_CHANNELS"
@@ -112,6 +115,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'NCCL_MIN_NCHANNELS=%q NCCL_MAX_NCHANNELS=%q\n' "${NCCL_MIN_NCHANNELS:-auto}" "${NCCL_MAX_NCHANNELS:-auto}"
     printf 'HCU_DP_MOE_PIPE_MIN_TOKENS=%q\n' "$HCU_DP_MOE_PIPE_MIN_TOKENS"
     printf 'HCU_STEP5_EXPERT_GRID=%q\n' "$HCU_STEP5_EXPERT_GRID"
+    printf 'HCU_STEP5_FUSED_ROUTER_STREAM=%q\n' "$HCU_STEP5_FUSED_ROUTER_STREAM"
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0

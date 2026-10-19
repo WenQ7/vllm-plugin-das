@@ -37,6 +37,9 @@ logger = init_logger(__name__)
 # VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
 # custom op, not the traced graph, so it must not change the compile hash.
 _LATE_STREAM_MIN_TOKENS = int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
+_FUSED_ROUTER_STREAM = henvs.optional_custom_op_enabled(
+    os.environ.get("HCU_STEP5_FUSED_ROUTER_STREAM", "0") == "1"
+)
 
 
 class SharedExpertsOrder(IntEnum):
@@ -51,6 +54,10 @@ class SharedExpertsOrder(IntEnum):
 
     # Overlapped with the gate, router, experts in aux stream.
     MULTI_STREAM_OVERLAPPED = (3,)
+
+    # The router has produced an independent shared activation. Only its down
+    # projection runs on the aux stream, starting after the producer event.
+    FUSED_ROUTER_OVERLAPPED = (4,)
 
 
 class SharedExperts(torch.nn.Module):
@@ -72,6 +79,7 @@ class SharedExperts(torch.nn.Module):
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
         self._output_pending_late: list[bool] = [False, False]
+        self._output_pending_fused_router: list[bool] = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -174,6 +182,9 @@ class SharedExperts(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> SharedExpertsOrder:
+        pending = getattr(self, "_output_pending_fused_router", None)
+        if pending is not None and pending[self._output_idx]:
+            return SharedExpertsOrder.FUSED_ROUTER_OVERLAPPED
         # A fused router can produce the shared gate_up + activation on the
         # current stream before the runner invokes this layer. Running the
         # shared expert on the auxiliary stream would fail the stream handoff
@@ -214,6 +225,41 @@ class SharedExperts(torch.nn.Module):
         if should_run_shared_in_aux_stream and self._is_multistream_safe():
             return SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
         return SharedExpertsOrder.NO_OVERLAP
+
+    def maybe_launch_fused_router_activation(
+        self, hidden_states: torch.Tensor
+    ) -> bool:
+        """Launch only after the internal router has handed off its activation.
+
+        Take the cache on its producer stream, then record the dependency and
+        allocator ownership explicitly. The auxiliary projection never reads
+        hidden_states, which routed experts are allowed to overwrite.
+        """
+        if (
+            not _FUSED_ROUTER_STREAM
+            or self.enable_dbo
+            or self._stream is None
+            or not self._requires_main_stream_for_fused_activation(hidden_states)
+        ):
+            return False
+        take = getattr(self._layer, "pop_fused_router_activation", None)
+        project = getattr(self._layer, "forward_fused_router_activation", None)
+        if not callable(take) or not callable(project):
+            return False
+        index = self._output_idx
+        assert self._output[index] is None
+        activation = take(hidden_states)
+        if activation is None:
+            return False
+        assert activation.device == hidden_states.device
+        assert activation.shape[0] == hidden_states.shape[0]
+        self._stream.wait_stream(current_stream())
+        activation.record_stream(self._stream)
+        with torch.cuda.stream(self._stream):
+            self._output[index] = project(activation)
+        self._output_pending_on_stream[index] = True
+        self._output_pending_fused_router[index] = True
+        return True
 
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
         """Return whether routed experts can mutate this input concurrently."""
@@ -341,6 +387,9 @@ class SharedExperts(torch.nn.Module):
             self._output_pending_on_stream[self._output_idx] = False
         output = self._output[self._output_idx]
         self._output[self._output_idx] = None
+        pending = getattr(self, "_output_pending_fused_router", None)
+        if pending is not None:
+            pending[self._output_idx] = False
         return output
 
     def forward(
