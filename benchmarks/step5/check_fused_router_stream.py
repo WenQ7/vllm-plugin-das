@@ -78,6 +78,16 @@ wrapper._moe_config = SimpleNamespace(moe_parallel_config=SimpleNamespace(
 ))
 wrapper._mk_can_overlap_shared_experts = lambda: False
 wrapper._is_multistream_safe = lambda: False
+projection_streams = []
+project = shared.forward_fused_router_activation
+
+
+def observe_projection(activation):
+    projection_streams.append(torch.cuda.current_stream().cuda_stream)
+    return project(activation)
+
+
+shared.forward_fused_router_activation = observe_projection
 
 runner = MoERunner.__new__(MoERunner)
 torch.nn.Module.__init__(runner)
@@ -112,7 +122,11 @@ runner._maybe_combine = lambda s, r: s + r
 
 
 def call(x):
+    projection_streams.clear()
+    producer = torch.cuda.current_stream().cuda_stream
     output = runner._forward_impl(x, None, x)
+    wanted = wrapper._stream.cuda_stream if se._FUSED_ROUTER_STREAM and x.shape[0] <= 64 else producer
+    assert projection_streams == [wanted], (projection_streams, wanted)
     assert shared.fused_act is None
     assert wrapper._output == [None, None]
     assert not any(wrapper._output_pending_fused_router)

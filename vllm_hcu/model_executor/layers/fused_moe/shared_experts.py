@@ -239,6 +239,9 @@ class SharedExperts(torch.nn.Module):
             not _FUSED_ROUTER_STREAM
             or self.enable_dbo
             or self._stream is None
+            or self._disable_shared_experts_overlap
+            or getattr(self._moe_config, "is_sequence_parallel", False)
+            or getattr(self._moe_config, "pcp_size", 1) > 1
             or not self._requires_main_stream_for_fused_activation(hidden_states)
         ):
             return False
