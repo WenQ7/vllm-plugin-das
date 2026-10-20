@@ -1,6 +1,6 @@
 {
   "scope": "Best verified Prefill configuration at current user constraints; no global optimality claim",
-  "recorded": "2026-10-21T00:43:40.012110+08:00",
+  "recorded": "2026-10-21T01:25:46.976347+08:00",
   "selected": {
     "case": "prefill-dp16-user-restored",
     "trial": "native-prefill-20261020-215742",
@@ -158,14 +158,7 @@
     "STEP5_API_HOST": "127.0.0.1",
     "STEP5_PORT": "8018"
   },
-  "selection_status": "Provisional best measured configuration; Prefill communication tuning remains in progress.",
-  "numerical_control_in_progress": {
-    "protocol": "64 fixed random-token prompts, 65536 input tokens and one output token; four waves of 16 with X-data-parallel-rank=index%16; per-engine success counters validate destination",
-    "performance_protocol": false,
-    "c131k_complete": true,
-    "c65536_pending": true,
-    "limits": "Does not control KV allocator free-list history or exact scheduler tick."
-  },
+  "selection_status": "Provisional best measured configuration. Communication and large-M MoE tile screens found no new candidate; DeepEP HT capability screening remains next.",
   "decode_deferred": {
     "dp": 16,
     "tp": 1,
@@ -182,5 +175,21 @@
     "selected": "Keep 32-channel automatic minimum and default buffer.",
     "native_fp8_baseline_proxy_ms": 12.443908452987671,
     "new_full_model_candidate_selected": false
-  }
+  },
+  "fixed_dp_output_controls": {
+    "report": "results-prefill-dp16-numerical-controls-20261021.json",
+    "baseline_repeat_token_matches": 64,
+    "baseline_repeat_top20_logprobs_exact": 64,
+    "cross_chunk_token_matches": 59,
+    "cross_chunk_top20_logprobs_exact": 0,
+    "requests": 64,
+    "performance_protocol": false,
+    "business_quality_evaluated": false
+  },
+  "gemm_tile_screen": {
+    "report": "results-prefill-dp16-gemm-tiles-20261021.json",
+    "selected": "Keep original table.",
+    "new_native_candidate_selected": false
+  },
+  "live_service_status": "Stopped after verified-idle control to run isolated GPU capability screens; selected runtime/configuration is preserved."
 }
