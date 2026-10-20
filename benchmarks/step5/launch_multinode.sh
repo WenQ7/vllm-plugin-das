@@ -68,7 +68,8 @@ export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
-    tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util=0.875
+    tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-32768}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-1048576}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.91}"
+    case "$gpu_util" in 0.875|0.91) ;; *) printf 'Unsupported Prefill GPU memory utilization\n' >&2; exit 2 ;; esac
     case "$max_len" in 70000|1048576) ;; *) printf 'Unsupported Prefill context limit\n' >&2; exit 2 ;; esac
     export HCU_STEP5_BOUNDED_EP_WORKSPACE="${STEP5_PREFILL_BOUNDED_WORKSPACE:-0}"
     case "$HCU_STEP5_BOUNDED_EP_WORKSPACE" in 0|1) ;; *) printf 'Unsupported Prefill workspace switch\n' >&2; exit 2 ;; esac
@@ -78,6 +79,9 @@ if [[ "$phase" == prefill ]]; then
     export HCU_DP_MOE_PIPE_MIN_TOKENS="${STEP5_PREFILL_PIPE_MIN_TOKENS:-0}"
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
     export NCCL_MAX_NCHANNELS=32
+    if [[ -n "${STEP5_PREFILL_PLACEMENT:-}" ]]; then
+        export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"
+    fi
 else
     tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
     export HCU_STEP5_EXPERT_GRID="${STEP5_DECODE_EXPERT_GRID:-0}"
@@ -131,6 +135,9 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
 fi
 if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 && "$phase" == decode ]]; then
     [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
+fi
+if [[ "$phase" == prefill && -n "${VLLM_STEP5_EXPERT_PLACEMENT:-}" ]]; then
+    [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing Prefill placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
 fi
 python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE"
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" \
