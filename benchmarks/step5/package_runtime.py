@@ -74,6 +74,10 @@ export STEP5_CACHE_DIR="${STEP5_CACHE_DIR:-/var/cache/xuwq_step5}"
 export STEP5_HEAD_IP="${STEP5_HEAD_IP:-172.20.2.22}"
 export VLLM_HOST_IP="${VLLM_HOST_IP:-172.20.2.$((22+rank))}"
 if [[ "$phase" == decode ]]; then
+    if [[ "${STEP5_DECODE_PARALLEL:-dp4tp4}" == dp16tp1 ]]; then
+        export STEP5_DECODE_PROFILE="${STEP5_DECODE_PROFILE:-dp16_native}"
+        exec bash "$bundle/source/benchmarks/step5/launch_multinode.sh" decode "$rank"
+    fi
     : "${STEP5_DECODE_PLACEMENT:?Set the external Decode placement file}"
     export STEP5_DECODE_PLACEMENT
     exec bash "$bundle/source/benchmarks/step5/launch_decode_itl6479.sh" "$rank"

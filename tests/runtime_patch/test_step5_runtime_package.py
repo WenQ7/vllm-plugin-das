@@ -3,7 +3,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -77,3 +79,20 @@ def test_weights_cannot_enter_source_snapshot(tmp_path,repository):
     run_git(repo,'add','.');run_git(repo,'-c','user.name=Test','-c','user.email=test@example.invalid','commit','-qm','invalid source weight')
     with pytest.raises(ValueError,match='weights must remain external'):
         PACKAGE.build_bundle(repo,'HEAD',tmp_path/'reject',library,tokenizer)
+
+
+def test_dp16_wrapper_does_not_require_legacy_decode_placement(tmp_path):
+    bash=shutil.which('bash')
+    if not bash or subprocess.run([bash,'-c','true'],capture_output=True).returncode:
+        pytest.skip('A working Bash is required for wrapper checks')
+    bundle=tmp_path/'bundle';bundle.mkdir()
+    server=bundle/'server_step5.sh';server.write_text(PACKAGE.SERVER)
+    scripts=bundle/'source/benchmarks/step5';scripts.mkdir(parents=True)
+    (scripts/'launch_multinode.sh').write_text(
+        '#!/usr/bin/env bash\nprintf "%s %s %s\\n" "$STEP5_DECODE_PROFILE" "$1" "$2"\n')
+    (scripts/'launch_decode_itl6479.sh').write_text('#!/usr/bin/env bash\nexit 99\n')
+    env={k:v for k,v in os.environ.items() if not k.startswith('STEP5_')}
+    env['STEP5_DECODE_PARALLEL']='dp16tp1'
+    result=subprocess.run([bash,str(server),'decode','3'],env=env,capture_output=True,text=True,timeout=15)
+    assert result.returncode==0,result.stderr
+    assert result.stdout.strip()=='dp16_native decode 3'

@@ -66,6 +66,7 @@ export HCU_STEP5_FUSED_ROUTER_STREAM=0
 export HCU_STEP5_BOUNDED_EP_WORKSPACE=0
 export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
+scheduler_extra=()
 
 if [[ "$phase" == prefill ]]; then
     tp=1; dp="${STEP5_PREFILL_DP_SIZE:-16}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
@@ -86,7 +87,26 @@ if [[ "$phase" == prefill ]]; then
         export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"
     fi
 else
-    tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
+    tokens=32768; max_len=1048576
+    case "${STEP5_DECODE_PARALLEL:-dp4tp4}" in
+        dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
+        dp16tp1)
+            tp=1; dp=16; local_dp=4; gpu_util=0.91
+            export HCU_STEP5_BOUNDED_EP_WORKSPACE=1
+            export EP_FUSED_MOE_CHUNK="${STEP5_DECODE_MOE_CHUNK:-65536}"
+            case "$EP_FUSED_MOE_CHUNK" in 32768|65536) ;; *) printf 'Unsupported Decode MoE chunk\n' >&2; exit 2 ;; esac
+            # Bound each prompt's score matrix without lowering the scheduler's
+            # total token budget or its 1M context limit. Live validation is needed.
+            threshold="${STEP5_DECODE_LONG_PREFILL_TOKEN_THRESHOLD:-2048}"
+            case "$threshold" in 0|1024|2048|4096|8192) ;; *) printf 'Unsupported Decode long-prefill threshold\n' >&2; exit 2 ;; esac
+            if [[ "$threshold" != 0 ]]; then
+                scheduler_extra=(--long-prefill-token-threshold "$threshold")
+            fi
+            ;;
+        *) printf 'Unsupported Decode parallel configuration\n' >&2; exit 2 ;;
+    esac
+    gpu_util="${STEP5_DECODE_GPU_MEMORY_UTILIZATION:-$gpu_util}"
+    case "$gpu_util" in 0.85|0.875|0.91) ;; *) printf 'Unsupported Decode GPU memory utilization\n' >&2; exit 2 ;; esac
     api_host="${STEP5_API_HOST:-0.0.0.0}"; api_port="${STEP5_PORT:-18118}"
     export HCU_STEP5_EXPERT_GRID="${STEP5_DECODE_EXPERT_GRID:-0}"
     case "$HCU_STEP5_EXPERT_GRID" in 0|1) ;; *) printf 'Unsupported Decode expert-grid switch\n' >&2; exit 2 ;; esac
@@ -98,10 +118,15 @@ else
         export NCCL_MAX_NCHANNELS="$STEP5_DECODE_NCCL_CHANNELS"
     fi
     if [[ "${STEP5_DECODE_PROFILE:-}" == itl6479 ]]; then
+        [[ "$dp" == 4 && "$tp" == 4 ]] || { printf 'itl6479 requires DP4/TP4\n' >&2; exit 2; }
         export VLLM_HCU_DP_PACKED_AG=1
         export HCU_STEP5_ROUTER_SHARED_MAX_M="${STEP5_ROUTER_SHARED_MAX_M:-32}"
         export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_SHARED_STREAM_MIN_TOKENS:-64}"
         export VLLM_STEP5_EXPERT_PLACEMENT="${STEP5_DECODE_PLACEMENT:?Set the measured Decode expert placement file}"
+    elif [[ "${STEP5_DECODE_PROFILE:-}" == dp16_native ]]; then
+        [[ "$dp" == 16 && "$tp" == 1 ]] || { printf 'dp16_native requires DP16/TP1\n' >&2; exit 2; }
+        export HCU_STEP5_ROUTER_SHARED_MAX_M="${STEP5_ROUTER_SHARED_MAX_M:-32}"
+        export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_SHARED_STREAM_MIN_TOKENS:-64}"
     fi
 fi
 extra=(--api-server-count 1)
@@ -122,7 +147,7 @@ command=(python3 -u -m vllm.entrypoints.cli.main serve "$model_dir"
     --no-enable-prefix-caching --max-cudagraph-capture-size 64
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+swiglustep_and_mul"],"compile_sizes":[16,64]}'
     --speculative-config '{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.838992,0.598322,0.362686],"use_local_argmax_reduction":true}'
-    --limit-mm-per-prompt '{"image":0}' "${extra[@]}")
+    --limit-mm-per-prompt '{"image":0}' "${scheduler_extra[@]}" "${extra[@]}")
 if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'EP_FUSED_MOE_TABLE=%q\n' "$EP_FUSED_MOE_TABLE"
     printf 'VLLM_HCU_DP_PACKED_AG=%q HCU_STEP5_ROUTER_SHARED_MAX_M=%q HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=%q\n' "${VLLM_HCU_DP_PACKED_AG:-0}" "${HCU_STEP5_ROUTER_SHARED_MAX_M:-64}" "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS"

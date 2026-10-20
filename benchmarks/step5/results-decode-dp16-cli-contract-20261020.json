@@ -1,0 +1,20 @@
+{
+  "exit": 0,
+  "stdout": "............                                                             [100%]\n12 passed in 0.36s\n",
+  "stderr": "",
+  "files_sha256": {
+    "benchmarks/step5/launch_multinode.sh": "ccf1f3d0bab40b89bbda481c704427e7a059bacfb86191ab71aee300bef2b66e",
+    "benchmarks/step5/package_runtime.py": "fcc0fcf86c5e440157210e3d79b0ba85b5a8c2dbf7309cca7f2cc78696d16699",
+    "tests/runtime_patch/test_step5_launch_limits.py": "0c47f6ec34afa3ed9e4eee376deaee326d7db44b9bb0e558ea2f218ccf67f3c2",
+    "tests/runtime_patch/test_step5_runtime_package.py": "5e26f07129a8496db18af6ec483bfb6754aeab06a81257d555feff4b82c54db8"
+  },
+  "gpu_work": false,
+  "scope": "Decode DP16 launcher/package contract only; no live decoder or performance claim",
+  "dp": 16,
+  "tp": 1,
+  "ep": 16,
+  "max_num_batched_tokens": 32768,
+  "max_model_len": 1048576,
+  "default_long_prefill_token_threshold": 2048,
+  "dp16_model_execution_validated": false
+}
