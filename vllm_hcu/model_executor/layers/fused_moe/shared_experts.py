@@ -37,6 +37,7 @@ logger = init_logger(__name__)
 # VLLM_HCU_* name on purpose: it only changes eager stream use inside the MoE
 # custom op, not the traced graph, so it must not change the compile hash.
 _LATE_STREAM_MIN_TOKENS = int(os.environ.get("HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS", "0"))
+_fused_router_stream_announced = False
 
 
 def _fused_router_stream_enabled() -> bool:
@@ -268,10 +269,16 @@ class SharedExperts(torch.nn.Module):
             self._output[index] = project(activation)
         self._output_pending_on_stream[index] = True
         self._output_pending_fused_router[index] = True
-        logger.info_once(
-            "Step5 fused-router shared down projection: auxiliary stream active",
-            scope="process",
-        )
+        # HCU replacement modules retain a vllm_hcu logger name, which can be
+        # filtered independently of vllm's INFO configuration. Match the other
+        # Step5 native activation markers and emit once after a real launch.
+        global _fused_router_stream_announced
+        if not _fused_router_stream_announced:
+            _fused_router_stream_announced = True
+            print(
+                "Step5 fused-router shared down projection: auxiliary stream active",
+                flush=True,
+            )
         return True
 
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:

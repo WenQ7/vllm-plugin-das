@@ -169,4 +169,7 @@ with torch.inference_mode():
             replays.append(dict(amplitude=amplitude, exact=True))
         results.append(dict(rows=m, eager_exact=True, changed_input_replays=replays))
 
-print(json.dumps(dict(passed=True, source=__file__, results=results)))
+assert se._fused_router_stream_announced
+print(json.dumps(dict(passed=True, source=__file__, results=results,
+    native_activation_announced=se._fused_router_stream_announced,
+    logger_name=se.logger.name, logger_effective_level=se.logger.getEffectiveLevel())))
