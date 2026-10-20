@@ -64,6 +64,19 @@
     "full_model_performance_validated": false
   },
   "worker_extension": false,
-  "full_model_activation_pending": true,
-  "full_model_performance_validated": false
+  "full_model_activation_pending": false,
+  "full_model_performance_validated": false,
+  "follow_up_prefill": {
+    "source_commit": "04c59a4b0c1b877c582164bdc6bb267640845e8d",
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "mean_tps": 27741.249141583405,
+    "reference": "results-prefill-selected-20261020.json",
+    "processes": 16,
+    "all_rounds_clean": true,
+    "improvement_comparison_pending": true
+  }
 }
