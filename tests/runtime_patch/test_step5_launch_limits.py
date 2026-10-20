@@ -41,6 +41,7 @@ def test_dp16_decode_retains_fixed_limits_and_local_ranks(launcher, rank):
         assert command[command.index(key) + 1] == value
     assert "VLLM_HCU_DP_PACKED_AG=0" in result.stdout
     assert "HCU_STEP5_BOUNDED_EP_WORKSPACE=1" in result.stdout
+    assert "VLLM_STEP4_DSA_GRAPH_REGIONS=0" in result.stdout
     if rank:
         assert command[command.index("--data-parallel-start-rank") + 1] == str(rank * 4)
         assert "--headless" in command

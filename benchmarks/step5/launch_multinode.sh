@@ -92,6 +92,9 @@ else
         dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
         dp16tp1)
             tp=1; dp=16; local_dp=4; gpu_util=0.91
+            # Size persistent DSA scores from the advertised context limit.
+            # The legacy narrow graph rejects longer decode histories.
+            export VLLM_STEP4_DSA_GRAPH_REGIONS=0
             export HCU_STEP5_BOUNDED_EP_WORKSPACE=1
             export EP_FUSED_MOE_CHUNK="${STEP5_DECODE_MOE_CHUNK:-65536}"
             case "$EP_FUSED_MOE_CHUNK" in 32768|65536) ;; *) printf 'Unsupported Decode MoE chunk\n' >&2; exit 2 ;; esac
@@ -158,6 +161,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'HCU_STEP5_FUSED_ROUTER_STREAM=%q\n' "$HCU_STEP5_FUSED_ROUTER_STREAM"
     printf 'EP_FUSED_MOE_CHUNK=%q\n' "$EP_FUSED_MOE_CHUNK"
     printf 'HCU_STEP5_BOUNDED_EP_WORKSPACE=%q\n' "$HCU_STEP5_BOUNDED_EP_WORKSPACE"
+    printf 'VLLM_STEP4_DSA_GRAPH_REGIONS=%q\n' "$VLLM_STEP4_DSA_GRAPH_REGIONS"
     printf '%q ' "${command[@]}"
     printf '\n'
     exit 0

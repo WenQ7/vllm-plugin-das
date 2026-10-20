@@ -1,0 +1,124 @@
+{
+  "scope": "Best verified Prefill configuration at current user constraints; no global optimality claim",
+  "recorded": "2026-10-20T23:56:59.321469+08:00",
+  "selected": {
+    "case": "prefill-dp16-user-restored",
+    "trial": "native-prefill-20261020-215742",
+    "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+    "tp": 1,
+    "dp": 16,
+    "ep": 16,
+    "concurrency": 64,
+    "input_tokens": 65536,
+    "output_tokens": 1,
+    "batched_tokens": 8192,
+    "warmup_rounds": 2,
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "rounds": [
+      {
+        "round": 3,
+        "prefill_tps": 28329.37049517894,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792505046.8369486,
+        "iteration_end": 1792505195.4225574,
+        "queue_samples_in_measurement": 4,
+        "max_observed_running": 16.0,
+        "max_observed_waiting": 48.0
+      },
+      {
+        "round": 4,
+        "prefill_tps": 28310.548278905713,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792505245.7474506,
+        "iteration_end": 1792505394.3730128,
+        "queue_samples_in_measurement": 4,
+        "max_observed_running": 16.0,
+        "max_observed_waiting": 48.0
+      },
+      {
+        "round": 5,
+        "prefill_tps": 28341.458612707218,
+        "preemptions": 0,
+        "complete_requests": 64,
+        "jit_events": 0,
+        "cache_updates": 0,
+        "iteration_start": 1792505442.205436,
+        "iteration_end": 1792505590.7160616,
+        "queue_samples_in_measurement": 4,
+        "max_observed_running": 16.0,
+        "max_observed_waiting": 48.0
+      }
+    ],
+    "mean_tps": 28327.12579559729,
+    "sample_stdev_tps": 15.576944215378258,
+    "strict_fa_dsa": true,
+    "worker_extension": false,
+    "placement": null,
+    "bounded_workspace": true,
+    "moe_chunk": 65536,
+    "pipe_min_tokens": 0,
+    "max_model_len": 70000,
+    "gpu_memory_utilization": 0.875,
+    "machines": 4,
+    "cards_per_machine": 4,
+    "concurrency_scope": "64 concurrent client requests; scheduler admission and queuing are allowed for output_len1, as in the supplied benchmark"
+  },
+  "model": "/data/model/Step5-Channel-FP8-w8a8",
+  "runtime": "/opt/xuwq_step5_native_prefill_dp16_user_20261020",
+  "user_preference": "Keep original expert placement; continue other optimizations.",
+  "minimum_startup_reported_kv_tokens": 798674,
+  "candidates_not_adopted": [
+    {
+      "name": "training-only static expert placement",
+      "heldout_max_load_proxy_change_percent": -34.59882770131672,
+      "proxy_is_not_throughput": true,
+      "formal_performance_measured": false,
+      "strict_first_target_matches": 55,
+      "controlled_cross_placement_matches": 56,
+      "total_requests": 64,
+      "baseline_self_matches": 63,
+      "placed_self_matches": 64,
+      "reason": "Full-model first-token/logprobs difference observed; business quality not established. User chose original placement."
+    },
+    {
+      "name": "original placement with MoEchunk131072",
+      "placement": null,
+      "first_target_matches": 56,
+      "total_requests": 64,
+      "minimum_startup_reported_kv_tokens": 566000,
+      "formal_performance_measured": false,
+      "reason": "Strict token check not passed; additional KV capacity cost. Keep the prior verified chunk65536 configuration."
+    }
+  ],
+  "prefill_launch_environment": {
+    "STEP5_PREFILL_DP_SIZE": "16",
+    "STEP5_PREFILL_BATCHED_TOKENS": "8192",
+    "STEP5_PREFILL_MAX_MODEL_LEN": "70000",
+    "STEP5_PREFILL_GPU_MEMORY_UTILIZATION": "0.875",
+    "STEP5_PREFILL_MOE_CHUNK": "65536",
+    "STEP5_PREFILL_BOUNDED_WORKSPACE": "1",
+    "STEP5_PREFILL_PIPE_MIN_TOKENS": "0",
+    "STEP5_API_HOST": "127.0.0.1",
+    "STEP5_PORT": "8018"
+  },
+  "decode_next": {
+    "dp": 16,
+    "tp": 1,
+    "ep": 16,
+    "max_num_batched_tokens": 32768,
+    "max_model_len": 1048576,
+    "placement": null,
+    "ITL_target_ms": 60,
+    "not_validated": true
+  }
+}
