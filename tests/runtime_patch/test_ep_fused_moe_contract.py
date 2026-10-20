@@ -373,3 +373,42 @@ def test_carve_reuses_disjoint_views_of_one_backing_allocation():
     scratch=backing[:128];output=backing[128:].view(8,16)
     result=carve(scratch,(8,4,4),torch.float32,"cpu",avoid=output)
     assert result.data_ptr()==scratch.data_ptr()
+
+
+@pytest.mark.parametrize("mode", ["main", "fallback", "unknown", "flag_off", "sp", "dbo"])
+def test_runtime_selected_wrapper_uses_bounded_workspace(monkeypatch, mode):
+    """Exercise the same outer expert class returned by the installed FP8 oracle."""
+    from vllm.model_executor.layers.fused_moe.experts import triton_deep_gemm_moe as selector
+    from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        Fp8MoeBackend, backend_to_kernel_cls,
+    )
+    cls=backend_to_kernel_cls(Fp8MoeBackend.DEEPGEMM)[0]
+    assert cls is selector.TritonOrDeepGemmExperts
+    if mode=="unknown":cls=type("UnreviewedSelector",(cls,),{})
+    outer=object.__new__(cls)
+    outer.experts=SimpleNamespace(step5_ep_chunk_size=lambda *a:32768)
+    outer.fallback_experts=SimpleNamespace()
+    monkeypatch.setattr(selector,"_valid_deep_gemm",lambda *a:mode!="fallback")
+    monkeypatch.setattr(selector,"is_deep_gemm_e8m0_used",lambda:False)
+    monkeypatch.setenv("HCU_STEP5_BOUNDED_EP_WORKSPACE","0" if mode=="flag_off" else "1")
+    allocations=[]
+    class Allocated(Exception):pass
+    def allocate(dtype,device,chunk,full,*args):
+        allocations.append((chunk,full));raise Allocated
+    pf=naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(is_sequence_parallel=mode=="sp")
+    runner=SimpleNamespace(fused_experts=outer,prepare_finalize=pf,N=-1,K=-1,_allocate_buffers=allocate)
+    ns={"torch":torch,"os":os,"dbo_enabled":lambda:mode=="dbo"}
+    path="vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py"
+    tree=ast.parse((ROOT/path).read_text())
+    if any(isinstance(n,ast.FunctionDef) and n.name=="_step5_ep_chunk_provider" for n in tree.body):
+        load_function(path,"_step5_ep_chunk_provider",ns)
+    fn=load_function(path,"_fused_experts",ns)
+    with pytest.raises(Allocated):
+        fn(runner,torch.bfloat16,torch.empty(65536,4096,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(65536,1,device="meta"),
+           torch.empty(22,3072,4096,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(22,4096,1536,device="meta",dtype=torch.float8_e4m3fn),
+           torch.empty(65536,8,device="meta"),torch.empty(65536,8,device="meta",dtype=torch.int32),
+           "swiglustep",352,22,torch.empty(352,device="meta",dtype=torch.int32),False,None)
+    assert allocations==[(32768 if mode=="main" else 65536,65536)]

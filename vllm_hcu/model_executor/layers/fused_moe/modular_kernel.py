@@ -68,6 +68,23 @@ _dp_pipe_announced = False
 _step5_ep_workspace_announced = False
 
 
+def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
+    """Use the implementation selected by the official runtime dispatcher."""
+    if os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") != "1":
+        return None
+    provider = getattr(experts, "step5_ep_chunk_size", None)
+    if provider is not None:
+        return provider
+    from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
+        TritonOrDeepGemmExperts,
+    )
+
+    if type(experts) is TritonOrDeepGemmExperts:
+        selected = experts._select_experts_impl(hidden_states, w1, w2)
+        return getattr(selected, "step5_ep_chunk_size", None)
+    return None
+
+
 def join_dp_moe_pipe() -> None:
     global _dp_pipe_pending
     if _dp_pipe_pending is not None:
@@ -1367,7 +1384,7 @@ class FusedMoEKernelModularImpl:
             return torch.empty_like(a1q, dtype=in_dtype)
 
         M_chunk = M_full
-        chunk_provider = getattr(self.fused_experts, "step5_ep_chunk_size", None)
+        chunk_provider = _step5_ep_chunk_provider(self.fused_experts, a1q, w1, w2)
         if chunk_provider is not None and not dbo_enabled():
             from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
 

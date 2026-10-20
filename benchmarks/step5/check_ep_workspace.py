@@ -19,6 +19,7 @@ torch.cuda.set_device(0)
 load_general_plugins(); apply_worker_patches()
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+from vllm.model_executor.layers.fused_moe.oracle.fp8 import Fp8MoeBackend, backend_to_kernel_cls
 from vllm.v1.worker.workspace import current_workspace_manager, init_workspace_manager
 from vllm_hcu.model_executor.layers.fused_moe import ep_fused_moe as ep
 from vllm_hcu.model_executor.layers.fused_moe import modular_kernel as mk
@@ -36,9 +37,13 @@ mapping[:E]=torch.arange(E,device='cuda',dtype=torch.int32)
 qconfig=SimpleNamespace(block_shape=None,use_fp8_w8a8=True,use_int8_w8a8=False,
     per_out_ch_quant=True,per_act_token_quant=True,w1_scale=s1,w2_scale=s2,
     a2_scale=None,gemm1_clamp_limit=7.0)
-expert=object.__new__(DeepGemmExperts)
-expert.quant_config=qconfig;expert._hcu_logical_n=2*I;expert._hcu_logical_k=K
-expert.gemm1_clamp_limit=7.;expert._lora_context=None
+inner=object.__new__(DeepGemmExperts)
+inner.quant_config=qconfig;inner._hcu_logical_n=2*I;inner._hcu_logical_k=K
+inner.gemm1_clamp_limit=7.;inner._lora_context=None
+dispatcher_cls=backend_to_kernel_cls(Fp8MoeBackend.DEEPGEMM)[0]
+expert=object.__new__(dispatcher_cls)
+expert.experts=inner;expert.fallback_experts=SimpleNamespace()
+expert.quant_config=qconfig;expert._lora_context=None
 runner=object.__new__(mk.FusedMoEKernelModularImpl)
 runner.fused_experts=expert;runner.N=2*I;runner.K=K
 runner.prepare_finalize=naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(num_dispatchers=16)
@@ -54,6 +59,7 @@ for rows,chunk,distribution in cases:
     experts=E if distribution=='all-local' else 352
     ids=torch.rand(rows,experts,device='cuda').topk(TOPK,dim=-1).indices.to(torch.int32)
     weights=torch.rand(rows,TOPK,device='cuda');weights/=weights.sum(-1,keepdim=True)
+    assert expert._select_experts_impl(x,w1,w2) is inner
     def reference():
         output=torch.empty(rows,K,device='cuda',dtype=torch.bfloat16)
         return ep.ep_fused_experts(x,w1,w2,weights,ids,mapping,s1,s2,
@@ -111,7 +117,7 @@ bytes_before=current_workspace_manager()._current_workspaces[0].numel()
 os.environ['HCU_STEP5_BOUNDED_EP_WORKSPACE']='1';candidate=native().clone()
 torch.cuda.synchronize();assert torch.equal(candidate,baseline)
 assert bytes_before==current_workspace_manager()._current_workspaces[0].numel()
-result=dict(passed=True,cases=reports,decode_one_chunk_bitexact=True,
+result=dict(passed=True,cases=reports,expert_dispatcher=dispatcher_cls.__module__+'.'+dispatcher_cls.__name__,decode_one_chunk_bitexact=True,
     decode_workspace_unchanged=True,full_model_quality_validated=False,
     full_model_performance_validated=False)
 Path(os.environ['STEP5_PROOF_OUTPUT']).write_text(json.dumps(result,indent=2))
