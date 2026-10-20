@@ -68,7 +68,7 @@ export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
-    tp=1; dp="${STEP5_PREFILL_DP_SIZE:-8}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
+    tp=1; dp="${STEP5_PREFILL_DP_SIZE:-16}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
     case "$dp" in 8|16) ;; *) printf 'Unsupported Prefill DP size\n' >&2; exit 2 ;; esac
     ((rank * local_dp < dp)) || { printf 'Node rank exceeds Prefill DP size\n' >&2; exit 2; }
     api_host="${STEP5_API_HOST:-127.0.0.1}"; api_port="${STEP5_PORT:-8018}"
