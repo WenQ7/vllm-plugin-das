@@ -1,6 +1,6 @@
 {
   "scope": "Best verified Prefill configuration at current user constraints; no global optimality claim",
-  "recorded": "2026-10-20T23:56:59.321469+08:00",
+  "recorded": "2026-10-21T00:43:40.012110+08:00",
   "selected": {
     "case": "prefill-dp16-user-restored",
     "trial": "native-prefill-20261020-215742",
@@ -83,21 +83,68 @@
       "heldout_max_load_proxy_change_percent": -34.59882770131672,
       "proxy_is_not_throughput": true,
       "formal_performance_measured": false,
-      "strict_first_target_matches": 55,
-      "controlled_cross_placement_matches": 56,
       "total_requests": 64,
-      "baseline_self_matches": 63,
-      "placed_self_matches": 64,
-      "reason": "Full-model first-token/logprobs difference observed; business quality not established. User chose original placement."
+      "reason": "Full-model first-token/logprobs difference observed; business quality not established. User chose original placement.",
+      "numerical_comparison_limit": "The original output probes did not pin DP destination, so their differences do not isolate placement effects. Business quality remains unestablished and user explicitly chose original placement.",
+      "unpinned_cross_placement_matches": 56,
+      "unpinned_initial_first_target_matches": 55,
+      "unpinned_baseline_self_matches": 63,
+      "unpinned_placed_self_matches": 64
     },
     {
       "name": "original placement with MoEchunk131072",
       "placement": null,
-      "first_target_matches": 56,
       "total_requests": 64,
       "minimum_startup_reported_kv_tokens": 566000,
-      "formal_performance_measured": false,
-      "reason": "Strict token check not passed; additional KV capacity cost. Keep the prior verified chunk65536 configuration."
+      "formal_performance_measured": true,
+      "reason": "Throughput is 1.33% lower and startup KV capacity is lower. Rejected on measured performance. Earlier unpinned token differences cannot isolate chunk effects from DP destination changes.",
+      "performance_only": true,
+      "mean_tps": 27951.34331672293,
+      "sample_stdev_tps": 30.683959928060034,
+      "relative_tps_change_percent": -1.3265817421291848,
+      "formal_rounds": [
+        {
+          "round": 3,
+          "prefill_tps": 27984.43607619643,
+          "preemptions": 0,
+          "complete_requests": 64,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792512853.1101727,
+          "iteration_end": 1792513003.4714592,
+          "queue_samples_in_measurement": 5,
+          "max_observed_running": 16.0,
+          "max_observed_waiting": 48.0
+        },
+        {
+          "round": 4,
+          "prefill_tps": 27945.758567781308,
+          "preemptions": 0,
+          "complete_requests": 64,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792513057.145886,
+          "iteration_end": 1792513207.7034101,
+          "queue_samples_in_measurement": 5,
+          "max_observed_running": 16.0,
+          "max_observed_waiting": 48.0
+        },
+        {
+          "round": 5,
+          "prefill_tps": 27923.835306191057,
+          "preemptions": 0,
+          "complete_requests": 64,
+          "jit_events": 0,
+          "cache_updates": 0,
+          "iteration_start": 1792513254.7336724,
+          "iteration_end": 1792513405.4089487,
+          "queue_samples_in_measurement": 5,
+          "max_observed_running": 16.0,
+          "max_observed_waiting": 48.0
+        }
+      ],
+      "numerical_fidelity_accepted": false,
+      "unpinned_first_target_matches": 56
     }
   ],
   "prefill_launch_environment": {
@@ -111,7 +158,15 @@
     "STEP5_API_HOST": "127.0.0.1",
     "STEP5_PORT": "8018"
   },
-  "decode_next": {
+  "selection_status": "Provisional best measured configuration; Prefill communication tuning remains in progress.",
+  "numerical_control_in_progress": {
+    "protocol": "64 fixed random-token prompts, 65536 input tokens and one output token; four waves of 16 with X-data-parallel-rank=index%16; per-engine success counters validate destination",
+    "performance_protocol": false,
+    "c131k_complete": true,
+    "c65536_pending": true,
+    "limits": "Does not control KV allocator free-list history or exact scheduler tick."
+  },
+  "decode_deferred": {
     "dp": 16,
     "tp": 1,
     "ep": 16,
@@ -119,6 +174,13 @@
     "max_model_len": 1048576,
     "placement": null,
     "ITL_target_ms": 60,
-    "not_validated": true
+    "not_validated": true,
+    "user_priority": "Only optimize Prefill now. Do not launch or tune Decode until the user resumes it."
+  },
+  "communication_screen": {
+    "report": "results-prefill-dp16-communication-20261021.json",
+    "selected": "Keep 32-channel automatic minimum and default buffer.",
+    "native_fp8_baseline_proxy_ms": 12.443908452987671,
+    "new_full_model_candidate_selected": false
   }
 }
