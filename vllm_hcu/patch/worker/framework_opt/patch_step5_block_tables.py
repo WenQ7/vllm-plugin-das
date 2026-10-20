@@ -48,6 +48,12 @@ def apply_to_module(module: ModuleType) -> bool:
             self._vllm_hcu_compact_block_tables = (
                 os.environ.get("HCU_STEP5_COMPACT_HOST_BLOCK_TABLES", "0") == "1"
             )
+            if self._vllm_hcu_compact_block_tables:
+                print(
+                    "[step5_host_tables] compact host snapshots enabled; "
+                    "full context backing retained",
+                    flush=True,
+                )
 
     def gather_block_tables_np(self, idx_mapping_np, num_reqs_padded):
         tables = getattr(self, "_vllm_hcu_block_tables_np", None)
