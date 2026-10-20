@@ -260,7 +260,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         self, w1, w2, activation, global_num_experts, expert_map,
         top_k, apply_router_weight_on_input,
     ) -> int | None:
-        """Bound Step5 scratch by the inner EP chunk, with plain Channel FP8."""
+        """Bound Step5 EP8/EP16 scratch by the inner Channel-FP8 chunk."""
         if not (
             _EP_FUSED_MOE
             and current_platform.is_rocm()
@@ -272,8 +272,9 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             and self.quant_config.per_out_ch_quant
             and self.quant_config.per_act_token_quant
             and getattr(self, "_lora_context", None) is None
-            and w1.shape == (22, 3072, 4096)
-            and w2.shape == (22, 4096, 1536)
+            and w1.ndim == 3 and w1.shape[0] in (22, 44)
+            and w1.shape[1:] == (3072, 4096)
+            and w2.shape == (w1.shape[0], 4096, 1536)
             and global_num_experts == 352
             and top_k == 8
         ):

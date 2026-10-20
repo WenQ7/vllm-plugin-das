@@ -285,12 +285,13 @@ def test_modular_chunk_scratch_has_independent_full_output(chunk, full):
     "block", "not_per_token", "not_per_channel", "other_experts", "other_global",
     "other_topk", "silu", "no_map", "router_on_input", "lora", "bad_scale",
 ])
-def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatch, case):
-    w1 = torch.empty(44 if case=="other_experts" else 22,3072,4096,
+@pytest.mark.parametrize("local_experts", [22, 44])
+def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatch, case, local_experts):
+    w1 = torch.empty(local_experts*2 if case=="other_experts" else local_experts,3072,4096,
                      device="meta",dtype=torch.float8_e4m3fn)
-    w2 = torch.empty(22,4096,1536,device="meta",dtype=w1.dtype)
-    s1 = torch.empty(22,3072,1,device="meta")
-    s2 = torch.empty(22,4096,1,device="meta")
+    w2 = torch.empty(local_experts,4096,1536,device="meta",dtype=w1.dtype)
+    s1 = torch.empty(local_experts,3072,1,device="meta")
+    s2 = torch.empty(local_experts,4096,1,device="meta")
     if case=="bad_scale":s1=torch.empty(1,device="meta")
     expert = SimpleNamespace(
         quant_config=SimpleNamespace(use_fp8_w8a8=True,
