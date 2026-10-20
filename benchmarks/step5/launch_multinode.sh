@@ -78,14 +78,7 @@ if [[ "$phase" == prefill ]]; then
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
     export NCCL_MAX_NCHANNELS=32
 else
-    tp=4; dp=4; local_dp=1
-    tokens="${STEP5_DECODE_BATCHED_TOKENS:-32768}"
-    max_len="${STEP5_DECODE_MAX_MODEL_LEN:-1048576}"
-    gpu_util=0.85
-    # A 64K input plus 4K output needs 69632 tokens. Smaller supported
-    # ceilings avoid provisioning 1M host block-table rows for that workload.
-    case "$max_len" in 70000|131072|1048576) ;; *) printf 'Unsupported Decode context limit\n' >&2; exit 2 ;; esac
-    case "$tokens" in 4096|8192|16384|32768) ;; *) printf 'Unsupported Decode batched-token limit\n' >&2; exit 2 ;; esac
+    tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
     export HCU_STEP5_EXPERT_GRID="${STEP5_DECODE_EXPERT_GRID:-0}"
     case "$HCU_STEP5_EXPERT_GRID" in 0|1) ;; *) printf 'Unsupported Decode expert-grid switch\n' >&2; exit 2 ;; esac
     export HCU_STEP5_FUSED_ROUTER_STREAM="${STEP5_DECODE_FUSED_ROUTER_STREAM:-0}"
