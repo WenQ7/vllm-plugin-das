@@ -233,4 +233,15 @@ P99为68.5472ms，Decode为2784.0134tokens/s，接受率60.1953%。这是一个�
 `STEP5_PREFILL_BOUNDED_WORKSPACE=1`为默认关闭的Prefill候选，只在实际支持的
 E22 Channel-FP8/SWIGLUSTEP、普通DP/EP且无SP、LoRA、DBO的路径上按内部chunk
 申请临时缓冲区，并为完整输出保留独立字节范围。Decode入口固定关闭此开关。
-待真实GPU算子、Graph重放和四节点同口径测试完成后，再决定是否采用。
+真实GPU检查已覆盖256/131072/131073/262144/262145行，使用每token各不重复的
+8个专家，普通执行及15次更换输入后的Graph重放与独立输出参考逐位一致。
+131072行workspace由17272143872降到5460983808字节，262144行由34452013056
+降到6534725632字节；M256单分块Decode的输出与workspace大小保持一致。
+检查调用真实DeepGemmExperts、原生modular runner与当前镜像的WorkspaceManager，
+不替换线上worker方法。最初包含重复专家ID的校验输入不符合真实topk约束，该次
+失败不计为通过；修正输入后在相同不可变主体代码上通过。详情见
+`results-ep-workspace-check-20261020.json`。
+
+四节点已正常启动提交`48945c1c`的16K候选，仍须取得实际KV容量和同口径正式成绩。
+还要在修复后的相同源码上重测8192基准，才能判断批量调整的真实收益；目前没有新的
+整模型Prefill吞吐或低于60ms的Decode结果，也没有完整模型质量验证结论。

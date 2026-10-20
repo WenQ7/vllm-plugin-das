@@ -44,11 +44,15 @@ runner.fused_experts=expert;runner.N=2*I;runner.K=K
 runner.prepare_finalize=naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular(num_dispatchers=16)
 ep.STEP5_EXPERT_GRID=False;ep.shared_add_provider=None;ep.DIRECT_MIN=0
 reports=[]
-for rows,chunk,distribution in [(256,64,'all-local'),(131072,32768,'global'),(131073,32768,'all-local')]:
+cases=[(256,64,'all-local'),(131072,32768,'global'),(131073,32768,'all-local'),
+       (262144,32768,'global'),(262145,32768,'all-local')]
+if os.environ.get('STEP5_WORKSPACE_LARGE_ONLY')=='1':cases=cases[-2:]
+for rows,chunk,distribution in cases:
     ep.CHUNK=chunk
     x=(torch.randn(rows,K,device='cuda')*8).to(ep.FP8)
     scale=torch.rand(rows,1,device='cuda')*.005+.01
-    ids=torch.randint(0,E if distribution=='all-local' else 352,(rows,TOPK),device='cuda',dtype=torch.int32)
+    experts=E if distribution=='all-local' else 352
+    ids=torch.rand(rows,experts,device='cuda').topk(TOPK,dim=-1).indices.to(torch.int32)
     weights=torch.rand(rows,TOPK,device='cuda');weights/=weights.sum(-1,keepdim=True)
     def reference():
         output=torch.empty(rows,K,device='cuda',dtype=torch.bfloat16)
@@ -60,7 +64,17 @@ for rows,chunk,distribution in [(256,64,'all-local'),(131072,32768,'global'),(13
     init_workspace_manager(torch.device('cuda',0))
     os.environ['HCU_STEP5_BOUNDED_EP_WORKSPACE']='1'
     expected=reference();actual=native();torch.cuda.synchronize()
-    assert torch.equal(actual,expected),(rows,'eager mismatch')
+    if not torch.equal(actual,expected):
+        again=reference();torch.cuda.synchronize()
+        diagnostic=dict(rows=rows,chunk=chunk,distribution=distribution,
+            different_elements=int((actual!=expected).sum()),
+            reference_repeat_bitexact=torch.equal(expected,again),
+            actual_nan=int(actual.isnan().sum()),reference_nan=int(expected.isnan().sum()),
+            relative_l2=float((actual.float()-expected.float()).norm()/expected.float().norm().clamp_min(1e-12)),
+            per_chunk_mismatches=[int((actual[s:s+chunk]!=expected[s:s+chunk]).sum()) for s in range(0,rows,chunk)])
+        Path(os.environ['STEP5_PROOF_OUTPUT']).write_text(json.dumps(dict(passed=False,diagnostic=diagnostic),indent=2))
+        print(json.dumps(diagnostic),flush=True)
+        raise AssertionError((rows,'eager mismatch'))
     expected_shape=expert.workspace_shapes(chunk,2*I,K,TOPK,352,E,None,MoEActivation.SWIGLUSTEP)
     full_shapes=expert.workspace_shapes(rows,2*I,K,TOPK,352,E,None,MoEActivation.SWIGLUSTEP)
     actual_bytes=current_workspace_manager()._current_workspaces[0].numel()
@@ -74,7 +88,7 @@ for rows,chunk,distribution in [(256,64,'all-local'),(131072,32768,'global'),(13
     with torch.cuda.graph(b):native_output=native()
     for value in [0,1,3]:
         x.fill_(value)
-        ids.copy_(torch.randint_like(ids,0,E if distribution=='all-local' else 352))
+        ids.copy_(torch.rand(rows,experts,device='cuda').topk(TOPK,dim=-1).indices.to(torch.int32))
         weights.copy_(torch.rand_like(weights));weights/=weights.sum(-1,keepdim=True)
         ref_output.zero_();native_output.zero_()
         a.replay();b.replay();torch.cuda.synchronize()
