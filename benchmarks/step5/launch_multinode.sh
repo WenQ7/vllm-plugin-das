@@ -68,7 +68,10 @@ export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
-    tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-32768}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-1048576}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.91}"
+    tp=1; dp="${STEP5_PREFILL_DP_SIZE:-8}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
+    case "$dp" in 8|16) ;; *) printf 'Unsupported Prefill DP size\n' >&2; exit 2 ;; esac
+    ((rank * local_dp < dp)) || { printf 'Node rank exceeds Prefill DP size\n' >&2; exit 2; }
+    api_host="${STEP5_API_HOST:-127.0.0.1}"; api_port="${STEP5_PORT:-8018}"
     case "$gpu_util" in 0.875|0.91) ;; *) printf 'Unsupported Prefill GPU memory utilization\n' >&2; exit 2 ;; esac
     case "$max_len" in 70000|1048576) ;; *) printf 'Unsupported Prefill context limit\n' >&2; exit 2 ;; esac
     export HCU_STEP5_BOUNDED_EP_WORKSPACE="${STEP5_PREFILL_BOUNDED_WORKSPACE:-0}"
@@ -84,6 +87,7 @@ if [[ "$phase" == prefill ]]; then
     fi
 else
     tp=4; dp=4; local_dp=1; tokens=32768; max_len=1048576; gpu_util=0.85
+    api_host="${STEP5_API_HOST:-0.0.0.0}"; api_port="${STEP5_PORT:-18118}"
     export HCU_STEP5_EXPERT_GRID="${STEP5_DECODE_EXPERT_GRID:-0}"
     case "$HCU_STEP5_EXPERT_GRID" in 0|1) ;; *) printf 'Unsupported Decode expert-grid switch\n' >&2; exit 2 ;; esac
     export HCU_STEP5_FUSED_ROUTER_STREAM="${STEP5_DECODE_FUSED_ROUTER_STREAM:-0}"
@@ -106,7 +110,7 @@ if [[ "$rank" != 0 ]]; then
 fi
 command=(python3 -u -m vllm.entrypoints.cli.main serve "$model_dir"
     --tokenizer "$STEP5_TOKENIZER" --served-model-name step5
-    --host 0.0.0.0 --port "${STEP5_PORT:-18118}"
+    --host "$api_host" --port "$api_port"
     --tensor-parallel-size "$tp" --data-parallel-size "$dp"
     --data-parallel-size-local "$local_dp"
     --data-parallel-address "$STEP5_HEAD_IP"
@@ -139,7 +143,7 @@ fi
 if [[ "$phase" == prefill && -n "${VLLM_STEP5_EXPERT_PLACEMENT:-}" ]]; then
     [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing Prefill placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
 fi
-python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE"
+python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE" --ep-size "$((tp * dp))"
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" \
     "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$MIOPEN_USER_DB_PATH"
 exec "${command[@]}"

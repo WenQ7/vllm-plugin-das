@@ -1,4 +1,4 @@
-"""Validate the effective EP16 table before loading the Step5 benchmark model."""
+"""Validate the effective EP8 or EP16 table before loading Step5."""
 from __future__ import annotations
 
 import argparse
@@ -9,14 +9,17 @@ from pathlib import Path
 KEY = "E=22,N=3072,K=4096,topk=8"
 
 
-def check_ep_table(path: str | Path) -> dict:
+def check_ep_table(path: str | Path, ep_size: int = 16) -> dict:
+    if ep_size not in (8, 16):
+        raise ValueError(f"Unsupported Step5 expert-parallel size: {ep_size}")
+    key = f"E={352 // ep_size},N=3072,K=4096,topk=8"
     path = Path(path).resolve()
     raw = path.read_bytes()
     table = json.loads(raw)
-    entries = table.get(KEY)
+    entries = table.get(key)
     if not isinstance(entries, dict) or not entries:
         raise ValueError(
-            f"Step5 EP16 requires {KEY} in {path}; the effective table would "
+            f"Step5 EP{ep_size} requires {key} in {path}; the effective table would "
             "otherwise fall back to untuned library configurations"
         )
     points = {}
@@ -24,31 +27,32 @@ def check_ep_table(path: str | Path) -> dict:
         try:
             size = int(size)
         except (TypeError, ValueError) as error:
-            raise ValueError(f"Invalid Step5 EP16 token count: {size!r}") from error
+            raise ValueError(f"Invalid Step5 EP{ep_size} token count: {size!r}") from error
         if size <= 0 or size in points or not isinstance(pair, list) or len(pair) != 2:
-            raise ValueError(f"Invalid Step5 EP16 GEMM pair at M={size}")
+            raise ValueError(f"Invalid Step5 EP{ep_size} GEMM pair at M={size}")
         for config in pair:
             if not isinstance(config, dict) or any(
                 type(config.get(name)) is not int or config[name] <= 0
                 for name in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K")
             ):
-                raise ValueError(f"Invalid Step5 EP16 GEMM dimensions at M={size}")
+                raise ValueError(f"Invalid Step5 EP{ep_size} GEMM dimensions at M={size}")
         if pair[0]["BLOCK_SIZE_M"] != pair[1]["BLOCK_SIZE_M"]:
-            raise ValueError(f"Step5 EP16 GEMM pair has different BLOCK_SIZE_M at M={size}")
+            raise ValueError(f"Step5 EP{ep_size} GEMM pair has different BLOCK_SIZE_M at M={size}")
         points[size] = pair
     selected = {}
     for size in (256, 32768):
         nearest = min(points, key=lambda candidate: abs(candidate-size))
         selected[str(size)] = {"table_m": nearest, "gemm1": points[nearest][0], "gemm2": points[nearest][1]}
     return {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(),
-            "key": KEY, "entries": len(points), "selected": selected}
+            "key": key, "ep_size": ep_size, "entries": len(points), "selected": selected}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("path", type=Path)
+    parser.add_argument("--ep-size", type=int, choices=[8, 16], default=16)
     args = parser.parse_args()
     try:
-        print("STEP5_EP16_TABLE " + json.dumps(check_ep_table(args.path)))
+        print(f"STEP5_EP{args.ep_size}_TABLE " + json.dumps(check_ep_table(args.path, args.ep_size)))
     except (ValueError, OSError) as error:
         parser.exit(2, str(error) + "\n")

@@ -157,7 +157,8 @@ def build_bundle(repo: Path, ref: str, output: Path, hcu_ops: Path, tokenizer: P
         'Model weights and placement PT files are external. This bundle asserts no performance score.\n'
         'Inside the matching Python3.12/DTK image: python3 prepare_runtime.py\n'
         'Set STEP5_DECODE_PLACEMENT, then bash server_step5.sh decode NODE_RANK (0..3).\n'
-        'For DP16TP1EP16 Prefill: bash server_step5.sh prefill NODE_RANK.\n',encoding='utf-8')
+        'For DP8TP1EP8 Prefill on two four-GPU hosts: bash server_step5.sh prefill NODE_RANK (0..1).\n'
+        'Prefill defaults: batch8192, context70000, localhost:8018, gpu_memory_utilization0.875.\n',encoding='utf-8')
     files = {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in output.iterdir() if p.is_file()}
     manifest = {'source_commit':commit,'source_export':'complete pinned Git object export',
                 'git_files':len(expected),'ep16_entries':len(table[key]),'external_hcu_ops_sha256':hashlib.sha256(binary).hexdigest(),
