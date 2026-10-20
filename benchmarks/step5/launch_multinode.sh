@@ -68,7 +68,8 @@ export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 
 if [[ "$phase" == prefill ]]; then
-    tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len=70000; gpu_util=0.875
+    tp=1; dp=16; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util=0.875
+    case "$max_len" in 70000|1048576) ;; *) printf 'Unsupported Prefill context limit\n' >&2; exit 2 ;; esac
     export HCU_STEP5_BOUNDED_EP_WORKSPACE="${STEP5_PREFILL_BOUNDED_WORKSPACE:-0}"
     case "$HCU_STEP5_BOUNDED_EP_WORKSPACE" in 0|1) ;; *) printf 'Unsupported Prefill workspace switch\n' >&2; exit 2 ;; esac
     case "$tokens" in 4096|8192|16384|32768) ;; *) printf 'Unsupported Prefill batched-token limit\n' >&2; exit 2 ;; esac
