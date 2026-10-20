@@ -256,6 +256,45 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def step5_ep_chunk_size(
+        self, w1, w2, activation, global_num_experts, expert_map,
+        top_k, apply_router_weight_on_input,
+    ) -> int | None:
+        """Bound Step5 scratch by the inner EP chunk, with plain Channel FP8."""
+        if not (
+            _EP_FUSED_MOE
+            and current_platform.is_rocm()
+            and henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") == "1"
+            )
+            and self.block_shape is None
+            and self.quant_config.use_fp8_w8a8
+            and self.quant_config.per_out_ch_quant
+            and self.quant_config.per_act_token_quant
+            and getattr(self, "_lora_context", None) is None
+            and w1.shape == (22, 3072, 4096)
+            and w2.shape == (22, 4096, 1536)
+            and global_num_experts == 352
+            and top_k == 8
+        ):
+            return None
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
+            supports_channel_ep_fused,
+        )
+
+        if not supports_channel_ep_fused(
+            w1, w2, self.w1_scale, self.w2_scale,
+            block_shape=self.block_shape, activation=activation,
+            expert_map=expert_map,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+        ):
+            return None
+        from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import CHUNK
+
+        if CHUNK <= 0:
+            raise ValueError("EP_FUSED_MOE_CHUNK must be positive")
+        return CHUNK
+
     def workspace_shapes(
         self,
         M: int,

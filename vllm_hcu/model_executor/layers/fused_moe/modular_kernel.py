@@ -65,6 +65,7 @@ _dp_pipe_stream: torch.cuda.Stream | None = None
 # (side stream, tensors it still reads/writes) until the main stream joins it.
 _dp_pipe_pending: tuple | None = None
 _dp_pipe_announced = False
+_step5_ep_workspace_announced = False
 
 
 def join_dp_moe_pipe() -> None:
@@ -1164,6 +1165,25 @@ class FusedMoEKernelModularImpl:
             activation,
         )
 
+        if M_chunk < M_full:
+            # The inner EP loop reuses both scratch buffers across chunks.
+            # Its full output must survive every later GEMM1 and GEMM2.
+            workspace13, workspace2, fused_out = (
+                current_workspace_manager().get_simultaneous(
+                    (workspace13_shape, workspace_dtype),
+                    (workspace2_shape, workspace_dtype),
+                    (fused_out_shape, out_dtype),
+                )
+            )
+            global _step5_ep_workspace_announced
+            if not _step5_ep_workspace_announced:
+                _step5_ep_workspace_announced = True
+                print(
+                    f"[step5_ep_workspace] active: full_M={M_full} "
+                    f"chunk_M={M_chunk} separate_output=True", flush=True,
+                )
+            return workspace13, workspace2, fused_out
+
         # We can reuse the memory between cache1 and cache3 because by the
         # time we need cache3, we're done with cache1.
         # Reuse workspace13 for the output since there is only one chunk.
@@ -1346,10 +1366,28 @@ class FusedMoEKernelModularImpl:
         if M_full == 0:
             return torch.empty_like(a1q, dtype=in_dtype)
 
+        M_chunk = M_full
+        chunk_provider = getattr(self.fused_experts, "step5_ep_chunk_size", None)
+        if chunk_provider is not None and not dbo_enabled():
+            from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
+
+            pf = self.prepare_finalize
+            if (
+                type(pf) is naive_dp_ep.MoEPrepareAndFinalizeNaiveDPEPModular
+                and not pf.is_sequence_parallel
+                and pf._lora_context is None
+            ):
+                ep_chunk = chunk_provider(
+                    w1, w2, activation, global_num_experts, expert_map,
+                    top_k, apply_router_weight_on_input,
+                )
+                if ep_chunk is not None:
+                    M_chunk = min(M_full, ep_chunk)
+
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
             a1q.device,
-            M_full,
+            M_chunk,
             M_full,
             N,
             K,

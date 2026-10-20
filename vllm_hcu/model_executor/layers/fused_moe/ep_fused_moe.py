@@ -466,12 +466,20 @@ def _carve(ws, shape, dtype, device, *, avoid=None):
     nbytes = dtype.itemsize
     for d in shape:
         nbytes *= d
-    # Reduction programs must not overwrite another token's unread routes.
-    # Storage identity also catches output slices with a nonzero offset.
-    aliases_output = (
-        ws is not None and avoid is not None
-        and ws.untyped_storage().data_ptr() == avoid.untyped_storage().data_ptr()
-    )
+    # WorkspaceManager returns disjoint views of one backing allocation.
+    # Compare the actual byte intervals, including nonzero output offsets.
+    aliases_output = False
+    if ws is not None and avoid is not None and ws.device == avoid.device:
+        if ws.is_contiguous() and avoid.is_contiguous():
+            start, other = ws.data_ptr(), avoid.data_ptr()
+            aliases_output = (
+                start < other + avoid.numel() * avoid.element_size()
+                and other < start + nbytes
+            )
+        else:
+            aliases_output = (
+                ws.untyped_storage().data_ptr() == avoid.untyped_storage().data_ptr()
+            )
     if (ws is None or not ws.is_contiguous()
             or ws.numel() * ws.element_size() < nbytes or aliases_output):
         return torch.empty(shape, dtype=dtype, device=device)
@@ -482,7 +490,7 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                      w1_scale, w2_scale, a1_scale=None, global_num_experts=-1,
                      output_dtype=None, gemm1_limit=None, routed_scaling_factor=1.0,
                      configs=None, expert_mask=None, out=None, workspace13=None,
-                     workspace2=None):
+                     workspace2=None, preserve_chunk_output=None):
     # out/workspace13/workspace2: caller-owned buffers (vLLM modular-kernel workspaces).
     # cache1 then cache3 live in workspace13, act_q in workspace2.
     out_dtype = output_dtype or (out.dtype if out is not None else hidden_states.dtype)
@@ -531,7 +539,10 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
             *sorting_args, expert_layout=expert_layout)
 
     dev = hidden_states.device
-    cache1 = _carve(workspace13, (rows, N), out_dtype, dev)
+    # Later chunks must preserve every previously completed output slice.
+    # Modular workspaces may share the output's storage, including at an offset.
+    cache1 = _carve(workspace13, (rows, N), out_dtype, dev,
+                    avoid=preserve_chunk_output)
     if presort and a_s.numel() == M:
         # A gathered into sorted order first (lives in workspace2, dead before act_q).
         a_g, s_g = ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, workspace2)
@@ -561,9 +572,10 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
                       flush=True)
             _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, expert_map,
                                sorted_ids, sorted_w, expert_ids, nvalid, compute_type, cfg2,
-                               use_mls, out, xoff, workspace13)
+                               use_mls, out, xoff, workspace13, preserve_chunk_output)
             return out
-    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev, avoid=out)
+    cache3 = _carve(workspace13, (M, topk, K), out_dtype, dev,
+                    avoid=preserve_chunk_output if preserve_chunk_output is not None else out)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, nvalid, 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
@@ -591,7 +603,7 @@ def _ep_direct_xoff(out, topk_ids):
 
 def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, expert_map,
                        sorted_ids, sorted_w, expert_ids, nvalid, compute_type, cfg2, use_mls,
-                       out, xoff, workspace13):
+                       out, xoff, workspace13, preserve_chunk_output=None):
     """GEMM2 + local top-k sum without the (M, topk, K) cache; see DIRECT_MIN."""
     M, topk = topk_ids.shape
     K = out.shape[1]
@@ -614,7 +626,8 @@ def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, exper
           bottom_a_use_mls_load=use_mls, ck_sorting=False, ck_topk=topk,
           scale_bias_with_routed_weight=True)
     # Fallback (scratch overflow) GEMM2 into cache3: exits at once unless gate[1] > 0.
-    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev, avoid=out)
+    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev,
+                    avoid=preserve_chunk_output if preserve_chunk_output is not None else out)
     _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
           expert_ids, gate[1:2], 1, compute_type, cfg2, a_sorted=True,
           bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
@@ -642,7 +655,7 @@ def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, 
             _ep_fused_experts(hidden_states[s:s + CHUNK], w1, w2, topk_weights[s:s + CHUNK],
                               topk_ids[s:s + CHUNK], expert_map, w1_scale, w2_scale,
                               a1_scale=None if a1 is None or a1.numel() == 1 else a1[s:s + CHUNK],
-                              out=out[s:s + CHUNK], **kw)
+                              out=out[s:s + CHUNK], preserve_chunk_output=out, **kw)
         return out
     return torch.cat([
         _ep_fused_experts(hidden_states[s:s + CHUNK], w1, w2, topk_weights[s:s + CHUNK],
