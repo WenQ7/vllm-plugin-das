@@ -93,9 +93,13 @@ def _valid_deep_gemm(
         logger.debug_once("DeepGemm disabled: deep_gemm not available.")
         return False
 
-    # HCU Marlin-packed weights [E, K/64, N/16, 4, 16, 16] are consumable
-    # only by the HCU DeepGEMM kernels; Triton cannot read this layout.
-    if w1.dim() == 6 and w2.dim() == 6:
+    # HCU Marlin-packed weights are consumable only by the HCU DeepGEMM
+    # kernels; Triton cannot read these layouts. gfx938 pair32 adds a leading
+    # pair dimension and therefore has rank 7.
+    if w1.dim() == w2.dim() and w1.dim() in (6, 7):
+        assert w1.size(0) == w2.size(0)
+        if w1.dim() == 7:
+            assert tuple(w1.shape[-4:]) == tuple(w2.shape[-4:]) == (2, 4, 16, 16)
         return True
 
     M = hidden_states.size(0)

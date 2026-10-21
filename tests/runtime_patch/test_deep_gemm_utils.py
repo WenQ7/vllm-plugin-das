@@ -159,6 +159,31 @@ def _load_deep_gemm_apply():
     return namespace
 
 
+def test_valid_deep_gemm_accepts_gfx938_pair32_weights():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/experts/deep_gemm_moe.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_valid_deep_gemm"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {
+        "torch": torch,
+        "has_deep_gemm": lambda: True,
+        "logger": SimpleNamespace(debug_once=lambda *_args: None),
+    }
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    assert namespace["_valid_deep_gemm"](
+        torch.empty((131072, 4096), device="meta"),
+        torch.empty((22, 64, 96, 2, 4, 16, 16), device="meta"),
+        torch.empty((22, 24, 128, 2, 4, 16, 16), device="meta"),
+    )
+
+
 def _load_deep_gemm_problem_size():
     source_path = (
         Path(__file__).parents[2]
