@@ -261,5 +261,13 @@
       "mean_centered_common_top_logprobs_rmse": 0.0
     }
   },
-  "live_service": "selected baseline restoration in progress"
+  "live_service": {
+    "case": "prefill-dp16-after-aiter-rejected",
+    "backend": "ep_fused_moe",
+    "source_commit": "1997af79d75cd070938faf77b72c3a0fbe344ab5",
+    "all16_verified": true,
+    "kv_capacity_min": 794555,
+    "kv_capacity_max": 805194,
+    "selected_baseline_mean_input_tps": 28327.12579559729
+  }
 }
