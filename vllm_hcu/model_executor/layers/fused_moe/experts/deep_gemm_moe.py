@@ -202,6 +202,39 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        """Use logical model dimensions for HCU's opaque packed weights.
+
+        gfx938 pair32 packing produces rank-7 tensors, while the generic
+        modular contract only understands rank-3 and the older rank-6 layout.
+        The logical dimensions were captured from ``FusedMoEConfig`` before
+        packing, so they are the authoritative shape for workspace sizing.
+        """
+        if not current_platform.is_rocm():
+            return super().moe_problem_size(a1, w1, w2, topk_ids)
+        assert w1.size(0) == w2.size(0)
+        experts = w1.size(0)
+        if a1.dim() == 2:
+            assert topk_ids.size(0) == a1.size(0)
+            tokens = a1.size(0)
+        else:
+            assert a1.dim() == 3 and a1.size(0) == experts
+            tokens = a1.size(1)
+        assert topk_ids.dim() == 2
+        return (
+            experts,
+            tokens,
+            self._hcu_logical_n,
+            self._hcu_logical_k,
+            topk_ids.size(1),
+        )
+
     @staticmethod
     def _supports_current_device() -> bool:
         return current_platform.is_rocm() or is_deep_gemm_supported()
