@@ -1,6 +1,6 @@
 {
   "measured_at": "2026-10-21",
-  "status": "operator_tuned_full_model_validation_pending",
+  "status": "rejected_full_model_warmup_regression",
   "parallel": "DP16TP1EP16",
   "prefill_recipe": {
     "concurrency": 64,
@@ -224,5 +224,42 @@
       }
     }
   },
-  "selected_baseline_mean_input_tps": 28327.12579559729
+  "selected_baseline_mean_input_tps": 28327.12579559729,
+  "selected": false,
+  "full_model": {
+    "service_case": "prefill-aiter-asm-tuned",
+    "all16_verified": true,
+    "backend": "AITER",
+    "shuffle": true,
+    "solution": "13001+23001",
+    "kv_capacity_min": 643234,
+    "kv_capacity_max": 660101,
+    "warmup_round": 1,
+    "warmup_only": true,
+    "formal_rounds_run": 0,
+    "prefill_tps": 15177.561330177074,
+    "delta_vs_selected_baseline_percent": -46.42039774986269,
+    "complete_requests": 64,
+    "incomplete_requests": 0,
+    "preemptions": 0.0,
+    "iteration_start": 1792562857.5854745,
+    "iteration_end": 1792563134.4426193,
+    "cache_updates_in_iteration": 0,
+    "jit_events_in_iteration": 0,
+    "reason_stopped_after_warmup": "Clean warmup throughput was more than 40% below the selected baseline; additional formal rounds cannot make this candidate competitive."
+  },
+  "numerical": {
+    "baseline_comparison": {
+      "token_matches": 59,
+      "top_logprobs_exact": 0,
+      "mean_centered_common_top_logprobs_rmse": 0.1488349070531202,
+      "p95_centered_common_top_logprobs_rmse": 0.34151076194594854
+    },
+    "self_repeatability": {
+      "token_matches": 64,
+      "top_logprobs_exact": 64,
+      "mean_centered_common_top_logprobs_rmse": 0.0
+    }
+  },
+  "live_service": "selected baseline restoration in progress"
 }
