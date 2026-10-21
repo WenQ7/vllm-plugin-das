@@ -97,6 +97,21 @@ def test_invalid_prefill_shared_expert_stream_threshold_fails(launcher):
     assert launcher("prefill", STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS="1").returncode != 0
 
 
+def test_prefill_can_select_aiter_without_changing_fixed_limits(launcher):
+    result = launcher("prefill", STEP5_PREFILL_MOE_BACKEND="aiter")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    assert command[command.index("--moe-backend") + 1] == "aiter"
+    assert command[command.index("--tensor-parallel-size") + 1] == "1"
+    assert command[command.index("--data-parallel-size") + 1] == "16"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
+    assert command[command.index("--max-model-len") + 1] == "70000"
+
+
+def test_invalid_prefill_moe_backend_fails(launcher):
+    assert launcher("prefill", STEP5_PREFILL_MOE_BACKEND="deep_gemm").returncode != 0
+
+
 @pytest.mark.parametrize("settings", [
     {"STEP5_DECODE_PARALLEL": "dp8tp2"},
     {"STEP5_DECODE_PARALLEL": "dp16tp1", "STEP5_DECODE_PROFILE": "itl6479", "STEP5_DECODE_PLACEMENT": "/external/placement.pt"},

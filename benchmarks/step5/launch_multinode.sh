@@ -68,6 +68,7 @@ export HCU_STEP5_BOUNDED_EP_WORKSPACE=0
 export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 scheduler_extra=()
+moe_backend_extra=()
 
 if [[ "$phase" == prefill ]]; then
     tp=1; dp="${STEP5_PREFILL_DP_SIZE:-16}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
@@ -85,6 +86,11 @@ if [[ "$phase" == prefill ]]; then
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
     export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS:-4096}"
     case "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS" in 0|4096|8192|16384) ;; *) printf 'Unsupported Prefill shared-expert stream threshold\n' >&2; exit 2 ;; esac
+    case "${STEP5_PREFILL_MOE_BACKEND:-auto}" in
+        auto) ;;
+        aiter) moe_backend_extra=(--moe-backend aiter) ;;
+        *) printf 'Unsupported Prefill MoE backend\n' >&2; exit 2 ;;
+    esac
     export NCCL_MAX_NCHANNELS=32
     if [[ -n "${STEP5_PREFILL_PLACEMENT:-}" ]]; then
         export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"
@@ -153,7 +159,7 @@ command=(python3 -u -m vllm.entrypoints.cli.main serve "$model_dir"
     --no-enable-prefix-caching --max-cudagraph-capture-size 64
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+swiglustep_and_mul"],"compile_sizes":[16,64]}'
     --speculative-config '{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.838992,0.598322,0.362686],"use_local_argmax_reduction":true}'
-    --limit-mm-per-prompt '{"image":0}' "${scheduler_extra[@]}" "${extra[@]}")
+    --limit-mm-per-prompt '{"image":0}' "${moe_backend_extra[@]}" "${scheduler_extra[@]}" "${extra[@]}")
 if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'EP_FUSED_MOE_TABLE=%q\n' "$EP_FUSED_MOE_TABLE"
     printf 'VLLM_HCU_DP_PACKED_AG=%q HCU_STEP5_ROUTER_SHARED_MAX_M=%q HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=%q\n' "${VLLM_HCU_DP_PACKED_AG:-0}" "${HCU_STEP5_ROUTER_SHARED_MAX_M:-64}" "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS"
