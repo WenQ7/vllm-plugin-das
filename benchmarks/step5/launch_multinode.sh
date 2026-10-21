@@ -83,6 +83,8 @@ if [[ "$phase" == prefill ]]; then
     case "$EP_FUSED_MOE_CHUNK" in 16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill MoE chunk size\n' >&2; exit 2 ;; esac
     export HCU_DP_MOE_PIPE_MIN_TOKENS="${STEP5_PREFILL_PIPE_MIN_TOKENS:-0}"
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
+    export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS:-4096}"
+    case "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS" in 0|4096|8192|16384) ;; *) printf 'Unsupported Prefill shared-expert stream threshold\n' >&2; exit 2 ;; esac
     export NCCL_MAX_NCHANNELS=32
     if [[ -n "${STEP5_PREFILL_PLACEMENT:-}" ]]; then
         export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"

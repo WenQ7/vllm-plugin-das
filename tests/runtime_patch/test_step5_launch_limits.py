@@ -78,8 +78,23 @@ def test_prefill_can_screen_native_deepgemm_without_changing_recipe(launcher):
     assert baseline_command == candidate_command
 
 
+def test_prefill_can_screen_shared_expert_late_stream_without_changing_recipe(launcher):
+    baseline = launcher("prefill")
+    candidate = launcher("prefill", STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS="0")
+    assert baseline.returncode == candidate.returncode == 0
+    assert "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096" in baseline.stdout
+    assert "HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=0" in candidate.stdout
+    baseline_command = shlex.split(baseline.stdout.splitlines()[-1])
+    candidate_command = shlex.split(candidate.stdout.splitlines()[-1])
+    assert baseline_command == candidate_command
+
+
 def test_invalid_prefill_expert_kernel_switch_fails(launcher):
     assert launcher("prefill", STEP5_PREFILL_EP_FUSED_MOE="deepgemm").returncode != 0
+
+
+def test_invalid_prefill_shared_expert_stream_threshold_fails(launcher):
+    assert launcher("prefill", STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS="1").returncode != 0
 
 
 @pytest.mark.parametrize("settings", [
