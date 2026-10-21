@@ -196,6 +196,36 @@ def test_hcu_problem_size_uses_logical_dimensions_for_gfx938_pair32_weights():
     ) == (22, 131072, 3072, 4096, 8)
 
 
+def test_generic_problem_size_understands_gfx938_pair32_weights():
+    source_path = (
+        Path(__file__).parents[2]
+        / "vllm_hcu/model_executor/layers/fused_moe/modular_kernel.py"
+    )
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    experts = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "FusedMoEExpertsModular"
+    )
+    function = next(
+        node
+        for node in experts.body
+        if isinstance(node, ast.FunctionDef) and node.name == "moe_problem_size"
+    )
+    module = ast.Module(body=[function], type_ignores=[])
+    namespace = {"torch": torch}
+    exec(compile(ast.fix_missing_locations(module), source_path, "exec"), namespace)
+    problem_size = namespace["moe_problem_size"]
+    assert problem_size(
+        object(),
+        torch.empty((131072, 4096), device="meta"),
+        torch.empty((22, 64, 96, 2, 4, 16, 16), device="meta"),
+        torch.empty((22, 24, 128, 2, 4, 16, 16), device="meta"),
+        torch.empty((131072, 8), dtype=torch.int32, device="meta"),
+    ) == (22, 131072, 3072, 4096, 8)
+
+
 def _run_w8a8_apply(
     namespace: dict[str, object], *, packed_weights: bool = False
 ) -> None:
