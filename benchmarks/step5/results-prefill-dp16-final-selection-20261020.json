@@ -1,6 +1,6 @@
 {
   "scope": "Best verified Prefill configuration at current user constraints; no global optimality claim",
-  "recorded": "2026-10-21T01:25:46.976347+08:00",
+  "recorded": "2026-10-21T08:50:18.405322+08:00",
   "selected": {
     "case": "prefill-dp16-user-restored",
     "trial": "native-prefill-20261020-215742",
@@ -158,7 +158,7 @@
     "STEP5_API_HOST": "127.0.0.1",
     "STEP5_PORT": "8018"
   },
-  "selection_status": "Provisional best measured configuration. Communication and large-M MoE tile screens found no new candidate; DeepEP HT capability screening remains next.",
+  "selection_status": "Provisional best measured native configuration unchanged. Installed DeepEP HT has a topology mismatch. Packed-MoE candidate is prepared locally but GPU execution has not started because SSH banner exchange is unavailable.",
   "decode_deferred": {
     "dp": 16,
     "tp": 1,
@@ -191,5 +191,16 @@
     "selected": "Keep original table.",
     "new_native_candidate_selected": false
   },
-  "live_service_status": "Stopped after verified-idle control to run isolated GPU capability screens; selected runtime/configuration is preserved."
+  "live_service_status": "Last observed stopped for isolated GPU tests; current remote state is unverified during SSH outage.",
+  "deepep_ht_capability": {
+    "report": "results-prefill-dp16-deepep-capability-20261021.json",
+    "passed": false,
+    "model_backend_changed": false
+  },
+  "packed_moe_candidate": {
+    "gpu_execution_started": false,
+    "cpu_encoded_routing_reference_passed": true,
+    "model_source_changed": false,
+    "new_performance_result": false
+  }
 }
