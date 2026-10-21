@@ -191,7 +191,7 @@
     "selected": "Keep original table.",
     "new_native_candidate_selected": false
   },
-  "live_service_status": "Selected c65536 original-placement baseline is being restored after the rejected DeepGEMM performance-only run.",
+  "live_service_status": "Selected c65536 original-placement baseline restored as prefill-dp16-final-baseline; all16 ranks and startup capacities verified.",
   "deepep_ht_capability": {
     "report": "results-prefill-dp16-deepep-capability-20261021.json",
     "passed": false,
