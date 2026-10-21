@@ -51,7 +51,41 @@
   },
   "decision": {
     "packed_on_call": "Rejected: packing weights on each forward is consistently slower.",
-    "prepacked_upper_bound": "Promising operator candidate only. Existing weight-conversion code can replace original parameters with packed parameters after loading, so steady-state storage does not inherently require two full copies. Startup, KV capacity, fixed-DP output controls, and native C64 throughput remain unvalidated.",
+    "prepacked_upper_bound": "Rejected after full-model validation: the local GEMM advantage did not survive routing, permutation, padding, and complete-model execution.",
     "production_changed": false
+  },
+  "native_validation": {
+    "source_commit": "d2aa5d8b611d5ed18fc67a26fc77266375e64638",
+    "case": "prefill-dp16-native-deepgemm-route",
+    "trial": "native-prefill-20261021-122316",
+    "backend": "DEEPGEMM FP8 MoE with existing allgather_reducescatter communication; DeepEP disabled",
+    "formal_rounds": [
+      3,
+      4,
+      5
+    ],
+    "formal_tps": [
+      25162.96062408295,
+      25190.15347091441,
+      25166.232575508253
+    ],
+    "mean_tps": 25173.115556835204,
+    "sample_stdev_tps": 14.845682997430778,
+    "relative_to_selected_baseline_percent": -11.134240238564175,
+    "clean_rounds": 3,
+    "complete_requests_per_round": 64,
+    "preemptions": 0,
+    "jit_or_cache_writes_during_formal_rounds": 0,
+    "minimum_startup_reported_kv_tokens": 671649,
+    "fixed_dp_output_controls": {
+      "requests": 64,
+      "baseline_cross_candidate_first_token_matches": 44,
+      "candidate_self_repeat_first_token_matches": 58,
+      "baseline_cross_candidate_top20_exact": 0,
+      "candidate_self_repeat_top20_exact": 0,
+      "performance_score": false,
+      "business_quality_evaluated": false
+    },
+    "accepted": false
   }
 }

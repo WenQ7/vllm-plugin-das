@@ -158,7 +158,7 @@
     "STEP5_API_HOST": "127.0.0.1",
     "STEP5_PORT": "8018"
   },
-  "selection_status": "Provisional best measured native configuration unchanged. Installed DeepEP HT has a topology mismatch. Packed-on-call is rejected; prepacked native DeepGEMM is selected only for model startup and numerical screening.",
+  "selection_status": "Best verified native configuration unchanged. Installed DeepEP HT is incompatible with the four-GPU-node topology, and native packed DeepGEMM is slower with weaker numerical repeatability and lower KV capacity.",
   "decode_deferred": {
     "dp": 16,
     "tp": 1,
@@ -191,7 +191,7 @@
     "selected": "Keep original table.",
     "new_native_candidate_selected": false
   },
-  "live_service_status": "Last observed stopped for isolated GPU tests; current remote state is unverified during SSH outage.",
+  "live_service_status": "Selected c65536 original-placement baseline is being restored after the rejected DeepGEMM performance-only run.",
   "deepep_ht_capability": {
     "report": "results-prefill-dp16-deepep-capability-20261021.json",
     "passed": false,
@@ -201,10 +201,16 @@
     "gpu_execution_started": true,
     "cpu_encoded_routing_reference_passed": true,
     "model_source_changed": false,
-    "new_performance_result": false,
+    "new_performance_result": true,
     "operator_report": "results-prefill-dp16-packed-moe-20261021.json",
     "packed_on_call_geomean_change_percent": 30.601,
     "prepacked_upper_bound_geomean_change_percent": -7.728,
-    "native_model_candidate_validated": false
+    "native_model_candidate_validated": true,
+    "native_mean_tps": 25173.115556835204,
+    "relative_to_selected_baseline_percent": -11.134240238564175,
+    "minimum_startup_reported_kv_tokens": 671649,
+    "baseline_cross_candidate_first_token_matches": 44,
+    "candidate_self_repeat_first_token_matches": 58,
+    "accepted": false
   }
 }
