@@ -67,6 +67,21 @@ def test_existing_decode_and_prefill_defaults_stay_separate(launcher):
         assert "--long-prefill-token-threshold" not in command
 
 
+def test_prefill_can_screen_native_deepgemm_without_changing_recipe(launcher):
+    baseline = launcher("prefill")
+    candidate = launcher("prefill", STEP5_PREFILL_EP_FUSED_MOE="0")
+    assert baseline.returncode == candidate.returncode == 0
+    assert "VLLM_HCU_EP_FUSED_MOE=1" in baseline.stdout
+    assert "VLLM_HCU_EP_FUSED_MOE=0" in candidate.stdout
+    baseline_command = shlex.split(baseline.stdout.splitlines()[-1])
+    candidate_command = shlex.split(candidate.stdout.splitlines()[-1])
+    assert baseline_command == candidate_command
+
+
+def test_invalid_prefill_expert_kernel_switch_fails(launcher):
+    assert launcher("prefill", STEP5_PREFILL_EP_FUSED_MOE="deepgemm").returncode != 0
+
+
 @pytest.mark.parametrize("settings", [
     {"STEP5_DECODE_PARALLEL": "dp8tp2"},
     {"STEP5_DECODE_PARALLEL": "dp16tp1", "STEP5_DECODE_PROFILE": "itl6479", "STEP5_DECODE_PLACEMENT": "/external/placement.pt"},
