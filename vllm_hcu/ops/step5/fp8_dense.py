@@ -24,6 +24,27 @@ from vllm.utils.torch_utils import direct_register_custom_op
 FP8_MAX = 448.0
 N_ALIGN = 256
 _TUNED_DENSE = os.environ.get("HCU_STEP5_DENSE_TUNING", "0") == "1"
+_DENSE_SHAPE_AUDIT = os.environ.get("HCU_STEP5_DENSE_SHAPE_AUDIT", "0") == "1"
+_dense_shapes_audited = set()
+
+
+def _audit_dense_shape(xq, wq):
+    # The opaque op's real implementation runs here, not its Dynamo fake.
+    # Read CPU metadata only; never inspect tensor values or synchronize.
+    # Ignore decode/capture sizes and bound logging for variable-length tails.
+    shape = (xq.shape[0], wq.shape[0], xq.shape[1])
+    if shape[0] < 1024 or len(_dense_shapes_audited) >= 128:
+        return
+    key = (xq.device.index,) + shape
+    if key in _dense_shapes_audited:
+        return
+    _dense_shapes_audited.add(key)
+    from vllm.logger import init_logger
+
+    init_logger("vllm.hcu.step5_dense").info(
+        "[step5_dense_shape_audit] device=%s M=%d N=%d K=%d",
+        xq.device.index, *shape,
+    )
 
 
 @torch.no_grad()
@@ -60,6 +81,8 @@ def _step5_fp8_gemm(
     N = wq.shape[0]
     if M == 0:
         return torch.empty(0, N, device=xq.device, dtype=torch.bfloat16)
+    if _DENSE_SHAPE_AUDIT:
+        _audit_dense_shape(xq, wq)
     if _TUNED_DENSE:
         from .fp8_dense_tuned import tuned_fp8_gemm
 
