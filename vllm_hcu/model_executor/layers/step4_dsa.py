@@ -2193,6 +2193,66 @@ class Step4SparsePlan:
     md: Step4DSAMetadata | None = None
 
 
+@triton.jit
+def _prefill_request_indices_kernel(
+    starts_ptr,
+    output_ptr,
+    num_tokens,
+    first_request,
+    num_requests,
+    decode_tokens,
+    STEPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tokens = rows + decode_tokens
+    low = tl.full((BLOCK,), 0, tl.int32) + first_request
+    high = low + num_requests
+    # Find the first request whose end is after the token. Empty requests
+    # have no output rows, matching repeat_interleave's zero-count behavior.
+    for _ in range(STEPS):
+        middle = (low + high) // 2
+        end = tl.load(
+            starts_ptr + middle + 1,
+            mask=middle < first_request + num_requests,
+            other=2147483647,
+        )
+        after = end <= tokens
+        low = tl.where(after, middle + 1, low)
+        high = tl.where(after, high, middle)
+    tl.store(output_ptr + rows, low, mask=rows < num_tokens)
+
+
+def _prefill_request_indices(
+    starts: torch.Tensor,
+    num_tokens: int,
+    first_request: int,
+    num_requests: int,
+    decode_tokens: int,
+) -> torch.Tensor:
+    """Build row owners without reading GPU counts or copying host metadata.
+
+    DBO hands execution between CPU threads while communication is queued.
+    A blocking H2D copy or repeat_interleave's implicit output-size read in
+    that interval can wait on the sibling thread's unissued GPU work.
+    """
+    output = torch.empty((num_tokens,), dtype=torch.int32, device=starts.device)
+    if num_tokens:
+        assert num_requests > 0
+        _prefill_request_indices_kernel[(triton.cdiv(num_tokens, 256),)](
+            starts,
+            output,
+            num_tokens,
+            first_request,
+            num_requests,
+            decode_tokens,
+            STEPS=num_requests.bit_length(),
+            BLOCK=256,
+            num_warps=4,
+        )
+    return output
+
+
 def build_plan(
     attn_metadata: Step4DSAMetadata,
     prefill_logits: torch.Tensor | None,
@@ -2262,15 +2322,12 @@ def build_plan(
         q_positions = positions[ndt : attn_metadata.num_actual_tokens].to(torch.int32)
         # request_indices maps each score row to its block-table row. Rows are
         # group-major, so the per-token request index tiles once per KV group.
-        starts = attn_metadata.query_start_loc_cpu
-        req_of_token = torch.repeat_interleave(
-            torch.arange(
-                nd,
-                nd + attn_metadata.num_prefills,
-                dtype=torch.int32,
-                device=positions.device,
-            ),
-            (starts[nd + 1 :] - starts[nd:-1]).to(positions.device),
+        req_of_token = _prefill_request_indices(
+            attn_metadata.query_start_loc,
+            q_positions.numel(),
+            nd,
+            attn_metadata.num_prefills,
+            ndt,
         )
         packed, counts, logical_ids = prefill_sparse_meta(
             prefill_logits,
