@@ -61,6 +61,7 @@ logger = init_logger(__name__)
 # inside the MoE custom op, must not change the compile hash.
 _DP_MOE_PIPE_MIN_TOKENS = int(os.environ.get("HCU_DP_MOE_PIPE_MIN_TOKENS", "0"))
 _EP_DIRECT_SUM = int(os.environ.get("HCU_EP_DIRECT_SUM", "0"))
+_DP_PIPE_UNIFORM = os.environ.get("HCU_DP_MOE_PIPE_UNIFORM", "0") == "1"
 _dp_pipe_stream: torch.cuda.Stream | None = None
 # (side stream, tensors it still reads/writes) until the main stream joins it.
 _dp_pipe_pending: tuple | None = None
@@ -1630,8 +1631,28 @@ class FusedMoEKernelModularImpl:
         nccl, ncomm = comm.nccl, comm.comm
         sum_op = ncclRedOpTypeEnum.from_torch(torch.distributed.ReduceOp.SUM)
 
+        # The synchronized DP metadata makes this decision identical on peers.
+        # Half-DP pipelines and nonuniform/empty shards retain the grouped path.
+        uniform = (
+            _DP_PIPE_UNIFORM and dbo and len(sizes) == W
+            and sizes[0] > 0 and all(n == sizes[0] for n in sizes)
+        )
+        if uniform and not getattr(self, "_step5_uniform_announced", False):
+            self._step5_uniform_announced = True
+            print(f"[dp_moe_pipe] uniform collectives: sizes={sizes}", flush=True)
+
         def broadcast(grp, stream) -> None:
             st = cudaStream_t(stream.cuda_stream)
+            if uniform:
+                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                nccl.ncclGroupStart()
+                for src, dst in zip(local, gath):
+                    nccl.ncclAllGather(
+                        buffer_type(src.data_ptr()), buffer_type(dst.data_ptr()),
+                        src.numel(), _nccl_dtype(src), ncomm, st,
+                    )
+                nccl.ncclGroupEnd()
+                return
             nccl.ncclGroupStart()
             for src, dst in zip(local, gath):
                 for root in grp:
@@ -1697,6 +1718,13 @@ class FusedMoEKernelModularImpl:
 
         def reduce(grp, stream) -> None:
             st = cudaStream_t(stream.cuda_stream)
+            if uniform:
+                assert len(grp) == W and grp[0] == 0 and grp[-1] == W - 1
+                nccl.ncclReduceScatter(
+                    buffer_type(moe_out.data_ptr()), buffer_type(result.data_ptr()),
+                    result.numel(), _nccl_dtype(result), sum_op, ncomm, st,
+                )
+                return
             nccl.ncclGroupStart()
             for root in grp:
                 ch = moe_out[offs[root] : offs[root + 1]]
