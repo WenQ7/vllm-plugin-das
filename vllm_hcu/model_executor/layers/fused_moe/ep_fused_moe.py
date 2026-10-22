@@ -82,6 +82,41 @@ def _ep_swiglustep_quant_kernel(
 
 
 @triton.jit
+def _ep_swiglustep_quant_deepgemm_kernel(
+    q_ptr, scale_ptr, in_ptr, expert_ids_ptr, M,
+    D: tl.constexpr, LIMIT: tl.constexpr, DTYPE_MAX: tl.constexpr,
+    BLOCK_M: tl.constexpr, CH: tl.constexpr,
+):
+    # DeepGEMM marks padding in a per-row array, including holes between
+    # experts. Reuse native Step5's post-SiLU clamp and BF16 rounding before
+    # calculating amax; LightOp's fused activation clamps before SiLU.
+    tl.static_assert(D == 3 * CH)
+    cols = tl.arange(0, CH)
+    step = tl.num_programs(0) * BLOCK_M
+    for start in range(tl.program_id(0) * BLOCK_M, M, step):
+        rows = start + tl.arange(0, BLOCK_M)
+        row_mask = rows < M
+        valid = tl.load(expert_ids_ptr + rows, mask=row_mask, other=-1) >= 0
+        m2 = (row_mask & valid)[:, None]
+        offs = rows[:, None].to(tl.int64) * (2 * D) + cols[None, :]
+        y0 = _ep_swiglu_chunk(in_ptr, offs, m2, LIMIT, D)
+        y1 = _ep_swiglu_chunk(in_ptr, offs + CH, m2, LIMIT, D)
+        y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, m2, LIMIT, D)
+        absmax = tl.maximum(tl.maximum(tl.max(tl.abs(y0), axis=-1), tl.max(tl.abs(y1), axis=-1)),
+                            tl.max(tl.abs(y2), axis=-1))
+        scale = tl.maximum(absmax.to(tl.float32), 1.0e-10) / DTYPE_MAX
+        inv = (1.0 / scale)[:, None]
+        q_offs = rows[:, None].to(tl.int64) * D + cols[None, :]
+        store_mask = row_mask[:, None]
+        tl.store(q_ptr + q_offs, (y0 * inv).to(q_ptr.dtype.element_ty), mask=store_mask, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + CH, (y1 * inv).to(q_ptr.dtype.element_ty), mask=store_mask, cache_modifier=".cs")
+        tl.store(q_ptr + q_offs + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty), mask=store_mask, cache_modifier=".cs")
+        # Router weights belong to DeepGEMM's unpermute/reduce after GEMM2.
+        # Invalid rows store zero q and the harmless native zero-row scale.
+        tl.store(scale_ptr + rows, scale, mask=row_mask)
+
+
+@triton.jit
 def _ep_masked_moe_sum_kernel(
     out_ptr, in_ptr, ids_ptr, emap_ptr, stride_ids, add_ptr, stride_add, add_start, add_end,
     N: tl.constexpr, TOPK: tl.constexpr, SCALE: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -217,6 +252,43 @@ def ep_swiglustep_quant(cache1, sorted_weights, nvalid, rows, limit=7.0, q=None)
         q, scale, cache1, sorted_weights, nvalid,
         D=D, LIMIT=float(limit), DTYPE_MAX=torch.finfo(FP8).max,
         BLOCK_M=bm, CH=D // 3, num_warps=ACT_CFG["num_warps"], num_stages=1)
+    return q, scale
+
+
+def ep_swiglustep_quant_deepgemm(cache1, expert_ids, q, limit=7.0):
+    """Native Step5 activation/quantization for DeepGEMM's padded row layout.
+
+    ``q`` is caller-owned scratch; only per-row scales are allocated here.
+    Input and output must be disjoint contiguous buffers. Negative expert ids
+    mask input loads and produce deterministic zero padding, without a device
+    row-count scalar or a host synchronization.
+    """
+    if (cache1.dtype != torch.bfloat16 or cache1.ndim != 2
+            or cache1.shape[1] != 3072 or not cache1.is_contiguous()):
+        raise ValueError("Step5 DeepGEMM activation requires contiguous BF16 [M, 3072]")
+    rows, n = cache1.shape
+    d = n // 2
+    if (expert_ids.dtype not in (torch.int32, torch.int64)
+            or expert_ids.shape != (rows,) or not expert_ids.is_contiguous()
+            or expert_ids.device != cache1.device):
+        raise ValueError("Step5 DeepGEMM requires contiguous per-row expert ids on the input device")
+    if (q.dtype != FP8 or q.shape != (rows, d) or not q.is_contiguous()
+            or q.device != cache1.device):
+        raise ValueError("Step5 DeepGEMM requires contiguous FP8 [M, 1536] output on the input device")
+    if rows:
+        start, other = cache1.data_ptr(), q.data_ptr()
+        if (start < other + q.numel() * q.element_size()
+                and other < start + cache1.numel() * cache1.element_size()):
+            raise ValueError("Step5 DeepGEMM activation input and output must not overlap")
+    scale = torch.empty((rows, 1), dtype=torch.float32, device=cache1.device)
+    if rows:
+        bm = ACT_CFG["BLOCK_M"]
+        grid = (max(1, min(triton.cdiv(rows, bm),
+                           _num_cus(cache1.device.index) * ACT_CFG["CTAS_PER_CU"])),)
+        _ep_swiglustep_quant_deepgemm_kernel[grid](
+            q, scale, cache1, expert_ids, rows,
+            D=d, LIMIT=float(limit), DTYPE_MAX=torch.finfo(FP8).max,
+            BLOCK_M=bm, CH=d // 3, num_warps=ACT_CFG["num_warps"], num_stages=1)
     return q, scale
 
 
