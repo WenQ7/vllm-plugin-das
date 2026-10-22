@@ -4816,6 +4816,9 @@ def test_slimquant_w4a8_auto_factory_rejects_auxiliary_quant_metadata(
 @pytest.mark.parametrize("use_fp8", [True, False])
 def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class DeepEPHTPrepareAndFinalize:
+        def _sync_dbo_comm_if_needed(self):
+            pass
+
         def _do_dispatch(
             self,
             tokens,

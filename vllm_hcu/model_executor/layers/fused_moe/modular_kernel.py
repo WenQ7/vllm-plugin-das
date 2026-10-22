@@ -86,6 +86,32 @@ def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
     return None
 
 
+def _step5_ep_private_output(
+    workspace13: torch.Tensor, fused_out: torch.Tensor
+) -> torch.Tensor:
+    """Keep the native EP result alive while GEMM2 reuses scratch storage.
+
+    WorkspaceManager can return disjoint views of one allocation, so compare
+    actual contiguous byte intervals rather than their storage identities.
+    """
+    if (
+        workspace13.device != fused_out.device
+        or workspace13.numel() == 0
+        or fused_out.numel() == 0
+        or not workspace13.is_contiguous()
+        or not fused_out.is_contiguous()
+    ):
+        return fused_out
+    start = workspace13.data_ptr()
+    other = fused_out.data_ptr()
+    if (
+        start < other + fused_out.numel() * fused_out.element_size()
+        and other < start + workspace13.numel() * workspace13.element_size()
+    ):
+        return torch.empty_like(fused_out)
+    return fused_out
+
+
 def join_dp_moe_pipe() -> None:
     global _dp_pipe_pending
     if _dp_pipe_pending is not None:
@@ -1394,6 +1420,7 @@ class FusedMoEKernelModularImpl:
             return torch.empty_like(a1q, dtype=in_dtype)
 
         M_chunk = M_full
+        private_native_ep_output = False
         chunk_provider = _step5_ep_chunk_provider(self.fused_experts, a1q, w1, w2)
         if chunk_provider is not None and not dbo_enabled():
             from vllm.model_executor.layers.fused_moe.prepare_finalize import naive_dp_ep
@@ -1410,6 +1437,7 @@ class FusedMoEKernelModularImpl:
                 )
                 if ep_chunk is not None:
                     M_chunk = min(M_full, ep_chunk)
+                    private_native_ep_output = True
 
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,
@@ -1441,6 +1469,15 @@ class FusedMoEKernelModularImpl:
                 and output_alias.is_contiguous()
             ):
                 fused_out = output_alias
+
+        if getattr(self.prepare_finalize, "_hcu_dbo_private_output", False):
+            # HT yields before combine. Even disjoint views in this step's
+            # shared workspace can be overwritten by the next microbatch.
+            fused_out = torch.empty_like(fused_out)
+        elif private_native_ep_output:
+            # A mixed-size native step needs scratch reuse to avoid a second
+            # M*topk*K allocation instead of this much smaller M*K result.
+            fused_out = _step5_ep_private_output(workspace13, fused_out)
 
         self.fused_experts.apply(
             output=fused_out,

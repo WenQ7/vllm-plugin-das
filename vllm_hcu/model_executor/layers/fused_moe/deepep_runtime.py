@@ -212,6 +212,10 @@ def ht_do_dispatch(
     quant_config,
     defer_input_quant,
 ):
+    # HCU DBO shares compute scratch between microbatches. An HT result must
+    # survive a handoff until combine consumes it, so its final output needs
+    # separate ownership. Reset the per-call marker for later unsplit steps.
+    self._hcu_dbo_private_output = bool(module.dbo_enabled())
     has_scales = token_scales is not None
     previous_event = module.dbo_get_previous_event(self.buffer.capture)
     module.dbo_yield_and_switch_from_compute_to_comm()
@@ -270,6 +274,9 @@ def ht_do_dispatch(
         async_finish=self.async_prepare and not module.dbo_enabled(),
         allocate_on_comm_stream=False,
     )
+    # Preserve the stock ROCm fence: the next microbatch must not reuse the
+    # Buffer-owned communication workspace before this dispatch completes.
+    self._sync_dbo_comm_if_needed()
     self.handles[module.dbo_current_ubatch_id()] = handle
     module.dbo_switch_to_compute_sync()
     return lambda: self._receiver(
