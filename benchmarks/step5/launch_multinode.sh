@@ -71,6 +71,7 @@ scheduler_extra=()
 moe_backend_extra=()
 
 if [[ "$phase" == prefill ]]; then
+    unset HCU_STEP5_DP_FABRIC HCU_STEP5_CONTEXT_GRAPH_REGIONS
     tp=1; dp="${STEP5_PREFILL_DP_SIZE:-16}"; local_dp=4; tokens="${STEP5_PREFILL_BATCHED_TOKENS:-8192}"; max_len="${STEP5_PREFILL_MAX_MODEL_LEN:-70000}"; gpu_util="${STEP5_PREFILL_GPU_MEMORY_UTILIZATION:-0.875}"
     case "$dp" in 8|16) ;; *) printf 'Unsupported Prefill DP size\n' >&2; exit 2 ;; esac
     ((rank * local_dp < dp)) || { printf 'Node rank exceeds Prefill DP size\n' >&2; exit 2; }
@@ -91,11 +92,35 @@ if [[ "$phase" == prefill ]]; then
         aiter) moe_backend_extra=(--moe-backend aiter) ;;
         *) printf 'Unsupported Prefill MoE backend\n' >&2; exit 2 ;;
     esac
+    # Explicit reproduction profiles; historical defaults remain unchanged.
+    case "${STEP5_PREFILL_PROFILE:-baseline}" in
+        baseline) ;;
+        dense_1021|g1_1021|g2_1021)
+            [[ "$dp" == 16 && "$tp" == 1 && "$tokens" == 8192 && "$max_len" == 70000 && "$gpu_util" == 0.875 ]] || {
+                printf '1021 Prefill profiles require DP16/TP1, tokens8192, length70000 and memory0.875\n' >&2; exit 2;
+            }
+            [[ "$VLLM_HCU_EP_FUSED_MOE" == 1 && "${STEP5_PREFILL_MOE_BACKEND:-auto}" == auto ]] || {
+                printf '1021 Prefill profiles require the existing EP fused MoE path\n' >&2; exit 2;
+            }
+            : "${STEP5_PREFILL_PLACEMENT:?Set the external measured E22 Prefill placement file}"
+            export HCU_DP_MOE_PIPE_MIN_TOKENS=65536 HCU_DBO_MIN_TOKENS=4096 HCU_EP_DIRECT_SUM=65536
+            export EP_FUSED_MOE_CHUNK=65536 HCU_STEP5_BOUNDED_EP_WORKSPACE=1
+            export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096 HCU_DP_MOE_PIPE_UNIFORM=1
+            export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0
+            case "$STEP5_PREFILL_PROFILE" in
+                g1_1021) export HCU_STEP5_PREFILL_G1=1 ;;
+                g2_1021) export HCU_STEP5_PREFILL_G2=1 ;;
+            esac
+            scheduler_extra=(--long-prefill-token-threshold 0)
+            ;;
+        *) printf 'Unsupported Prefill reproduction profile\n' >&2; exit 2 ;;
+    esac
     export NCCL_MAX_NCHANNELS=32
     if [[ -n "${STEP5_PREFILL_PLACEMENT:-}" ]]; then
         export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"
     fi
 else
+    export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_DP_MOE_PIPE_UNIFORM=0
     tokens=32768; max_len=1048576
     case "${STEP5_DECODE_PARALLEL:-dp4tp4}" in
         dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
@@ -141,6 +166,28 @@ else
         export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_SHARED_STREAM_MIN_TOKENS:-64}"
     fi
 fi
+if [[ "$phase" == decode ]]; then
+    case "${HCU_STEP5_DP_FABRIC:-0}" in
+        0) ;;
+        1)
+            [[ "$dp" == 4 && "$tp" == 4 && "${STEP5_DECODE_PROFILE:-}" == itl6479 ]] || {
+                printf 'Measured Decode Fabric requires the DP4/TP4 itl6479 profile\n' >&2; exit 2;
+            }
+            export VLLM_HCU_DP_CUSTOM_AG=0
+            ;;
+        *) printf 'Unsupported Decode Fabric switch\n' >&2; exit 2 ;;
+    esac
+    case "${HCU_STEP5_CONTEXT_GRAPH_REGIONS:-0}" in
+        0) ;;
+        8736)
+            [[ "$dp" == 4 && "$tp" == 4 && "${STEP5_DECODE_PROFILE:-}" == itl6479 ]] || {
+                printf 'Measured hot-context graph requires DP4/TP4 itl6479\n' >&2; exit 2;
+            }
+            export VLLM_STEP4_DSA_GRAPH_REGIONS=8736
+            ;;
+        *) printf 'Unsupported measured hot-context graph width\n' >&2; exit 2 ;;
+    esac
+fi
 extra=(--api-server-count 1)
 if [[ "$rank" != 0 ]]; then
     extra=(--headless --data-parallel-start-rank "$((rank * local_dp))")
@@ -166,6 +213,10 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'VLLM_STEP5_EXPERT_PLACEMENT=%q\n' "${VLLM_STEP5_EXPERT_PLACEMENT:-}"
     printf 'NCCL_MIN_NCHANNELS=%q NCCL_MAX_NCHANNELS=%q\n' "${NCCL_MIN_NCHANNELS:-auto}" "${NCCL_MAX_NCHANNELS:-auto}"
     printf 'HCU_DP_MOE_PIPE_MIN_TOKENS=%q\n' "$HCU_DP_MOE_PIPE_MIN_TOKENS"
+    printf 'HCU_DBO_MIN_TOKENS=%q HCU_EP_DIRECT_SUM=%q HCU_DP_MOE_PIPE_UNIFORM=%q\n' "$HCU_DBO_MIN_TOKENS" "$HCU_EP_DIRECT_SUM" "${HCU_DP_MOE_PIPE_UNIFORM:-0}"
+    printf 'HCU_STEP5_DENSE_TUNING=%q HCU_STEP5_PREFILL_G1=%q HCU_STEP5_PREFILL_G2=%q\n' "${HCU_STEP5_DENSE_TUNING:-0}" "${HCU_STEP5_PREFILL_G1:-0}" "${HCU_STEP5_PREFILL_G2:-0}"
+    printf 'VLLM_HCU_DP_CUSTOM_AG=%q\n' "$VLLM_HCU_DP_CUSTOM_AG"
+    printf 'HCU_STEP5_DP_FABRIC=%q HCU_STEP5_CONTEXT_GRAPH_REGIONS=%q\n' "${HCU_STEP5_DP_FABRIC:-0}" "${HCU_STEP5_CONTEXT_GRAPH_REGIONS:-0}"
     printf 'HCU_STEP5_EXPERT_GRID=%q\n' "$HCU_STEP5_EXPERT_GRID"
     printf 'HCU_STEP5_FUSED_ROUTER_STREAM=%q\n' "$HCU_STEP5_FUSED_ROUTER_STREAM"
     printf 'EP_FUSED_MOE_CHUNK=%q\n' "$EP_FUSED_MOE_CHUNK"

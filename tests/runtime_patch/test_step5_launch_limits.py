@@ -119,3 +119,66 @@ def test_invalid_prefill_moe_backend_fails(launcher):
 ])
 def test_invalid_or_incompatible_decode_modes_fail_before_launch(launcher, settings):
     assert launcher("decode", **settings).returncode != 0
+
+
+@pytest.mark.parametrize("profile,g1,g2", [
+    ("dense_1021", "0", "0"), ("g1_1021", "1", "0"), ("g2_1021", "0", "1"),
+])
+def test_measured_prefill_profiles_preserve_limits_and_effective_knobs(launcher, profile, g1, g2):
+    result = launcher("prefill", STEP5_PREFILL_PROFILE=profile,
+                      STEP5_PREFILL_PLACEMENT="/external/prefill.pt")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    for key, value in {"--tensor-parallel-size": "1", "--data-parallel-size": "16",
+                       "--max-num-batched-tokens": "8192", "--max-model-len": "70000",
+                       "--long-prefill-token-threshold": "0"}.items():
+        assert command[command.index(key) + 1] == value
+    assert "HCU_DP_MOE_PIPE_MIN_TOKENS=65536" in result.stdout
+    assert "HCU_DBO_MIN_TOKENS=4096 HCU_EP_DIRECT_SUM=65536 HCU_DP_MOE_PIPE_UNIFORM=1" in result.stdout
+    assert f"HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1={g1} HCU_STEP5_PREFILL_G2={g2}" in result.stdout
+    assert "EP_FUSED_MOE_CHUNK=65536" in result.stdout
+    assert "HCU_STEP5_BOUNDED_EP_WORKSPACE=1" in result.stdout
+
+
+@pytest.mark.parametrize("extra", [
+    {"STEP5_PREFILL_DP_SIZE": "8"}, {"STEP5_PREFILL_BATCHED_TOKENS": "32768"},
+    {"STEP5_PREFILL_MAX_MODEL_LEN": "1048576"}, {"STEP5_PREFILL_EP_FUSED_MOE": "0"},
+])
+def test_measured_prefill_profile_rejects_unmeasured_combinations(launcher, extra):
+    result = launcher("prefill", STEP5_PREFILL_PROFILE="dense_1021",
+                      STEP5_PREFILL_PLACEMENT="/external/prefill.pt", **extra)
+    assert result.returncode != 0
+
+
+def test_decode_fabric_profile_retains_one_million_context(launcher):
+    result = launcher("decode", STEP5_DECODE_PROFILE="itl6479",
+                      STEP5_DECODE_PLACEMENT="/external/decode.pt",
+                      HCU_STEP5_DP_FABRIC="1", HCU_STEP5_CONTEXT_GRAPH_REGIONS="8736")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    assert command[command.index("--max-model-len") + 1] == "1048576"
+    assert command[command.index("--max-num-batched-tokens") + 1] == "32768"
+    assert "VLLM_HCU_DP_PACKED_AG=1" in result.stdout
+    assert "VLLM_STEP4_DSA_GRAPH_REGIONS=8736" in result.stdout
+    assert "HCU_STEP5_DP_FABRIC=1 HCU_STEP5_CONTEXT_GRAPH_REGIONS=8736" in result.stdout
+    assert "VLLM_HCU_DP_CUSTOM_AG=0" in result.stdout
+
+
+def test_decode_fabric_rejects_other_topologies(launcher):
+    result = launcher("decode", STEP5_DECODE_PARALLEL="dp16tp1",
+                      STEP5_DECODE_PROFILE="dp16_native", HCU_STEP5_DP_FABRIC="1")
+    assert result.returncode != 0
+
+
+def test_prefill_does_not_inherit_decode_only_context_guard(launcher):
+    result = launcher("prefill", HCU_STEP5_CONTEXT_GRAPH_REGIONS="8736", HCU_STEP5_DP_FABRIC="1")
+    assert result.returncode == 0, result.stderr
+    assert "HCU_STEP5_DP_FABRIC=0 HCU_STEP5_CONTEXT_GRAPH_REGIONS=0" in result.stdout
+
+
+def test_decode_does_not_inherit_prefill_candidates(launcher):
+    result = launcher("decode", HCU_STEP5_DENSE_TUNING="1", HCU_STEP5_PREFILL_G1="1",
+                      HCU_STEP5_PREFILL_G2="1", HCU_DP_MOE_PIPE_UNIFORM="1")
+    assert result.returncode == 0, result.stderr
+    assert "HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0" in result.stdout
+    assert "HCU_DP_MOE_PIPE_UNIFORM=0" in result.stdout

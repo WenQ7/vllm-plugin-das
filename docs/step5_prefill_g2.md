@@ -21,8 +21,22 @@ Run `benchmarks/step5/check_prefill_g2_fused.py --run-gpu --fixture FIXTURE.npz
 to compare the integrated source, including device overflow and unsupported
 metadata guards. Use the existing frozen routing fixture format.
 
-Full-model synthetic performance and standard-MTP GSM validation are pending.
-Keep DP16/TP1/EP16, batched-tokens8192, model-length70000, E22, native attention,
-and the fixed synthetic MTP3 rates [0.838992,0.598322,0.362686] for performance.
-The separate G1 path has unresolved GSM96/96 versus disabled98/98 and is not
-required by G2 fusion.
+With G1 specialization disabled, three clean full-model synthetic rounds gave
+42,224.93 tokens/s (sample SD 8.25), 1.55% above the earlier 41,580.14 result.
+DP16/TP1/EP16, batched-tokens8192, model-length70000, E22, native attention,
+C64 x 65536 input tokens x 1 output token, and synthetic MTP3 rates
+[0.838992,0.598322,0.362686] were retained. There were no preemptions or
+in-measurement compilation/cache updates. This remains below 45,000 tokens/s.
+
+Separate standard-MTP evaluation on the same delivered source scored GSM100
+97/100, long24K16 15/16, and long64K16 15/16, with zero request errors. The
+short GSM prompts total only 8,485 tokens (maximum 154 each); they cannot
+exercise the M65536 specialization, so this sample alone does not establish
+its quality effect. Long-context scores match the earlier 15/16 results;
+evaluation-window dispatch counts were not collected. The independent
+integrated complete-MoE check passed 34 bitexact comparisons and nine metadata
+fallback guards. All performance and quality services were stopped afterward.
+
+The separate G1 path is not required by G2 fusion. Prior stochastic short-GSM
+scores of G1-enabled96/96 versus disabled98/98 need coverage-aware evaluation
+before attributing a quality difference to that specialization.

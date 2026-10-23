@@ -32,6 +32,16 @@ complete-MoE comparisons with approximately 2.5–2.7% lower MoE latency. The
 normal-package entry passed another 34 bit-exact comparisons and measured
 6.953 ms versus 6.775 ms on
 the middle routing distribution. Separate projection tests cover all-local
-routing and sorted addresses beyond 2 GiB. Four-node model performance and
-standard-MTP GSM8K validation remain pending; these operator results do not
-establish the 45,000 tokens/s target.
+routing and sorted addresses beyond 2 GiB. These isolated operator results do not establish the 45,000 tokens/s target.
+Later full-model measurements are recorded below.
+
+
+## Later full-model evidence (2026-10-23)
+
+Three clean synthetic rounds measured 42045.84 tokens/s (SD28.97), versus
+41542.66 tokens/s for the same-source flag-off control (+1.21%). G1 remains
+opt-in. Separate standard-MTP GSM100 runs scored96/100 twice; fresh off-control
+runs scored98/100 twice. These short prompts do not hit M65536, so the score
+difference alone does not establish a specialization defect or equivalence.
+Long24K16 and long64K16 smoke scores were15/16 with zero request errors.
+See `step5_pd_optimizations_20261023.md` for snapshot scope and limitations.

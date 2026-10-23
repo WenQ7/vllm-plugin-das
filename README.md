@@ -293,3 +293,7 @@ wheel so stale module identities and custom-op registrations cannot survive an
 upgrade.
 
 ---
+
+## Step5 P/D optimization snapshot
+
+The 2026-10-23 Step5 branch inventory, measured results, opt-in reproduction profiles and validation limits are documented in [Step5 P/D optimizations](docs/step5_pd_optimizations_20261023.md).

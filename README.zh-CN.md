@@ -222,3 +222,7 @@ python3 tools/run_patch_tests.py --suite contract --vllm-source /path/to/vllm-ro
 安装新 wheel 后应重启全部 Python/vLLM 进程，避免旧模块和算子注册状态残留。
 
 ---
+
+## Step5 P/D 优化快照
+
+2026-10-23 的 Step5 代码清单、实测成绩、显式复现配置及验证边界见 [Step5 P/D 优化说明](docs/step5_pd_optimizations_20261023.md)。
