@@ -209,6 +209,8 @@ def apply_to_module(module: ModuleType) -> bool:
             and 2 <= self.world_size <= 16
         )
         try:
+            from vllm_hcu.distributed.device_communicators.step5_dp_fabric import maybe_install
+            maybe_install(self, cpu_group, device, unique_name)
             _maybe_init_ep_custom_allreduce(self, unique_name)
             _maybe_init_dp_ipc_all_gather(self, unique_name)
             from vllm.config import get_current_vllm_config_or_none

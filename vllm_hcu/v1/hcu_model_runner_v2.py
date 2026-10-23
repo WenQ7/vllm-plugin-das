@@ -240,6 +240,8 @@ class HcuGPUModelRunnerV2(GPUModelRunner):
             if input_batch is self._hsl_batch and input_batch.seq_lens_cpu is None:
                 self._hsl_resolve()
                 self._hsl_attach(input_batch)
+                from vllm_hcu.v1.step5_hot_context import check_hot_graph_context
+                check_hot_graph_context(input_batch, args[0] if args else None, getattr(self, "_step5_hot_context_real_batch", False))
             return original_prepare_attn(input_batch, *args, **kwargs)
 
         model_state.prepare_attn = prepare_attn

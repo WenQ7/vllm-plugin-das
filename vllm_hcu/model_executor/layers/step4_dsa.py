@@ -161,6 +161,9 @@ PREFILL_FP8_INDEXER = henvs.optional_custom_op_enabled(
 # 512K one does. Set this only to go *below* max_model_len deliberately -- a
 # batch whose real history exceeds it is rejected loudly, never truncated.
 GRAPH_REGIONS_OVERRIDE = int(os.environ.get("VLLM_STEP4_DSA_GRAPH_REGIONS", "0"))
+_HOT_CONTEXT_EAGER_FALLBACK = int(os.environ.get("HCU_STEP5_CONTEXT_GRAPH_REGIONS", "0")) > 0
+if _HOT_CONTEXT_EAGER_FALLBACK and GRAPH_REGIONS_OVERRIDE != int(os.environ["HCU_STEP5_CONTEXT_GRAPH_REGIONS"]):
+    raise ValueError("Step5 hot context width must match the decode graph width")
 
 # Debug switch for the host-side slot derivation in _decode_schedule. When set,
 # the slots computed from the block table's host mirror are checked against the
@@ -3476,14 +3479,14 @@ class Step4DSAState:
         # discarded by the selector's ``history_lengths``.
         sched.max_nscore = widest
         if persistent:
-            if widest > self.graph_regions:
+            if widest > self.graph_regions and not _HOT_CONTEXT_EAGER_FALLBACK:
                 raise RuntimeError(
                     f"Step-4 DSA: a request needs {widest} region scores but the "
                     f"captured decode width is {self.graph_regions}. Raise "
                     f"VLLM_STEP4_DSA_GRAPH_REGIONS or --max-model-len; the width "
                     f"is a graph constant and cannot be grown per step."
                 )
-            sched.graph_regions = self.graph_regions
+            sched.graph_regions = self.graph_regions if widest <= self.graph_regions else 0
         return sched
 
     def _trim_graph_width(self, md: Step4DSAMetadata) -> None:
@@ -3823,7 +3826,7 @@ class Step4DSAState:
 
         sched.max_nscore = widest
         if persistent:
-            if widest > self.graph_regions:
+            if widest > self.graph_regions and not _HOT_CONTEXT_EAGER_FALLBACK:
                 raise RuntimeError(
                     f"Step-4 DSA: a request needs {widest} region scores but the "
                     f"captured decode width is {self.graph_regions}. Raise "
@@ -3835,7 +3838,7 @@ class Step4DSAState:
                     f"Step-4 DSA: {ndt} verify rows overflow the score pool "
                     f"({self._decode_logits.shape[0]} group-major rows)."
                 )
-            sched.graph_regions = self.graph_regions
+            sched.graph_regions = self.graph_regions if widest <= self.graph_regions else 0
         return sched
 
     def finish_layer(self) -> None:
