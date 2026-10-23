@@ -35,6 +35,7 @@ FP8 = torch.float8_e4m3fn
 _announced = False
 STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 _step5_grid_announced = False
+STEP5_PREFILL_G1 = os.environ.get("HCU_STEP5_PREFILL_G1", "0") == "1"
 
 
 @triton.jit
@@ -618,9 +619,17 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     if presort and a_s.numel() == M:
         # A gathered into sorted order first (lives in workspace2, dead before act_q).
         a_g, s_g = ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, workspace2)
-        _gemm(a_g, w1, cache1, s_g, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
-              expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
-              ck_topk=topk, a_sorted=True)
+        specialized = False
+        if STEP5_PREFILL_G1:
+            from vllm_hcu.ops.step5.prefill_g1 import try_step5_prefill_g1
+
+            specialized = try_step5_prefill_g1(
+                a_g, w1, cache1, s_g, w1_scale, sorted_ids, expert_ids, nvalid,
+                num_tokens=M, top_k=topk, sort_block_m=bm)
+        if not specialized:
+            _gemm(a_g, w1, cache1, s_g, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+                  expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
+                  ck_topk=topk, a_sorted=True)
         del a_g, s_g
     else:
         _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
