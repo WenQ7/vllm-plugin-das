@@ -36,6 +36,7 @@ _announced = False
 STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 _step5_grid_announced = False
 STEP5_PREFILL_G1 = os.environ.get("HCU_STEP5_PREFILL_G1", "0") == "1"
+STEP5_PREFILL_G2 = os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
 
 
 @triton.jit
@@ -700,19 +701,32 @@ def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, exper
         sorted_ids, nvalid, info, rows2, inv, ctr, M, xoff, sorted_ids.numel(), TOPK=topk,
         BIG=_DIRECT_BIG, BLOCK=1024, num_warps=4)
     _ep_direct_gate_kernel[(1,)](nvalid, ctr, gate, x.shape[0], num_warps=1)
-    # num_valid_tokens (= topk_ids.numel()) only masks rows >= it: make it never mask.
-    fake_ids = torch.empty((1, 1), dtype=torch.int32, device=dev).expand(_DIRECT_BIG - 1, 1)
-    _gemm(act_q, w2, out, act_s, w2_scale, topk_weights, fake_ids, rows2, sorted_w,
-          expert_ids, gate[0:1], 1, compute_type, cfg2, a_sorted=True,
-          bottom_a_use_mls_load=use_mls, ck_sorting=False, ck_topk=topk,
-          scale_bias_with_routed_weight=True)
-    # Fallback (scratch overflow) GEMM2 into cache3: exits at once unless gate[1] > 0.
-    cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev,
-                    avoid=preserve_chunk_output if preserve_chunk_output is not None else out)
-    _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
-          expert_ids, gate[1:2], 1, compute_type, cfg2, a_sorted=True,
-          bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
-          scale_bias_with_routed_weight=True)
+    cache3 = None
+    specialized = False
+    if STEP5_PREFILL_G2 and not use_mls:
+        from vllm_hcu.ops.step5.prefill_g2 import try_step5_prefill_g2
+
+        cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev,
+                        avoid=preserve_chunk_output if preserve_chunk_output is not None else out)
+        specialized = try_step5_prefill_g2(
+            act_q, w2, out, cache3, act_s, w2_scale, sorted_ids, rows2,
+            expert_ids, gate, num_tokens=M, top_k=topk,
+            sort_block_m=cfg2["BLOCK_SIZE_M"], config=cfg2)
+    if not specialized:
+        # num_valid_tokens only masks rows >= it: make it never mask.
+        fake_ids = torch.empty((1, 1), dtype=torch.int32, device=dev).expand(_DIRECT_BIG - 1, 1)
+        _gemm(act_q, w2, out, act_s, w2_scale, topk_weights, fake_ids, rows2, sorted_w,
+              expert_ids, gate[0:1], 1, compute_type, cfg2, a_sorted=True,
+              bottom_a_use_mls_load=use_mls, ck_sorting=False, ck_topk=topk,
+              scale_bias_with_routed_weight=True)
+        if cache3 is None:
+            cache3 = _carve(workspace13, (M, topk, K), out.dtype, dev,
+                            avoid=preserve_chunk_output if preserve_chunk_output is not None else out)
+        # Overflow fallback exits unless gate[1] > 0.
+        _gemm(act_q, w2, cache3, act_s, w2_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+              expert_ids, gate[1:2], 1, compute_type, cfg2, a_sorted=True,
+              bottom_a_use_mls_load=use_mls, ck_sorting=True, ck_topk=topk,
+              scale_bias_with_routed_weight=True)
     bn = SUM_CFG["BLOCK_N"]
     _ep_direct_fix_kernel[(triton.cdiv(M, DIRECT_TPP), K // bn)](
         out, x, cache3, topk_ids, expert_map, info, inv, gate, M, N=K, TOPK=topk, BLOCK_N=bn,
