@@ -242,6 +242,14 @@
       "count": 16,
       "reason": "Local Windows publication environment has no vLLM distribution; imports failed in the attempted environment-contract run."
     },
-    "fresh_gpu_rebuild_or_fullmodel_rerun": false
+    "fresh_gpu_rebuild_or_fullmodel_rerun": false,
+    "wrapper_followup": {
+      "scripts": [
+        "start_prefill_1021.sh",
+        "start_decode_1021.sh"
+      ],
+      "added_dry_run_cases": 9,
+      "service_started": false
+    }
   }
 }

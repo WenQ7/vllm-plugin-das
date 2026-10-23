@@ -1,4 +1,5 @@
 """The requested DP16 decoder must retain its token budget and context limit."""
+import json
 import os
 from pathlib import Path
 import shlex
@@ -182,3 +183,51 @@ def test_decode_does_not_inherit_prefill_candidates(launcher):
     assert result.returncode == 0, result.stderr
     assert "HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0" in result.stdout
     assert "HCU_DP_MOE_PIPE_UNIFORM=0" in result.stdout
+
+
+@pytest.mark.parametrize("phase,rank", [(p, r) for p in ("prefill", "decode") for r in range(4)])
+def test_convenience_start_scripts_preserve_measured_configuration(tmp_path, phase, rank):
+    bash = shutil.which("bash")
+    if not bash or subprocess.run([bash, "-c", "true"], capture_output=True).returncode:
+        pytest.skip("A working Bash is required for wrapper checks")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STEP5_")}
+    env.update(STEP5_HEAD_IP="172.20.2.22", VLLM_HOST_IP="172.20.2.22",
+               STEP5_TOKENIZER="/external/tokenizer", STEP5_STATE_DIR=str(tmp_path),
+               STEP5_DRY_RUN="1")
+    result = subprocess.run([bash, str(ROOT / f"benchmarks/step5/start_{phase}_1021.sh"), str(rank)],
+                            env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    expected = ({"--tensor-parallel-size": "1", "--data-parallel-size": "16",
+                 "--data-parallel-size-local": "4", "--max-num-batched-tokens": "8192",
+                 "--max-model-len": "70000", "--port": "8018"} if phase == "prefill" else
+                {"--tensor-parallel-size": "4", "--data-parallel-size": "4",
+                 "--data-parallel-size-local": "1", "--max-num-batched-tokens": "32768",
+                 "--max-model-len": "1048576", "--port": "18118"})
+    for key, value in expected.items():
+        assert command[command.index(key) + 1] == value
+    spec = json.loads(command[command.index("--speculative-config") + 1])
+    assert spec["synthetic_acceptance_rates"] == [0.838992, 0.598322, 0.362686]
+    if rank:
+        assert "--headless" in command
+        assert command[command.index("--data-parallel-start-rank") + 1] == str(rank * (4 if phase == "prefill" else 1))
+    if phase == "prefill":
+        assert "HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0" in result.stdout
+    else:
+        assert "VLLM_HCU_DP_CUSTOM_AG=0" in result.stdout
+        assert "HCU_STEP5_DP_FABRIC=1 HCU_STEP5_CONTEXT_GRAPH_REGIONS=8736" in result.stdout
+    assert not list(tmp_path.iterdir()), "dry-run must not create runtime assets"
+
+
+def test_prefill_start_wrapper_accepts_explicit_g2_candidate(tmp_path):
+    bash = shutil.which("bash")
+    if not bash or subprocess.run([bash, "-c", "true"], capture_output=True).returncode:
+        pytest.skip("A working Bash is required for wrapper checks")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("STEP5_")}
+    env.update(STEP5_HEAD_IP="172.20.2.22", VLLM_HOST_IP="172.20.2.22",
+               STEP5_TOKENIZER="/external/tokenizer", STEP5_STATE_DIR=str(tmp_path),
+               STEP5_DRY_RUN="1")
+    result = subprocess.run([bash, str(ROOT / "benchmarks/step5/start_prefill_1021.sh"), "0", "g2_1021"],
+                            env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=1" in result.stdout

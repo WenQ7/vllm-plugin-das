@@ -132,3 +132,19 @@ An attempted environment-contract run had16 import failures because this
 Windows environment has no vLLM distribution; these are not reported as passes.
 The matching Linux/DTK extension build and full model were not rerun for this
 consolidated publication tree. Existing hardware evidence is labelled separately.
+
+
+## Convenience start scripts
+
+`benchmarks/step5/start_prefill_1021.sh NODE_RANK [PROFILE]` selects
+`dense_1021` by default; pass `g2_1021` explicitly for the 42224.93 tps candidate.
+`benchmarks/step5/start_decode_1021.sh NODE_RANK` selects the measured DP4/TP4
+Fabric + hot-context configuration. Both preserve the fixed synthetic MTP3 rates.
+Set `STEP5_HEAD_IP`, `VLLM_HOST_IP`, and `STEP5_TOKENIZER` before running either.
+The model, placement, cache and state paths default to the existing 1021-container
+assets and can be overridden through the corresponding `STEP5_*` variables.
+Both commands run in the foreground; ranks0/1/2/3 belong to p5c1/p5c2/p5c3/p5c4.
+Use `STEP5_DRY_RUN=1` to print the resolved configuration without starting a model.
+
+These are separate-phase benchmark services. Each phase occupies all16 GPUs;
+they do not configure simultaneous P/D routing or KV-cache transfer.
