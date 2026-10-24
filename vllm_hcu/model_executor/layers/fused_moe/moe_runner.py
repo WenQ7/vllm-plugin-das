@@ -425,6 +425,9 @@ class MoERunner(MoERunnerInterface):
         routed_scaling_factor: float = 1.0,
     ):
         super().__init__()
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe_config)
         self.moe_config = moe_config
         self.router = router
         self.routed_input_transform = routed_input_transform
@@ -467,6 +470,7 @@ class MoERunner(MoERunnerInterface):
         # conditions (custom AR availability, size) are checked in the op.
         self._ep_fused_combine = (
             _EP_FUSED_COMBINE
+            and self._hcu_step5_owner
             and shared_experts is not None
             and moe_config.dp_size > 1
             and moe_config.pcp_size == 1

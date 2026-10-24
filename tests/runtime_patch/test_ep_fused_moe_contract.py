@@ -94,6 +94,7 @@ def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
     )
     w1, w2, s1, s2 = tensors(block=True)
     expert = SimpleNamespace(
+        _hcu_step5_owner=True,
         quant_config=SimpleNamespace(use_fp8_w8a8=True, use_int8_w8a8=False),
         block_shape=[128, 128], w1_scale=s1, w2_scale=s2,
         _hcu_logical_n=3072, _hcu_logical_k=4096,
@@ -120,7 +121,7 @@ def test_ep_execution_validates_channel_scale_semantics(monkeypatch, case):
     w1,w2,s1,s2 = tensors(block=case == "block_scales")
     cfg = SimpleNamespace(use_fp8_w8a8=True, per_out_ch_quant=True,
                           per_act_token_quant=case != "not_per_token")
-    expert = SimpleNamespace(quant_config=cfg, block_shape=None,
+    expert = SimpleNamespace(_hcu_step5_owner=True, quant_config=cfg, block_shape=None,
                              w1_scale=s1,w2_scale=s2,gemm1_clamp_limit=7.0)
     seen=[]
     vendor=ModuleType("vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe")
@@ -175,6 +176,7 @@ def test_weight_preparation_agrees_with_execution_capability(monkeypatch, case):
         "hcu_convert_to_fp8_moe_kernel_format",ns,
     )
     layer=SimpleNamespace(
+        _hcu_step5_owner=True,
         weight_block_size=[128,128] if case=="block" else None,
         activation="silu" if case=="silu" else "swiglustep",
         expert_map=None if case=="no_ep" else metadata()["expert_map"],
@@ -267,6 +269,7 @@ def test_modular_chunk_scratch_has_independent_full_output(chunk, full):
         "_allocate_buffers", ns,
     )
     expert = SimpleNamespace(
+        _hcu_step5_owner=True,
         workspace_dtype=lambda dtype: dtype,
         workspace_shapes=lambda m,n,k,topk,*a: ((m*topk,k),(m*topk,n),(m,k)),
     )
@@ -297,6 +300,7 @@ def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatc
     s2 = torch.empty(local_experts,4096,1,device="meta")
     if case=="bad_scale":s1=torch.empty(1,device="meta")
     expert = SimpleNamespace(
+        _hcu_step5_owner=True,
         quant_config=SimpleNamespace(use_fp8_w8a8=True,
             per_out_ch_quant=case!="not_per_channel",per_act_token_quant=case!="not_per_token"),
         block_shape=[128,128] if case=="block" else None,
@@ -393,7 +397,7 @@ def test_runtime_selected_wrapper_uses_bounded_workspace(monkeypatch, mode):
     assert cls is selector.TritonOrDeepGemmExperts
     if mode=="unknown":cls=type("UnreviewedSelector",(cls,),{})
     outer=object.__new__(cls)
-    outer.experts=SimpleNamespace(step5_ep_chunk_size=lambda *a:32768)
+    outer.experts=SimpleNamespace(_hcu_step5_owner=True,step5_ep_chunk_size=lambda *a:32768)
     outer.fallback_experts=SimpleNamespace()
     monkeypatch.setattr(selector,"_valid_deep_gemm",lambda *a:mode!="fallback")
     monkeypatch.setattr(selector,"is_deep_gemm_e8m0_used",lambda:False)

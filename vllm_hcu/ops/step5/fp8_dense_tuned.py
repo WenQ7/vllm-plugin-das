@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measured gfx938 Step5 Dense choices through the normal hcu_ops extension.
 
-No standalone library, ctypes binding or external recipe manifest is used.
+No standalone library or runtime code injection is used. Algorithm choices
+come from explicitly supplied external tuning data.
 Call from the existing opaque vllm::step5_fp8_gemm custom op. Other shapes
 return None, preserving the original LightOp path and its compilation fake.
 """
@@ -15,18 +16,10 @@ from vllm.logger import init_logger
 
 logger = init_logger("vllm.hcu.step5_dense")
 
-# Independently confirmed on all four gfx938 nodes, image1021/DTK2610,
-# hipBLASLt library SHA256 e05a97b826fa33214dea22edfe9b21837d27b6ae8b925c76bf2ca9ede4919187.
-# All selected algorithms require zero device workspace. These IDs must be
-# revalidated when the underlying library changes.
-_CHOICES = {
-    (4096, 14080, 4096): 26422,
-    (4096, 18688, 4096): 26422,
-    (4096, 4096, 12288): 26423,
-    (4096, 4096, 13824): 26422,
-    (1536, 14080, 4096): 26423,
-    (1536, 4096, 13824): 26418,
-}
+from .tuning import dense_recipe
+
+_recipe = dense_recipe()
+_CHOICES, _LIBRARY_SHA256 = _recipe if _recipe is not None else ({}, None)
 _BY_NK = {}
 for _shape, _algorithm in _CHOICES.items():
     _BY_NK.setdefault(_shape[1:], []).append((_shape[0], _algorithm))
@@ -44,7 +37,7 @@ def _native_gemm():
     try:
         op = torch.ops.hcu_ops.step5_fp8_dense_gemm
         library = Path(torch.ops.hcu_ops.step5_fp8_dense_backend_library()).resolve()
-        expected = "e05a97b826fa33214dea22edfe9b21837d27b6ae8b925c76bf2ca9ede4919187"
+        expected = _LIBRARY_SHA256
         if hashlib.sha256(library.read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Unvalidated hipBLASLt build for Step5 Dense recipe: {library}")
         return op

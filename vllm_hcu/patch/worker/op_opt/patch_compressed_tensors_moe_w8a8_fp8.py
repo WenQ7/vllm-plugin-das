@@ -144,8 +144,12 @@ def apply_to_module(module: ModuleType) -> bool:
         requested_backend = None
         if channel_token:
             requested_backend = _requested_selected_backend(moe)
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe)
         original_init(self, weight_quant, input_quant, moe, layer_name)
-        if os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1":
+        if (self._hcu_step5_owner
+                and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
             self._hcu_step5_asm_g1_owner_context = _asm_g1_owner_context(layer_name, moe)
         if channel_token:
             selected_backend = _selected_backend_name(self)
@@ -166,6 +170,7 @@ def apply_to_module(module: ModuleType) -> bool:
 
     @functools.wraps(original_process)
     def hcu_process_weights_after_loading(self, layer):
+        layer._hcu_step5_owner = getattr(self, "_hcu_step5_owner", False)
         original_process(self, layer)
         selected_backend = _selected_backend_name(self)
         if selected_backend == "AITER":
@@ -195,7 +200,8 @@ def apply_to_module(module: ModuleType) -> bool:
                     "before weight postprocessing"
                 )
             process(layer)
-        if (selected_backend in ("DEEPGEMM", "HCU_DEEPGEMM")
+        if (getattr(self, "_hcu_step5_owner", False)
+                and selected_backend in ("DEEPGEMM", "HCU_DEEPGEMM")
                 and os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"):
             from vllm_hcu.ops.step5.prefill_asm_g1 import prepare_prefill_asm_g1_cache
 

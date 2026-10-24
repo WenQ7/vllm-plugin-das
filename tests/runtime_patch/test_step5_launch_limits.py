@@ -18,7 +18,8 @@ def launcher(tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("STEP5_")}
     env.update(STEP5_HEAD_IP="172.20.2.22", VLLM_HOST_IP="172.20.2.22",
                STEP5_TOKENIZER="/external/tokenizer", STEP5_STATE_DIR=str(tmp_path),
-               STEP5_DRY_RUN="1")
+               STEP5_DRY_RUN="1", STEP5_EP_TABLE="/external/ep_table.json",
+               HCU_STEP5_TUNING_CONFIG="/external/tuning.json")
 
     def run(phase, rank=0, **settings):
         return subprocess.run([bash, str(ROOT / "benchmarks/step5/launch_multinode.sh"),
@@ -118,7 +119,7 @@ def test_e22_cached_asm_profile_keeps_measured_limits(launcher):
     assert result.returncode == 0, result.stderr
     command = shlex.split(result.stdout.splitlines()[-1])
     assert "HCU_STEP5_PREFILL_ASM_G1=1 GPU_MAX_HW_QUEUES=4" in result.stdout
-    assert "HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=1" in result.stdout
+    assert "HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G2=1" in result.stdout
     assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
     assert command[command.index("--max-model-len") + 1] == "70000"
     assert "--enable-eplb" not in command
@@ -158,7 +159,7 @@ def test_invalid_or_incompatible_decode_modes_fail_before_launch(launcher, setti
 
 
 @pytest.mark.parametrize("profile,g1,g2", [
-    ("dense_1021", "0", "0"), ("g1_1021", "1", "0"), ("g2_1021", "0", "1"),
+    ("dense_1021", "0", "0"), ("g2_1021", "0", "1"),
 ])
 def test_measured_prefill_profiles_preserve_limits_and_effective_knobs(launcher, profile, g1, g2):
     result = launcher("prefill", STEP5_PREFILL_PROFILE=profile,
@@ -171,7 +172,7 @@ def test_measured_prefill_profiles_preserve_limits_and_effective_knobs(launcher,
         assert command[command.index(key) + 1] == value
     assert "HCU_DP_MOE_PIPE_MIN_TOKENS=65536" in result.stdout
     assert "HCU_DBO_MIN_TOKENS=4096 HCU_EP_DIRECT_SUM=65536 HCU_DP_MOE_PIPE_UNIFORM=1" in result.stdout
-    assert f"HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1={g1} HCU_STEP5_PREFILL_G2={g2}" in result.stdout
+    assert f"HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G2={g2}" in result.stdout
     assert "EP_FUSED_MOE_CHUNK=65536" in result.stdout
     assert "HCU_STEP5_BOUNDED_EP_WORKSPACE=1" in result.stdout
 
@@ -216,5 +217,5 @@ def test_decode_does_not_inherit_prefill_candidates(launcher):
     result = launcher("decode", HCU_STEP5_DENSE_TUNING="1", HCU_STEP5_PREFILL_G1="1",
                       HCU_STEP5_PREFILL_G2="1", HCU_DP_MOE_PIPE_UNIFORM="1")
     assert result.returncode == 0, result.stderr
-    assert "HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0" in result.stdout
+    assert "HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G2=0" in result.stdout
     assert "HCU_DP_MOE_PIPE_UNIFORM=0" in result.stdout

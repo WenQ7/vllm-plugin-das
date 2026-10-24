@@ -98,6 +98,7 @@ def test_internal_router_handoff_consumes_fresh_activation_only(
     wrapper = SharedExperts.__new__(SharedExperts)
     torch.nn.Module.__init__(wrapper)
     wrapper.enable_dbo = False
+    wrapper._hcu_step5_owner = True
     wrapper._layer = shared
     wrapper._stream = auxiliary if fused_stream else None
     wrapper._output = [None, None]

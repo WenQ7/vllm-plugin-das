@@ -75,14 +75,15 @@ def _step5_ep_chunk_provider(experts, hidden_states, w1, w2):
         return None
     provider = getattr(experts, "step5_ep_chunk_size", None)
     if provider is not None:
-        return provider
+        return provider if getattr(experts, "_hcu_step5_owner", False) else None
     from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
         TritonOrDeepGemmExperts,
     )
 
     if type(experts) is TritonOrDeepGemmExperts:
         selected = experts._select_experts_impl(hidden_states, w1, w2)
-        return getattr(selected, "step5_ep_chunk_size", None)
+        return (getattr(selected, "step5_ep_chunk_size", None)
+                if getattr(selected, "_hcu_step5_owner", False) else None)
     return None
 
 
@@ -1155,6 +1156,9 @@ class FusedMoEKernelModularImpl:
         N: int = -1,
         K: int = -1,
     ):
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(fused_experts.moe_config)
         self.prepare_finalize = prepare_finalize
         self.fused_experts = fused_experts
         self.shared_experts: SharedExperts | None = None
@@ -1866,6 +1870,7 @@ class FusedMoEKernelModularImpl:
 
         if (
             _DP_MOE_PIPE_MIN_TOKENS > 0
+            and self._hcu_step5_owner
             and quanted_hidden_states is None
             and not apply_router_weight_on_input
         ):

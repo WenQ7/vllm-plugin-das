@@ -178,7 +178,7 @@ def test_bounded_workspace_replica_namespace_is_explicit(monkeypatch, local_e, g
     fn = load_function(DEEP, "step5_ep_chunk_size", dict(
         os=os, _EP_FUSED_MOE=True, current_platform=SimpleNamespace(is_rocm=lambda: True),
         henvs=SimpleNamespace(optional_custom_op_enabled=lambda value: value)))
-    expert = SimpleNamespace(block_shape=None, _lora_context=None,
+    expert = SimpleNamespace(_hcu_step5_owner=True, block_shape=None, _lora_context=None,
         quant_config=SimpleNamespace(use_fp8_w8a8=True, per_out_ch_quant=True, per_act_token_quant=True),
         w1_scale=None, w2_scale=None)
     emap = Tensor(map_shape, "int32") if map_shape is not None else None

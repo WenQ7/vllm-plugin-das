@@ -293,11 +293,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
             from vllm_hcu.platforms import envs as henvs
 
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
             ep_fused = False
             if (
                 henvs.optional_custom_op_enabled(
                     os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
                 )
+                and is_step5_owner(layer)
                 and fp8_backend == hcu_enum.DEEPGEMM
                 and w13_input_scale is None
                 and w2_input_scale is None

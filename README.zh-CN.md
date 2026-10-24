@@ -230,3 +230,5 @@ python3 tools/run_patch_tests.py --suite contract --vllm-source /path/to/vllm-ro
 2026-10-23 的 Step5 代码清单、实测成绩、显式复现配置及验证边界见 [Step5 P/D 优化说明](docs/step5_pd_optimizations_20261023.md)。
 
 三组全量 GSM8K 精度及长输入小样结果见 [2026-10-24 全量验证记录](docs/step5_full_gsm8k_20261024.md)。
+
+Step5 调优配置已移出源码，专用路径增加模型隔离，详见[源码清理说明](docs/step5_pd_verification_20261024.md#source-cleanup-after-the-recorded-measurements)。

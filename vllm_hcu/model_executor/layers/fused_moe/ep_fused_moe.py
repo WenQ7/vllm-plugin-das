@@ -35,7 +35,6 @@ FP8 = torch.float8_e4m3fn
 _announced = False
 STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 _step5_grid_announced = False
-STEP5_PREFILL_G1 = os.environ.get("HCU_STEP5_PREFILL_G1", "0") == "1"
 STEP5_PREFILL_G2 = os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
 STEP5_PREFILL_ASM_G1 = os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
 
@@ -411,21 +410,28 @@ def lib_configs(w1, w2, topk, M):
 # uniform random routing). A cfg with PERSISTENT_PROGRAMS runs the persistent kernel.
 # {"E=..,N=..,K=..,topk=..": {M: [gemm1_cfg, gemm2_cfg]}}, nearest M wins (same rule as boltops).
 # Shapes without an entry fall back to the library tables.
-EP_TABLE_PATH = os.environ.get(
-    "EP_FUSED_MOE_TABLE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ep_table.json"))
+EP_TABLE_PATH = os.environ.get("EP_FUSED_MOE_TABLE", "")
 
 
 @functools.lru_cache(maxsize=None)
 def _ep_table(key):
+    if not EP_TABLE_PATH:
+        return None
     if not os.path.exists(EP_TABLE_PATH):
         return None
     t = json.load(open(EP_TABLE_PATH)).get(key)
     return {int(m): (c1, c2) for m, (c1, c2) in t.items()} if t else None
 
 
+@functools.lru_cache(maxsize=None)
+def _device_arch(device_index):
+    return torch.cuda.get_device_properties(device_index).gcnArchName.split(":", 1)[0]
+
+
 def pick_configs(w1, w2, topk, M):
     E, N, K = w1.shape
-    t = _ep_table(f"E={E},N={N},K={K},topk={topk}")
+    arch = _device_arch(w1.device.index)
+    t = _ep_table(f"E={E},N={N},K={K},topk={topk}") if arch == "gfx938" else None
     if t:
         return t[min(t, key=lambda x: abs(x - M))]
     return lib_configs(w1, w2, topk, M)
@@ -633,17 +639,9 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     elif presort and a_s.numel() == M:
         # A gathered into sorted order first (lives in workspace2, dead before act_q).
         a_g, s_g = ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, workspace2)
-        specialized = False
-        if STEP5_PREFILL_G1:
-            from vllm_hcu.ops.step5.prefill_g1 import try_step5_prefill_g1
-
-            specialized = try_step5_prefill_g1(
-                a_g, w1, cache1, s_g, w1_scale, sorted_ids, expert_ids, nvalid,
-                num_tokens=M, top_k=topk, sort_block_m=bm)
-        if not specialized:
-            _gemm(a_g, w1, cache1, s_g, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
-                  expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
-                  ck_topk=topk, a_sorted=True)
+        _gemm(a_g, w1, cache1, s_g, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
+              expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
+              ck_topk=topk, a_sorted=True)
         del a_g, s_g
     else:
         _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,

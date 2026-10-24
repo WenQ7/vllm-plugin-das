@@ -44,6 +44,8 @@ import sys
 
 import numpy as np
 import torch
+from vllm_hcu.runtime_compat.step5 import is_step5_config
+from vllm_hcu.platforms import envs as henvs
 
 from vllm.logger import init_logger
 
@@ -57,12 +59,17 @@ _MIN_TAIL = 64
 
 
 def enable_in_worker(vllm_config) -> bool:
+    if not is_step5_config(vllm_config) or not henvs.optional_custom_op_enabled(
+        DBO_MIN_TOKENS > 0
+    ):
+        return False
     pc = vllm_config.parallel_config
     if DBO_MIN_TOKENS <= 0 or pc.data_parallel_size <= 1 or pc.enable_dbo:
         return False
     _patch_compute_hash()
     _patch_revalidation()
     pc.enable_dbo = True
+    pc._hcu_step5_dbo = True
     _patch_dp_threshold()
     _patch_slicing()
     # No CU partitioning: the NCCL kernels already take few CUs
@@ -95,7 +102,7 @@ def _patch_compute_hash() -> None:
         return
 
     def compute_hash(self):
-        if not self.enable_dbo:
+        if not self.enable_dbo or not getattr(self, "_hcu_step5_dbo", False):
             return orig(self)
         self.enable_dbo = False
         try:
@@ -119,7 +126,7 @@ def _patch_revalidation() -> None:
 
     def __post_init__(self):
         pc = self.parallel_config
-        if not pc.enable_dbo:
+        if not pc.enable_dbo or not is_step5_config(self):
             return orig(self)
         pc.enable_dbo = False
         try:
@@ -137,7 +144,11 @@ def _patch_dp_threshold() -> None:
     if getattr(dpu.check_ubatch_thresholds, "_hcu_dbo", False):
         return
 
+    original_threshold = dpu.check_ubatch_thresholds
+
     def check_ubatch_thresholds(config, num_tokens, uniform_decode):
+        if not getattr(config, "_hcu_step5_dbo", False):
+            return original_threshold(config, num_tokens, uniform_decode)
         if uniform_decode or num_tokens < DBO_MIN_TOKENS:
             return False
         # The caller passes the smallest rank's count; the split point is half
@@ -245,6 +256,10 @@ def _patch_slicing() -> None:
 
 def install_runner(runner) -> None:
     """Per-runner hooks, once the ubatch runner and the model exist."""
+    if (DBO_MIN_TOKENS <= 0
+            or not is_step5_config(getattr(runner, "vllm_config", None))
+            or not henvs.optional_custom_op_enabled(True)):
+        return
     ur = getattr(runner, "ubatch_runner", None)
     if ur is None or getattr(ur, "_hcu_dbo", False):
         return

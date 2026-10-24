@@ -11,7 +11,15 @@ SPEC = importlib.util.spec_from_file_location(
 )
 CHECK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECK)
-TABLE = ROOT / "vllm_hcu/model_executor/layers/fused_moe/ep_table.json"
+@pytest.fixture(autouse=True)
+def external_table(tmp_path, monkeypatch):
+    global TABLE
+    TABLE = tmp_path / "ep_table.json"
+    pair = [{"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 64}] * 2
+    seeds = {"256": pair, "32768": pair}
+    TABLE.write_text(json.dumps({f"E={e},N=3072,K=4096,topk=8":
+                               dict(seeds, **({"65536": pair} if e == 23 else {}))
+                               for e in (22,23,44)}))
 
 
 @pytest.mark.parametrize("ep_size", [8, 16])
@@ -71,15 +79,9 @@ def test_e23_requires_its_own_table_and_explicit_hot_row(tmp_path):
     assert CHECK.check_ep_table(path)["key"] == CHECK.KEY
 
 
-def test_e23_ships_the_measured_hot_row_and_preserves_small_shape_seeds():
-    data = json.loads(TABLE.read_text())
-    e22, e23 = data[CHECK.KEY], data["E=23,N=3072,K=4096,topk=8"]
-    assert {m: pair for m, pair in e23.items() if m != "65536"} == e22
-    assert e23["65536"][0]["GROUP_SIZE_M"] == 1
-    assert e23["65536"][1] == e22["32768"][1]
-    result = CHECK.check_ep_table(TABLE, 16, 368, 65536)
-    assert result["selected"]["256"]["table_m"] == 256
-    assert result["selected"]["65536"]["table_m"] == 65536
+def test_no_machine_table_is_shipped_in_the_source_tree():
+    assert not (ROOT / "vllm_hcu/model_executor/layers/fused_moe/ep_table.json").exists()
+    assert not (ROOT / "benchmarks/step5/ep_table_decode_candidate.json").exists()
 
 
 @pytest.mark.parametrize("physical_experts,require_m", [(True, None), (353, None), (368, 0), (368, True)])

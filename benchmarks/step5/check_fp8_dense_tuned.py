@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True,
                         help="New JSON result path; existing results are not overwritten")
     args = parser.parse_args()
+    if not os.environ.get("HCU_STEP5_TUNING_CONFIG"):
+        parser.error("Set HCU_STEP5_TUNING_CONFIG to an external qualified tuning profile")
     if args.device < 0:
         parser.error("--device must be nonnegative")
     if args.output.exists():

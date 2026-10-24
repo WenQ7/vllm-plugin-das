@@ -54,6 +54,10 @@ def test_native_adapter_enables_packing_only_for_opted_in_dp_groups(monkeypatch)
     monkeypatch.delenv('VLLM_HCU_DP_PACKED_AG', raising=False)
     assert not Communicator(4, unique_name='dp:0')._hcu_dp_packed_ag
     monkeypatch.setenv('VLLM_HCU_DP_PACKED_AG', '1')
+    assert not Communicator(4, unique_name='dp:0')._hcu_dp_packed_ag
+    owner=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type='step5')))
+    monkeypatch.setattr(vllm.config, 'get_current_vllm_config_or_none', lambda: owner)
+    monkeypatch.setattr(adapter, 'get_hcu_config', lambda _:SimpleNamespace(deepep_auto=False))
     assert Communicator(4, unique_name='dp:0')._hcu_dp_packed_ag
     assert not Communicator(4, unique_name='tp:0')._hcu_dp_packed_ag
     assert not Communicator(1, unique_name='dp:0')._hcu_dp_packed_ag

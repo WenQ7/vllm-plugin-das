@@ -6,6 +6,41 @@ and fixed E23 Prefill support. The tested model code is `c2daed7ef0d34ea0313eda4
 archive contains 925 files verified against their Git blobs. Windows archive
 export explicitly disables `core.autocrlf` so Linux receives the committed bytes.
 
+## Source cleanup after the recorded measurements
+
+The measurements below remain pinned to their original commits. The subsequent
+cleanup does not claim a new throughput or GSM8K score.
+
+Machine-selected MoE tables and Dense/ASM algorithm choices are no longer
+shipped in the source tree or wheel. Supply `STEP5_EP_TABLE` (the MoE JSON)
+and `HCU_STEP5_TUNING_CONFIG` (the qualified Dense/ASM profile) as external
+runtime data. Absent a recipe, the generic operator keeps its existing native
+fallback. The benchmark launcher requires explicit data for reproduction;
+no tuning files, model weights or binaries are added to Git.
+
+The Dense implementation still belongs to the normal `vllm_hcu.hcu_ops` module.
+Its extra build dependency is opt-in: set `VLLM_HCU_BUILD_STEP5_DENSE=1` when
+building the matching Step5 wheel. The default build omits this implementation
+and does not directly link hipBLASLt. There is no separate Dense library,
+LD_PRELOAD deployment, or runtime native-code compilation.
+
+DBO worker/runner hooks, packed DP dispatch, Fabric, MoE specialization and
+MTP prefill-tail selection require Step5 ownership. Unknown/other models keep
+their ordinary paths even if a Step5 environment variable is inherited.
+External MoE tables are used only on the qualified gfx938 architecture.
+
+The unused Triton G1 experiment and static-load diagnostic RPC implementation
+have been removed. Native GEMM fallback, ASM G1, fused G2 and fixed E23 routing
+remain. Test fixtures construct synthetic contract data instead of depending
+on machine tuning artifacts. Historical Git objects are retained; this cleanup
+does not rewrite existing commits.
+
+Cleanup validation: **583 CPU contract tests passed**, with four GPU graph
+tests skipped. Both default and Step5-enabled native extensions built and
+imported successfully; ELF inspection confirmed that only the explicitly
+enabled build directly links hipBLASLt. No model service, new throughput run
+or new GSM8K run was started for this cleanup.
+
 ## Fresh Decode results
 
 Four nodes x four gfx938 cards use DP4/TP4/EP16, concurrency 64 (16 per DP),

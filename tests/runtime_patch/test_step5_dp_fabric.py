@@ -76,6 +76,10 @@ class Tests(unittest.TestCase):
         env = patch.dict(os.environ, {"VLLM_HCU_USE_CUSTOM_OPS": "1"})
         env.start()
         self.addCleanup(env.stop)
+        self.config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(hf_config=types.SimpleNamespace(model_type="step5")),
+            parallel_config=types.SimpleNamespace(tensor_parallel_size=4,data_parallel_size=4))
+        subject.torch.cuda = types.SimpleNamespace(get_device_properties=lambda _:types.SimpleNamespace(gcnArchName="gfx938"))
         self.n = Native()
         self.f = Fabric()
         self.p = subject.Step5DPFabricProxy(self.n, self.f)
@@ -141,11 +145,11 @@ class Tests(unittest.TestCase):
     def test_factory_targets_only_enabled_dp4(self):
         comm = types.SimpleNamespace(world_size=4, pynccl_comm=self.n)
         with patch.dict(os.environ, {"HCU_STEP5_DP_FABRIC": "0"}):
-            subject.maybe_install(comm, None, None, "dp:0")
+            subject.maybe_install(comm, None, None, "dp:0", vllm_config=self.config)
         with patch.dict(os.environ, {"HCU_STEP5_DP_FABRIC": "1"}):
             subject.maybe_install(comm, None, None, "tp:0")
             comm.world_size = 16
-            subject.maybe_install(comm, None, None, "dp:0")
+            subject.maybe_install(comm, None, None, "dp:0", vllm_config=self.config)
         self.assertIs(comm.pynccl_comm, self.n)
 
     def test_factory_rejects_conflicting_legacy_backend(self):
@@ -156,7 +160,7 @@ class Tests(unittest.TestCase):
             ),
             self.assertRaisesRegex(AssertionError, "Choose one DP dispatch backend"),
         ):
-            subject.maybe_install(comm, None, None, "dp:0")
+            subject.maybe_install(comm, None, None, "dp:0", vllm_config=self.config)
 
     def test_factory_requires_packed_dispatch(self):
         comm = types.SimpleNamespace(world_size=4, _hcu_dp_packed_ag=False)
@@ -166,14 +170,14 @@ class Tests(unittest.TestCase):
             ),
             self.assertRaisesRegex(AssertionError, "requires packed DP dispatch"),
         ):
-            subject.maybe_install(comm, None, None, "dp:0")
+            subject.maybe_install(comm, None, None, "dp:0", vllm_config=self.config)
 
     def test_custom_op_master_off_prevents_communicator_allocation(self):
         comm = types.SimpleNamespace(world_size=4, pynccl_comm=self.n)
         with patch.dict(
             os.environ, {"VLLM_HCU_USE_CUSTOM_OPS": "0", "HCU_STEP5_DP_FABRIC": "1"}
         ):
-            subject.maybe_install(comm, None, None, "dp:0")
+            subject.maybe_install(comm, None, None, "dp:0", vllm_config=self.config)
         self.assertIs(comm.pynccl_comm, self.n)
 
 

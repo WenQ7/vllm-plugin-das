@@ -44,6 +44,11 @@ _TAIL = int(os.environ.get("HCU_MTP_PREFILL_TAIL", "0"))
 def _tail_enabled(self) -> bool:
     ok = getattr(self, "_hcu_mtp_tail_ok", None)
     if ok is None:
+        from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+        if not is_step5_config(self.vllm_config):
+            self._hcu_mtp_tail_ok = False
+            return False
         cache_config = self.vllm_config.cache_config
         ok = _TAIL > 0 and not cache_config.enable_prefix_caching
         if ok:

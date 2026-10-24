@@ -13,6 +13,7 @@ import torch
 
 from vllm_hcu.patch.config import get_hcu_config
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 from vllm_hcu.patch.import_coordinator import (
     IMPORT_COORDINATOR,
@@ -201,8 +202,13 @@ def apply_to_module(module: ModuleType) -> bool:
             tcp_store_group,
             use_all2all,
         )
+        from vllm.config import get_current_vllm_config_or_none
+
+        vllm_config = get_current_vllm_config_or_none()
+        step5_owner = vllm_config is not None and is_step5_config(vllm_config)
         self._hcu_dp_packed_ag = (
-            henvs.optional_custom_op_enabled(
+            step5_owner
+            and henvs.optional_custom_op_enabled(
                 os.environ.get("VLLM_HCU_DP_PACKED_AG", "0") == "1"
             )
             and unique_name.split(":")[0] == "dp"
@@ -210,12 +216,13 @@ def apply_to_module(module: ModuleType) -> bool:
         )
         try:
             from vllm_hcu.distributed.device_communicators.step5_dp_fabric import maybe_install
-            maybe_install(self, cpu_group, device, unique_name)
-            _maybe_init_ep_custom_allreduce(self, unique_name)
-            _maybe_init_dp_ipc_all_gather(self, unique_name)
-            from vllm.config import get_current_vllm_config_or_none
-
-            vllm_config = get_current_vllm_config_or_none()
+            maybe_install(self, cpu_group, device, unique_name,
+                          vllm_config=vllm_config)
+            if step5_owner:
+                _maybe_init_ep_custom_allreduce(self, unique_name)
+                _maybe_init_dp_ipc_all_gather(self, unique_name)
+            else:
+                self._hcu_ipc_ag = None
             if vllm_config is None or not get_hcu_config(vllm_config).deepep_auto:
                 return
             # CudaCommunicator is constructed for DP/TP/PP as well as EP groups.

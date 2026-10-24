@@ -3,7 +3,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 
-import json
 import os
 from contextlib import nullcontext
 
@@ -57,6 +56,7 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.import_utils import has_deep_gemm
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
 logger = init_logger(__name__)
 
@@ -70,52 +70,6 @@ _HCU_HT_EP_TOKEN_ALIGNMENT = 256
 _EP_FUSED_MOE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_EP_FUSED_MOE", "0") == "1"
 )
-_STEP5_BACKEND_AUDIT = os.environ.get("HCU_STEP5_MOE_BACKEND_AUDIT", "0") == "1"
-_step5_backend_audited = False
-
-
-def _audit_step5_backend(experts, a1q, a1q_scale, w1, w2, activation, helper):
-    """Optional first-apply metadata receipt; never reads tensor contents."""
-    global _step5_backend_audited
-    if (_step5_backend_audited
-            or os.environ.get("HCU_STEP5_MOE_BACKEND_AUDIT", "0") != "1"):
-        return
-    if not (
-        activation == MoEActivation.SWIGLUSTEP
-        and experts.block_shape is None
-        and experts.quant_config.use_fp8_w8a8
-        and experts.quant_config.per_out_ch_quant
-        and experts.quant_config.per_act_token_quant
-        and experts._hcu_logical_n == 3072
-        and experts._hcu_logical_k == 4096
-    ):
-        return
-    from vllm.distributed import get_ep_group
-
-    flag_names = (
-        "VLLM_HCU_EP_FUSED_MOE", "VLLM_USE_DEEP_GEMM", "VLLM_MOE_USE_DEEP_GEMM",
-        "DEEP_EP_NORMAL_MNVL", "HCU_DBO_MIN_TOKENS", "HCU_DP_MOE_PIPE_MIN_TOKENS",
-        "HCU_DP_MOE_PIPE_UNIFORM", "HCU_STEP5_DENSE_TUNING",
-        "VLLM_HCU_STEP5_FP8_DENSE", "HCU_EP_DIRECT_SUM",
-    )
-    record = {
-        "backend_class": f"{type(experts).__module__}.{type(experts).__qualname__}",
-        "activation": activation.name,
-        "activation_helper": helper,
-        "ep_rank": int(get_ep_group().rank_in_group),
-        "w1_ndim": w1.ndim,
-        "w2_ndim": w2.ndim,
-        "w1_shape": list(w1.shape),
-        "w2_shape": list(w2.shape),
-        "w1_scale_shape": list(experts.w1_scale.shape),
-        "w2_scale_shape": list(experts.w2_scale.shape),
-        "input_shape": list(a1q.shape),
-        "input_scale_shape": list(a1q_scale.shape),
-        "ep_fused_moe_import": _EP_FUSED_MOE,
-        "flags": {name: os.environ.get(name) for name in flag_names},
-    }
-    _step5_backend_audited = True
-    print("[step5_moe_backend_audit] " + json.dumps(record, sort_keys=True), flush=True)
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:
@@ -209,6 +163,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
+        self._hcu_step5_owner = is_step5_owner(moe_config)
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
         # the same grouped GEMM (aliased to fp8_fp4) with recipe (1, 32).
         self.mxfp8 = quant_config.block_shape == [1, 32]
@@ -347,6 +302,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
         """Bound Step5 EP8/EP16 scratch, including static EP16 replicas."""
         if not (
             _EP_FUSED_MOE
+            and getattr(self, "_hcu_step5_owner", False)
             and current_platform.is_rocm()
             and henvs.optional_custom_op_enabled(
                 os.environ.get("HCU_STEP5_BOUNDED_EP_WORKSPACE", "0") == "1"
@@ -580,12 +536,14 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
 
         native_channel_fp8 = (
             _EP_FUSED_MOE
+            and getattr(self, "_hcu_step5_owner", False)
             and self.block_shape is None
             and self.quant_config.use_fp8_w8a8
             and w1.dim() == 3
         )
         step5_channel_fp8 = (
-            current_platform.is_rocm()
+            getattr(self, "_hcu_step5_owner", False)
+            and current_platform.is_rocm()
             and activation == MoEActivation.SWIGLUSTEP
             and self.block_shape is None
             and self.quant_config.use_fp8_w8a8
@@ -595,19 +553,6 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             and self._hcu_logical_n == 3072
             and self._hcu_logical_k == 4096
         )
-        if _STEP5_BACKEND_AUDIT and not _step5_backend_audited:
-            activation_helper = (
-                "native_ep_swiglustep_quant" if native_channel_fp8
-                else "ep_swiglustep_quant_deepgemm" if step5_channel_fp8
-                else "lightop_fuse_silu_mul_fp8_quant"
-                if current_platform.is_rocm() and activation in (
-                    MoEActivation.SILU, MoEActivation.SWIGLUSTEP
-                )
-                else "generic_act_mul_quant"
-            )
-            _audit_step5_backend(
-                self, a1q, a1q_scale, w1, w2, activation, activation_helper
-            )
         if native_channel_fp8:
             self._apply_ep_fused(
                 output, a1q, w1, w2, topk_weights, topk_ids, activation,

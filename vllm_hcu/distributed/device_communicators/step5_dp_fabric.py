@@ -8,6 +8,7 @@ import os
 import torch
 
 from vllm_hcu.platforms import envs as henvs
+from vllm_hcu.runtime_compat.step5 import is_step5_config
 
 
 class Step5DPFabricProxy:
@@ -90,12 +91,20 @@ class Step5DPFabricProxy:
             self.original.destroy()
 
 
-def maybe_install(communicator, cpu_group, device, unique_name):
+def maybe_install(communicator, cpu_group, device, unique_name, *, vllm_config=None):
     if not henvs.optional_custom_op_enabled(
         os.environ.get("HCU_STEP5_DP_FABRIC", "0") == "1"
     ):
         return
     if unique_name.split(":")[0] != "dp" or communicator.world_size != 4:
+        return
+    config = vllm_config
+    if (config is None or not is_step5_config(config)
+            or config.parallel_config.tensor_parallel_size != 4
+            or config.parallel_config.data_parallel_size != 4):
+        return
+    architecture = torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+    if architecture != "gfx938":
         return
     assert communicator._hcu_dp_packed_ag, "Step5 Fabric requires packed DP dispatch"
     assert os.environ.get("VLLM_HCU_DP_CUSTOM_AG", "0") != "1", (

@@ -123,8 +123,6 @@ class HcuGPUWorker(Worker):
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         """Load the model, then require every enabled patch chain to be live."""
 
-        self._hcu_static_load_diag_ready = False
-        self._hcu_static_load_diag_dummy_weights = bool(load_dummy_weights)
         super().load_model(load_dummy_weights=load_dummy_weights)
         from vllm_hcu.patch.worker import validate_worker_patches
 
@@ -156,7 +154,6 @@ class HcuGPUWorker(Worker):
             refresh_glm53_router_gates(self.model_runner.model)
 
     def compile_or_warm_up_model(self):
-        self._hcu_static_load_diag_ready = False
         if self.use_v2_model_runner:
             from vllm_hcu.v1.hcu_model_runner_v2 import sampler_warmup_scope
 
@@ -164,21 +161,7 @@ class HcuGPUWorker(Worker):
         else:
             scope = nullcontext()
         with scope:
-            result = self._compile_or_warm_up_model()
-        self._hcu_static_load_diag_ready = not getattr(
-            self, "_hcu_static_load_diag_dummy_weights", False
-        )
-        return result
-
-    def step5_static_load_diag(
-        self, action: str, session: str = "", max_steps: str = "64"
-    ) -> dict:
-        """Normal JSON-only Worker RPC for explicitly enabled load diagnostics."""
-        from vllm_hcu.distributed.static_eplb_diagnostics import worker_rpc
-
-        return worker_rpc(
-            self, action=action, session=session, max_steps=max_steps
-        )
+            return self._compile_or_warm_up_model()
 
     def _compile_or_warm_up_model(self):
         if (

@@ -1,7 +1,7 @@
 """Export a complete pinned Git tree with explicit CP312/tokenizer runtime assets.
 
 Never reconstruct a release by applying a Git delta to an unrelated old snapshot:
-unchanged configuration files, including the EP16 table, must travel with the code.
+runtime assets supplied separately are hashed independently from the Git tree.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ with tarfile.open(root/'source-runtime.tar.gz') as archive:
         members[member.name]=(data,member.mode)
 assert set(members)==set(hashes)
 assert set(origin['files']).issubset(members)
-table=json.loads(members['source/vllm_hcu/model_executor/layers/fused_moe/ep_table.json'][0])
+table=json.loads(members['assets/ep_table.json'][0])
 key='E=22,N=3072,K=4096,topk=8'
 assert isinstance(table.get(key),dict) and table[key],'Missing Step5 EP16/E22 configuration'
 if not args.verify_only:
@@ -68,6 +68,7 @@ case "$phase" in prefill|decode) ;; *) exit 2;; esac
 case "$rank" in 0|1|2|3) ;; *) exit 2;; esac
 bundle="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 export STEP5_SOURCE_DIR="$bundle/source"
+export STEP5_EP_TABLE="${STEP5_EP_TABLE:-$bundle/assets/ep_table.json}"
 export STEP5_TOKENIZER="${STEP5_TOKENIZER:-$bundle/assets/tokenizer-bytelevel}"
 export STEP5_STATE_DIR="${STEP5_STATE_DIR:-/var/lib/xuwq_step5_native}"
 export STEP5_CACHE_DIR="${STEP5_CACHE_DIR:-/var/cache/xuwq_step5}"
@@ -90,7 +91,7 @@ def git(repo: Path, *args: str) -> bytes:
     return subprocess.check_output(['git', *args], cwd=repo)
 
 
-def build_bundle(repo: Path, ref: str, output: Path, hcu_ops: Path, tokenizer: Path) -> dict:
+def build_bundle(repo: Path, ref: str, output: Path, hcu_ops: Path, tokenizer: Path, ep_table: Path) -> dict:
     repo, output = repo.resolve(), output.resolve()
     if output.exists() and any(output.iterdir()):
         raise ValueError(f'Refusing to replace an existing bundle: {output}')
@@ -136,10 +137,11 @@ def build_bundle(repo: Path, ref: str, output: Path, hcu_ops: Path, tokenizer: P
             raise ValueError('Git object checksum mismatch: '+oid)
         blobs[oid]=data
     entries = {name:(blobs[info['git_blob']],info['mode']) for name,info in expected.items()}
-    table = json.loads(entries['source/vllm_hcu/model_executor/layers/fused_moe/ep_table.json'][0])
+    entries['assets/ep_table.json'] = (ep_table.read_bytes(),0o644)
+    table = json.loads(entries['assets/ep_table.json'][0])
     key = 'E=22,N=3072,K=4096,topk=8'
     if not isinstance(table.get(key),dict) or not table[key]:
-        raise ValueError('Pinned source is missing Step5 EP16/E22 configurations')
+        raise ValueError('External table is missing Step5 EP16/E22 configurations')
     entries['source/vllm_hcu/'+hcu_ops.name] = (binary,0o644)
     if not (tokenizer/'tokenizer.json').is_file() or not (tokenizer/'tokenizer_config.json').is_file():
         raise ValueError('Supply the benchmark tokenizer directory')
@@ -179,5 +181,6 @@ if __name__ == '__main__':
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--hcu-ops',type=Path,required=True)
     parser.add_argument('--tokenizer',type=Path,required=True)
+    parser.add_argument('--ep-table',type=Path,required=True)
     args=parser.parse_args()
-    print(json.dumps(build_bundle(args.repo,args.ref,args.output,args.hcu_ops,args.tokenizer)))
+    print(json.dumps(build_bundle(args.repo,args.ref,args.output,args.hcu_ops,args.tokenizer,args.ep_table)))

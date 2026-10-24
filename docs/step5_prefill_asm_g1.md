@@ -1,5 +1,8 @@
 # Step5 prefill ASM G1
 
+Historical measurement record. Current cleanup removes the retired Triton G1
+experiment and keeps tuning data external; see [current source contract](step5_pd_verification_20261024.md#source-cleanup-after-the-recorded-measurements).
+
 `HCU_STEP5_PREFILL_ASM_G1=1` opts into the existing AITER ASM stage1 API
 for gfx938, DP16/TP1/EP16, E22 or fixed E23, M65536, topk8 and the original
 BM256 expert sorting. The default remains disabled. Solution13001 uses a BM128

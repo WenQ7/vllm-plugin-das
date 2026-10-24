@@ -1,5 +1,8 @@
 # Step5 prefill G1 specialization
 
+Historical measurement record. Current cleanup removes the retired Triton G1
+experiment and keeps tuning data external; see [current source contract](step5_pd_verification_20261024.md#source-cleanup-after-the-recorded-measurements).
+
 `HCU_STEP5_PREFILL_G1=1` enables a shape-specialized Triton projection in the
 existing channel-FP8 EP path. It consumes the original contiguous NK weights
 and expert-sorted buffers. FP32 scaling, the BF16 projection boundary,

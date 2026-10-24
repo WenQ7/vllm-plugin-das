@@ -586,12 +586,6 @@ def apply_to_module(module) -> bool:
     def step(self, is_dummy=False, is_profile=False, log_stats=False):
         load_path, record_path = _paths(self.parallel_config)
         if load_path:
-            if os.environ.get("HCU_STATIC_EPLB_LOAD_DIAGNOSTICS", "0") == "1":
-                from vllm_hcu.distributed.static_eplb_diagnostics import (
-                    on_static_step,
-                )
-
-                on_static_step(self, is_dummy=is_dummy, is_profile=is_profile)
             return None
         if not record_path:
             return original_step(

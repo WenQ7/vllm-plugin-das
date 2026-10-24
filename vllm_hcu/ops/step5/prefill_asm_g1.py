@@ -16,6 +16,8 @@ import os
 import threading
 import weakref
 
+from .tuning import asm_recipe
+
 import torch
 import triton
 import triton.language as tl
@@ -31,13 +33,10 @@ _CACHES = weakref.WeakValueDictionary()
 _ONES = {}
 _M, _N, _K, _TOPK, _BM = 65536, 3072, 4096, 8, 128
 _LOCAL_EXPERTS = (22, 23)
-_SOLUTION, _PERSIST = 13001, 256
 
 
 def _persist_for_experts(local_experts: int) -> int:
-    # E23 candidate: selected by a separate native AG/RS interference screen.
-    # Preserve the measured E22 configuration.
-    return 320 if local_experts == 23 else _PERSIST
+    return asm_recipe(local_experts)[1]
 
 
 @dataclass
@@ -172,6 +171,8 @@ def prepare_prefill_asm_g1_cache(method, layer, owner_context) -> bool:
         and weight.dtype == torch.float8_e4m3fn and weight.is_cuda
         and weight.is_contiguous() and _is_gfx938(weight.device.index)
     )
+    if eligible:
+        eligible = asm_recipe(local_experts) is not None
     if not eligible:
         with _LOCK:
             _discard(layer)
@@ -213,7 +214,7 @@ def prepare_prefill_asm_g1_cache(method, layer, owner_context) -> bool:
             total_layers=len(records), total_bytes=sum(r.packed.numel() * r.packed.element_size() for r in records),
             allocation_delta=int(torch.cuda.memory_allocated(weight.device)) - before,
             source_ptr=record.source_ptr, packed_ptr=packed.data_ptr(),
-            source_version=version, mtp_cached=False, solution=_SOLUTION,
+            source_version=version, mtp_cached=False, solution=asm_recipe(local_experts)[0],
             persist=_persist_for_experts(local_experts), asm_block_m=_BM, shuffle=1,
             local_experts=local_experts, physical_experts=local_experts * 16,
             static_row_sha256=(hashlib.sha256(json.dumps(static_row).encode()).hexdigest()
@@ -349,7 +350,7 @@ def try_step5_prefill_asm_g1(a, w1, w2, cache1, a_scale, w_scale,
 
     # The installed normal AITER API launches on the current HIP stream.
     aiter.asm_fmoe_a8(cache1, a, record.packed, w2, safe, ones, expanded, nvalid,
-                     _TOPK, a_scale, w_scale, None, 4, _SOLUTION, 1,
+                     _TOPK, a_scale, w_scale, None, 4, asm_recipe(local_experts)[0], 1,
                      _persist_for_experts(local_experts), 1)
     scale = torch.empty((capacity, 1), dtype=torch.float32, device=a.device)
     block = ep.ACT_CFG["BLOCK_M"]
@@ -363,7 +364,7 @@ def try_step5_prefill_asm_g1(a, w1, w2, cache1, a_scale, w_scale,
             record.used = True
             print("[step5_prefill_asm_g1] active: " + json.dumps(dict(
                 layer=record.layer_name, M=_M, E=local_experts, topk=_TOPK, sort_bm=256,
-                asm_bm=_BM, solution=_SOLUTION,
+                asm_bm=_BM, solution=asm_recipe(local_experts)[0],
                 persist=_persist_for_experts(local_experts), shuffle=1,
                 source_ptr=record.source_ptr, packed_ptr=record.packed.data_ptr(),
                 weight_bytes=record.packed.numel(), input_storage_tail_added=False,

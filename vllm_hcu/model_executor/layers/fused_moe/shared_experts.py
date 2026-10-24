@@ -82,6 +82,9 @@ class SharedExperts(torch.nn.Module):
         # an MK's finalize method.  We keep a list of outputs indexed by current
         # DBO ubatch id to handle this case.  If DBO is not enabled, the
         # index is always 0 and the second output list element is ignored.
+        from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+        self._hcu_step5_owner = is_step5_owner(moe_config)
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
         self._output_pending_on_stream: list[bool] = [False, False]
@@ -243,7 +246,8 @@ class SharedExperts(torch.nn.Module):
         hidden_states, which routed experts are allowed to overwrite.
         """
         if (
-            not _fused_router_stream_enabled()
+            not getattr(self, "_hcu_step5_owner", False)
+            or not _fused_router_stream_enabled()
             or self.enable_dbo
             or self._stream is None
             or self._disable_shared_experts_overlap
@@ -300,7 +304,8 @@ class SharedExperts(torch.nn.Module):
 
     def _late_stream(self, hidden_states: torch.Tensor) -> bool:
         return (
-            _LATE_STREAM_MIN_TOKENS > 0
+            getattr(self, "_hcu_step5_owner", False)
+            and _LATE_STREAM_MIN_TOKENS > 0
             and self._stream is not None
             and hidden_states.shape[0] >= _LATE_STREAM_MIN_TOKENS
             # Microbatched: the combine already overlaps the other microbatch.

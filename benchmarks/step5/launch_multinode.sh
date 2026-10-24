@@ -15,7 +15,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_dir="${STEP5_SOURCE_DIR:-$repo_root}"
 model_dir="${STEP5_MODEL_DIR:-/data/model/Step5-Channel-FP8-w8a8}"
 export PYTHONPATH="$source_dir${PYTHONPATH:+:$PYTHONPATH}"
-export EP_FUSED_MOE_TABLE="${STEP5_EP_TABLE:-$source_dir/vllm_hcu/model_executor/layers/fused_moe/ep_table.json}"
+export EP_FUSED_MOE_TABLE="${STEP5_EP_TABLE:?Set an external tuned MoE table; machine tuning data is not shipped in the source}"
 export HOME="$STEP5_STATE_DIR/$phase/home"
 # ZMQ appends a UUID to TMPDIR for Unix sockets (107-byte path limit).
 export TMPDIR="${STEP5_TMP_DIR:-/var/tmp/xuwq_step5}"
@@ -104,7 +104,7 @@ if [[ "$phase" == prefill ]]; then
     # Explicit reproduction profiles; historical defaults remain unchanged.
     case "${STEP5_PREFILL_PROFILE:-baseline}" in
         baseline) ;;
-        dense_1021|g1_1021|g2_1021|asm_g1_1021|e23_asm_1021)
+        dense_1021|g2_1021|asm_g1_1021|e23_asm_1021)
             [[ "$dp" == 16 && "$tp" == 1 && "$tokens" == 8192 && "$max_len" == 70000 && "$gpu_util" == 0.875 ]] || {
                 printf '1021 Prefill profiles require DP16/TP1, tokens8192, length70000 and memory0.875\n' >&2; exit 2;
             }
@@ -112,12 +112,12 @@ if [[ "$phase" == prefill ]]; then
                 printf '1021 Prefill profiles require the existing EP fused MoE path\n' >&2; exit 2;
             }
             : "${STEP5_PREFILL_PLACEMENT:?Set the external measured E22 Prefill placement file}"
+            : "${HCU_STEP5_TUNING_CONFIG:?Set the external Dense/ASM tuning profile}"
             export HCU_DP_MOE_PIPE_MIN_TOKENS=65536 HCU_DBO_MIN_TOKENS=4096 HCU_EP_DIRECT_SUM=65536
             export EP_FUSED_MOE_CHUNK=65536 HCU_STEP5_BOUNDED_EP_WORKSPACE=1
             export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096 HCU_DP_MOE_PIPE_UNIFORM=1
-            export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0
+            export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0
             case "$STEP5_PREFILL_PROFILE" in
-                g1_1021) export HCU_STEP5_PREFILL_G1=1 ;;
                 g2_1021) export HCU_STEP5_PREFILL_G2=1 ;;
                 asm_g1_1021)
                     [[ "${STEP5_PREFILL_REDUNDANT_EXPERTS:-0}" == 0 && -z "${STEP5_PREFILL_STATIC_MAP:-}" ]] || {
@@ -162,7 +162,7 @@ PY
         profiler_extra=(--profiler-config "$STEP5_PREFILL_PROFILER_CONFIG")
     fi
 else
-    export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0 HCU_DP_MOE_PIPE_UNIFORM=0
+    export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0 HCU_DP_MOE_PIPE_UNIFORM=0
     tokens=32768; max_len=1048576
     case "${STEP5_DECODE_PARALLEL:-dp4tp4}" in
         dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
@@ -256,7 +256,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'NCCL_MIN_NCHANNELS=%q NCCL_MAX_NCHANNELS=%q\n' "${NCCL_MIN_NCHANNELS:-auto}" "${NCCL_MAX_NCHANNELS:-auto}"
     printf 'HCU_DP_MOE_PIPE_MIN_TOKENS=%q\n' "$HCU_DP_MOE_PIPE_MIN_TOKENS"
     printf 'HCU_DBO_MIN_TOKENS=%q HCU_EP_DIRECT_SUM=%q HCU_DP_MOE_PIPE_UNIFORM=%q\n' "$HCU_DBO_MIN_TOKENS" "$HCU_EP_DIRECT_SUM" "${HCU_DP_MOE_PIPE_UNIFORM:-0}"
-    printf 'HCU_STEP5_DENSE_TUNING=%q HCU_STEP5_PREFILL_G1=%q HCU_STEP5_PREFILL_G2=%q\n' "${HCU_STEP5_DENSE_TUNING:-0}" "${HCU_STEP5_PREFILL_G1:-0}" "${HCU_STEP5_PREFILL_G2:-0}"
+    printf 'HCU_STEP5_DENSE_TUNING=%q HCU_STEP5_PREFILL_G2=%q\n' "${HCU_STEP5_DENSE_TUNING:-0}" "${HCU_STEP5_PREFILL_G2:-0}"
     printf 'HCU_STEP5_PREFILL_ASM_G1=%q GPU_MAX_HW_QUEUES=%q\n' "${HCU_STEP5_PREFILL_ASM_G1:-0}" "$GPU_MAX_HW_QUEUES"
     printf 'VLLM_HCU_DP_CUSTOM_AG=%q\n' "$VLLM_HCU_DP_CUSTOM_AG"
     printf 'HCU_STEP5_DP_FABRIC=%q HCU_STEP5_CONTEXT_GRAPH_REGIONS=%q\n' "${HCU_STEP5_DP_FABRIC:-0}" "${HCU_STEP5_CONTEXT_GRAPH_REGIONS:-0}"

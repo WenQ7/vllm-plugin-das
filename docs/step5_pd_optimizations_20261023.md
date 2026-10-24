@@ -1,5 +1,8 @@
 # Step5 P/D optimization snapshot — 2026-10-23
 
+Historical measurement record. Current cleanup removes the retired Triton G1
+experiment and keeps tuning data external; see [current source contract](step5_pd_verification_20261024.md#source-cleanup-after-the-recorded-measurements).
+
 This branch consolidates the tested Step5 source and reproduction records for
 vLLM 0.28.1 / DTK2610 / gfx938. It is not based on the fork's v0.25.1 default
 branch. Existing commit history is retained; the source snapshot is

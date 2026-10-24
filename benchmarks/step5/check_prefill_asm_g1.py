@@ -28,13 +28,18 @@ def main():
     parser.add_argument("--fixture-meta", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if not os.environ.get("HCU_STEP5_TUNING_CONFIG"):
+        parser.error("Set HCU_STEP5_TUNING_CONFIG to an external qualified tuning profile")
     assert args.run_gpu and not args.output.exists()
+    from vllm_hcu.ops.step5.tuning import asm_recipe
+
+    solution, persist = asm_recipe(22)
     previous_env = os.environ.get("HCU_STEP5_PREFILL_ASM_G1")
     os.environ["HCU_STEP5_PREFILL_ASM_G1"] = "1"
     report = dict(complete=False, scope="normal ASM G1 local complete-MoE proof; not distributed DBO/model TPS",
                   actual_normal_cache_API=True, complete_model_loader_exercised=False,
                   private_math_imported=False, weight_ring=8, local_sort_bm=256,
-                  solution=13001, persist=256, shuffle=1,
+                  solution=solution, persist=persist, shuffle=1,
                   amplitudes=[1.0, 0.25, 0.0, 4.0], relative_l2_limit=0.005,
                   exact_M_AQ_AS_storage_required=True, logical_storage_only_not_memory_sanitizer=True,
                   checks=[], graph_checks=[], cache_checks=[])
@@ -80,7 +85,7 @@ def main():
         sources["normal_postload_hook"] = dict(path=str(hook), sha256=hashlib.sha256(hook.read_bytes()).hexdigest())
         report["sources"] = sources
         originals = {name: getattr(ep, name) for name in (
-            "STEP5_PREFILL_ASM_G1", "STEP5_PREFILL_G1", "STEP5_PREFILL_G2", "CHUNK", "DIRECT_MIN",
+            "STEP5_PREFILL_ASM_G1", "STEP5_PREFILL_G2", "CHUNK", "DIRECT_MIN",
             "shared_add_provider", "direct_scratch", "ep_gather_sorted", "_gemm", "ep_swiglustep_quant")}
         originals["normal_try"] = asm_g1.try_step5_prefill_asm_g1
         originals["g2_try"] = g2.try_step5_prefill_g2
@@ -98,7 +103,6 @@ def main():
         torch.manual_seed(451523)
         ep.CHUNK = ep.DIRECT_MIN = m
         ep.shared_add_provider = None
-        ep.STEP5_PREFILL_G1 = False
         ep.STEP5_PREFILL_G2 = True
         ep.STEP5_PREFILL_ASM_G1 = False
         ids = torch.as_tensor(ids_cpu.astype(np.int32), device="cuda")
@@ -268,7 +272,7 @@ def main():
 
         def observe_asm(*positional, **keywords):
             assert candidate and not keywords and len(positional) == 17
-            assert positional[12:] == (4, 13001, 1, 256, 1)
+            assert positional[12:] == (4, solution, 1, persist, 1)
             layer, method, context, aq, asc, w2, s1, s2, weights = ring[current_index]
             assert packed_owner[positional[2].data_ptr()] == current_index
             assert positional[1].data_ptr() == aq.data_ptr() and positional[9].data_ptr() == asc.data_ptr()
@@ -312,7 +316,7 @@ def main():
             nonlocal candidate, current_index
             candidate, current_index = optimized, index
             ep.STEP5_PREFILL_ASM_G1 = optimized
-            assert ep.STEP5_PREFILL_G1 is False and ep.STEP5_PREFILL_G2 is True
+            assert ep.STEP5_PREFILL_G2 is True
             if poison:
                 full_back.fill_(float("nan"))
                 ws13_back.view(torch.bfloat16).fill_(float("nan"))
