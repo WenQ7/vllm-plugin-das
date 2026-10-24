@@ -180,7 +180,7 @@ class _EpFusedCombineState:
 
 
 _EP_COMBINE = _EpFusedCombineState()
-if _EP_FUSED_COMBINE:
+def _install_step5_combine_hooks():
     from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
         set_finalize_combine_hook,
     )
@@ -480,6 +480,8 @@ class MoERunner(MoERunnerInterface):
             and routed_input_transform is None
             and routed_output_transform is None
         )
+        if self._ep_fused_combine:
+            _install_step5_combine_hooks()
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name

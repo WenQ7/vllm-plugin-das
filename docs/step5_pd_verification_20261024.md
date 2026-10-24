@@ -35,7 +35,7 @@ remain. Test fixtures construct synthetic contract data instead of depending
 on machine tuning artifacts. Historical Git objects are retained; this cleanup
 does not rewrite existing commits.
 
-Cleanup validation: **583 CPU contract tests passed**, with four GPU graph
+Cleanup validation: **585 CPU contract tests passed**, with four GPU graph
 tests skipped. Both default and Step5-enabled native extensions built and
 imported successfully; ELF inspection confirmed that only the explicitly
 enabled build directly links hipBLASLt. No model service, new throughput run
