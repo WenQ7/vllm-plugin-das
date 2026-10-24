@@ -58,11 +58,11 @@ score establishes full-dataset equivalence. Dataset SHA256 is
 | Variant | DP/TP/EP | Prefill tokens/s | Separate standard-MTP quality |
 | --- | --- | ---: | --- |
 | E22 cached ASM G1 + fused G2 | 16/1/16 |42565.786| GSM8K100 96/100; long24K 15/16; long64K 16/16 |
-| Fixed E23 cached ASM G1 + fused G2 | 16/1/16 |42666.451| Complete-model quality not run |
+| Fixed E23 cached ASM G1 + fused G2 | 16/1/16 |42666.451| See full GSM8K follow-up |
 
 These Prefill results belong to their pinned measurement runtimes, rather than
-a new full-model Prefill run of this consolidated checkout. E23 stays an explicit
-performance-only candidate. Its fixed map uses the namespace after the legacy
+a new full-model Prefill throughput run of this consolidated checkout. E23 remains
+an explicit opt-in candidate. Its fixed map uses the namespace after the legacy
 Prefill placement; preserve the measured placement/map pair and do not apply
 the legacy placement twice. The recorded pair has placement SHA256
 `876ac0f5963c51d7e9e0a4629e589de70ef2d2e9ba86b9b20437d8d0beb1bb32`
@@ -104,3 +104,8 @@ the target build's observed baseline rather than a hard-coded preload list.
 Additional isolated checks passed: static maps 44, diagnostics 17 plus 12 subtests,
 static worker bridge 10, EP tables 16, offline EPLB 37, and EP contracts 93.
 Repaired complete suites: `tests/runtime_patch/test_platform_hcu_config.py` 149 passed, `tests/patch/test_worker_dispatcher.py` 21 passed.
+
+## Full accuracy follow-up
+
+Fresh 1319-example standard-MTP3 results for Decode, Prefill E22 and Prefill E23,
+plus separate 24K/64K samples, are recorded in the [full GSM8K comparison](step5_full_gsm8k_20261024.md).
