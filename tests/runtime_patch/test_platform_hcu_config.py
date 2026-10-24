@@ -76,7 +76,7 @@ def _run_fresh_target(code: str) -> subprocess.CompletedProcess[str]:
         env.pop(name, None)
     env["VLLM_PLUGINS"] = "__disabled__"
     env["VLLM_HCU_TARGET_ROOT"] = str(TARGET_VLLM_ROOT)
-    env["PYTHONPATH"] = os.pathsep.join((str(TARGET_VLLM_ROOT), str(REPO)))
+    env["PYTHONPATH"] = os.pathsep.join((str(REPO), str(TARGET_VLLM_ROOT)))
     return subprocess.run(
         [sys.executable, "-c", _TARGET_SOURCE_ASSERTION + code],
         check=False,
@@ -659,6 +659,9 @@ def test_real_v0251_engine_args_normalizes_legacy_deep_gemm_backend() -> None:
     result = _run_fresh_target(
         r'''
 import os
+import json
+import tempfile
+from pathlib import Path
 os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "0"
 from vllm.engine import arg_utils
 from vllm_hcu.patch.platform.core_fix import patch_engine_args
@@ -666,17 +669,25 @@ from vllm_hcu.patch.platform.core_fix import patch_engine_args
 patch_engine_args.apply_to_module(arg_utils)
 arg_utils.current_platform.device_type = "cpu"
 
-for kwargs in (
-    {"moe_backend": "dpsk_deep_gemm"},
-    {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
-):
-    args = arg_utils.EngineArgs(**kwargs)
-    assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
-    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
+with tempfile.TemporaryDirectory() as directory:
+    model = Path(directory)
+    (model / "config.json").write_text(json.dumps(dict(
+        model_type="qwen3", architectures=["Qwen3ForCausalLM"],
+        hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=4, vocab_size=64,
+        max_position_embeddings=2048, torch_dtype="bfloat16",
+    )))
+    for kwargs in (
+        {"moe_backend": "dpsk_deep_gemm"},
+        {"kernel_config": {"moe_backend": "dpsk_deep_gemm"}},
+    ):
+        args = arg_utils.EngineArgs(model=str(model), skip_tokenizer_init=True, **kwargs)
+        assert args.moe_backend == "deep_gemm" or args.kernel_config.moe_backend == "deep_gemm"
+        assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
-args = arg_utils.EngineArgs()
-args.moe_backend = "dpsk_deep_gemm"
-assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
+    args = arg_utils.EngineArgs(model=str(model), skip_tokenizer_init=True)
+    args.moe_backend = "dpsk_deep_gemm"
+    assert args.create_engine_config().kernel_config.moe_backend == "deep_gemm"
 
 print("legacy-backend-normalized")
 '''
@@ -1681,10 +1692,10 @@ def test_slimquant_marlin_inherits_v0251_compressed_tensors_constructor() -> Non
 
     # v0.25.1's FusedMoE public symbol is a factory and may be wrapped by HCU;
     # quantization dispatch must use the target-owned RoutedExperts type.
-    source = Path(
+    source = (REPO / Path(
         "vllm_hcu/model_executor/layers/quantization/compressed_tensors/"
         "compressed_tensors_marlin.py"
-    ).read_text(encoding="utf-8-sig")
+    )).read_text(encoding="utf-8-sig")
     assert "isinstance(layer, RoutedExperts)" in source
     assert "isinstance(layer, FusedMoE)" not in source
     assert config.get_quant_method(torch.nn.Embedding(4, 4), "embed") is None

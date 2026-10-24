@@ -12,6 +12,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe_support import (
     supports_channel_ep_fused,
@@ -83,6 +84,7 @@ def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
 
     ns = {
         "torch": torch, "_EP_FUSED_MOE": True,
+        "MoEActivation": MoEActivation, "_STEP5_BACKEND_AUDIT": False,
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "_HCU_HT_EP_TOKEN_ALIGNMENT": 256,
         "compute_aligned_M_and_alignment": native,
@@ -103,7 +105,7 @@ def test_block_fp8_uses_original_deepgemm_path_with_opt_in_enabled():
             torch.empty(4,4096,dtype=w1.dtype,device="meta"), w1,w2,
             torch.empty(4,2,device="meta"),
             torch.empty(4,2,dtype=torch.int32,device="meta"),
-            "swiglustep",4,metadata()["expert_map"],
+            MoEActivation.SWIGLUSTEP,4,metadata()["expert_map"],
             torch.empty(4,32,device="meta"),None,
             torch.empty(1,device="meta"),torch.empty(1,device="meta"),None,False,
         )
@@ -214,6 +216,7 @@ def test_gathered_route_reduction_does_not_alias_output(output_offset):
         "torch": torch,
         "tl": SimpleNamespace(bfloat16=None, float16=None, float32=None),
         "FP8": torch.float8_e4m3fn,
+        "STEP5_PREFILL_ASM_G1": False,
         "ep_sorting": lambda *a: (None, None, None, None, rows),
         "_gemm": gemm,
         "ep_swiglustep_quant": lambda *a, q: (q, None),
@@ -345,6 +348,7 @@ def test_later_chunk_gate_up_preserves_earlier_chunk_output(tokens, output_offse
         "torch": torch,
         "tl": SimpleNamespace(bfloat16=None, float16=None, float32=None),
         "FP8": torch.float8_e4m3fn, "CHUNK": 2, "_announced": True,
+        "STEP5_PREFILL_ASM_G1": False,
         "ep_sorting": lambda ids, *a: (None, None, None, None, ids.numel()),
         "_gemm": gemm,
         "ep_swiglustep_quant": lambda *a, q: (q, None),

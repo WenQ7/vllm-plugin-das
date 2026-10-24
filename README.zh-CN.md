@@ -225,4 +225,6 @@ python3 tools/run_patch_tests.py --suite contract --vllm-source /path/to/vllm-ro
 
 ## Step5 P/D 优化快照
 
+整理后的源码及最新 Decode 性能、精度复测见 [2026-10-24 验证记录](docs/step5_pd_verification_20261024.md)。
+
 2026-10-23 的 Step5 代码清单、实测成绩、显式复现配置及验证边界见 [Step5 P/D 优化说明](docs/step5_pd_optimizations_20261023.md)。
