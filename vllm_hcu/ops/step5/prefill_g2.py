@@ -126,7 +126,7 @@ def try_step5_prefill_g2(
     if (
         a.ndim != 2
         or a.shape[1] != 1536
-        or w.shape != (22, 4096, 1536)
+        or w.shape not in ((22, 4096, 1536), (23, 4096, 1536))
         or out.shape != (65536, 4096)
         or cache3.shape != (65536, 8, 4096)
         or a.dtype != torch.float8_e4m3fn
@@ -141,7 +141,7 @@ def try_step5_prefill_g2(
         rows % 256
         or a.shape[0] != rows
         or a_scale.numel() != rows
-        or w_scale.numel() != 22 * 4096
+        or w_scale.numel() != w.shape[0] * 4096
         or a_scale.dtype != torch.float32
         or w_scale.dtype != torch.float32
         or sorted_ids.ndim != 1
@@ -200,7 +200,7 @@ def try_step5_prefill_g2(
     if not _announced:
         _announced = True
         print(
-            "[step5_prefill_g2] active: E22 M65536 sort256 NK fused-direct-overflow",
+            f"[step5_prefill_g2] active: E{w.shape[0]} M65536 sort256 NK fused-direct-overflow",
             flush=True,
         )
     return True

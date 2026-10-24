@@ -519,19 +519,20 @@ def apply_to_module(module) -> bool:
                 "_vllm_hcu_eplb_static_dispatch_policy",
                 "nearest",
             )
-            order = {
-                "nearest": build_nearest_replica_order,
-                "locality_fair": build_locality_fair_replica_order,
-            }[policy]
             group = target.get_ep_group().device_group
-            ordered = order(
-                model_state.logical_to_physical_map,
-                ep_rank=group.rank(),
-                ep_size=group.size(),
-                num_nodes=target.get_node_count(),
-                num_physical_experts=plan.num_physical_experts,
-            )
-            model_state.logical_to_physical_map.copy_(ordered)
+            if policy != "token_hash":
+                order = {
+                    "nearest": build_nearest_replica_order,
+                    "locality_fair": build_locality_fair_replica_order,
+                }[policy]
+                ordered = order(
+                    model_state.logical_to_physical_map,
+                    ep_rank=group.rank(),
+                    ep_size=group.size(),
+                    num_nodes=target.get_node_count(),
+                    num_physical_experts=plan.num_physical_experts,
+                )
+                model_state.logical_to_physical_map.copy_(ordered)
             for layer in model.moe_layers:
                 layer_state = layer.eplb_state
                 replica_count = layer_state.logical_replica_count
@@ -539,11 +540,18 @@ def apply_to_module(module) -> bool:
                     raise ValueError(
                         "Static EPLB layer has no logical replica counts"
                     )
-                setattr(
-                    layer_state,
-                    STATIC_PRIMARY_REPLICA_COUNT,
-                    torch.ones_like(replica_count),
-                )
+                if policy == "token_hash":
+                    # Preserve the native single-replica token hash and the
+                    # complete candidate map/count. Placement is still fixed;
+                    # no recording, transfer, or rearrangement is enabled.
+                    if hasattr(layer_state, STATIC_PRIMARY_REPLICA_COUNT):
+                        delattr(layer_state, STATIC_PRIMARY_REPLICA_COUNT)
+                else:
+                    setattr(
+                        layer_state,
+                        STATIC_PRIMARY_REPLICA_COUNT,
+                        torch.ones_like(replica_count),
+                    )
             self._vllm_hcu_static_source_sha256 = plan.source_sha256
             logger.info(
                 "Committed static EPLB runtime map: model=%s "
@@ -578,6 +586,12 @@ def apply_to_module(module) -> bool:
     def step(self, is_dummy=False, is_profile=False, log_stats=False):
         load_path, record_path = _paths(self.parallel_config)
         if load_path:
+            if os.environ.get("HCU_STATIC_EPLB_LOAD_DIAGNOSTICS", "0") == "1":
+                from vllm_hcu.distributed.static_eplb_diagnostics import (
+                    on_static_step,
+                )
+
+                on_static_step(self, is_dummy=is_dummy, is_profile=is_profile)
             return None
         if not record_path:
             return original_step(

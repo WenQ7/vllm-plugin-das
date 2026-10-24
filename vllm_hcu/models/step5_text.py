@@ -1127,6 +1127,16 @@ class FusedMoEBlock(nn.Module):
             custom_routing_function=custom_routing_function,
         )
 
+    @property
+    def routed_experts(self):
+        """Expose the normal RoutedExperts owner to static EPLB loading."""
+        return self.experts.routed_experts
+
+    @property
+    def eplb_state(self):
+        """Use the same layer state as the normal MoERunner router."""
+        return self.experts.eplb_state
+
     def forward(
         self,
         hidden_states: torch.Tensor,

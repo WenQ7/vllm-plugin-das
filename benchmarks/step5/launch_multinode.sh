@@ -69,6 +69,10 @@ export EP_FUSED_MOE_CHUNK=32768
 export VLLM_STEP4_DSA_GRAPH_REGIONS=8704
 scheduler_extra=()
 moe_backend_extra=()
+eplb_extra=()
+profiler_extra=()
+table_extra=()
+physical_experts=352
 
 if [[ "$phase" == prefill ]]; then
     unset HCU_STEP5_DP_FABRIC HCU_STEP5_CONTEXT_GRAPH_REGIONS
@@ -84,6 +88,11 @@ if [[ "$phase" == prefill ]]; then
     export EP_FUSED_MOE_CHUNK="${STEP5_PREFILL_MOE_CHUNK:-32768}"
     case "$EP_FUSED_MOE_CHUNK" in 16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill MoE chunk size\n' >&2; exit 2 ;; esac
     export HCU_DP_MOE_PIPE_MIN_TOKENS="${STEP5_PREFILL_PIPE_MIN_TOKENS:-0}"
+    export HCU_DBO_MIN_TOKENS="${STEP5_PREFILL_DBO_MIN_TOKENS:-$HCU_DBO_MIN_TOKENS}"
+    export HCU_EP_DIRECT_SUM="${STEP5_PREFILL_DIRECT_SUM_MIN_TOKENS:-$HCU_EP_DIRECT_SUM}"
+    for threshold in "$HCU_DBO_MIN_TOKENS" "$HCU_EP_DIRECT_SUM"; do
+        [[ "$threshold" =~ ^[0-9]+$ ]] || { printf 'Invalid Prefill overlap threshold\n' >&2; exit 2; }
+    done
     case "$HCU_DP_MOE_PIPE_MIN_TOKENS" in 0|16384|32768|65536|131072|262144) ;; *) printf 'Unsupported Prefill pipeline threshold\n' >&2; exit 2 ;; esac
     export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS="${STEP5_PREFILL_SHARED_STREAM_MIN_TOKENS:-4096}"
     case "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS" in 0|4096|8192|16384) ;; *) printf 'Unsupported Prefill shared-expert stream threshold\n' >&2; exit 2 ;; esac
@@ -95,7 +104,7 @@ if [[ "$phase" == prefill ]]; then
     # Explicit reproduction profiles; historical defaults remain unchanged.
     case "${STEP5_PREFILL_PROFILE:-baseline}" in
         baseline) ;;
-        dense_1021|g1_1021|g2_1021)
+        dense_1021|g1_1021|g2_1021|asm_g1_1021|e23_asm_1021)
             [[ "$dp" == 16 && "$tp" == 1 && "$tokens" == 8192 && "$max_len" == 70000 && "$gpu_util" == 0.875 ]] || {
                 printf '1021 Prefill profiles require DP16/TP1, tokens8192, length70000 and memory0.875\n' >&2; exit 2;
             }
@@ -106,10 +115,22 @@ if [[ "$phase" == prefill ]]; then
             export HCU_DP_MOE_PIPE_MIN_TOKENS=65536 HCU_DBO_MIN_TOKENS=4096 HCU_EP_DIRECT_SUM=65536
             export EP_FUSED_MOE_CHUNK=65536 HCU_STEP5_BOUNDED_EP_WORKSPACE=1
             export HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=4096 HCU_DP_MOE_PIPE_UNIFORM=1
-            export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0
+            export HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0
             case "$STEP5_PREFILL_PROFILE" in
                 g1_1021) export HCU_STEP5_PREFILL_G1=1 ;;
                 g2_1021) export HCU_STEP5_PREFILL_G2=1 ;;
+                asm_g1_1021)
+                    [[ "${STEP5_PREFILL_REDUNDANT_EXPERTS:-0}" == 0 && -z "${STEP5_PREFILL_STATIC_MAP:-}" ]] || {
+                        printf 'E22 ASM profile does not use redundant experts\n' >&2; exit 2;
+                    }
+                    export HCU_STEP5_PREFILL_ASM_G1=1 HCU_STEP5_PREFILL_G2=1
+                    ;;
+                e23_asm_1021)
+                    [[ "${STEP5_PREFILL_REDUNDANT_EXPERTS:-0}" == 16 && -r "${STEP5_PREFILL_STATIC_MAP:-}" ]] || {
+                        printf 'E23 ASM requires 16 fixed replicas and a readable static map\n' >&2; exit 2;
+                    }
+                    export HCU_STEP5_PREFILL_ASM_G1=1 HCU_STEP5_PREFILL_G2=1 GPU_MAX_HW_QUEUES=8
+                    ;;
             esac
             scheduler_extra=(--long-prefill-token-threshold 0)
             ;;
@@ -119,8 +140,29 @@ if [[ "$phase" == prefill ]]; then
     if [[ -n "${STEP5_PREFILL_PLACEMENT:-}" ]]; then
         export VLLM_STEP5_EXPERT_PLACEMENT="$STEP5_PREFILL_PLACEMENT"
     fi
+    redundant="${STEP5_PREFILL_REDUNDANT_EXPERTS:-0}"
+    static_map="${STEP5_PREFILL_STATIC_MAP:-}"
+    case "$redundant" in
+        0) [[ -z "$static_map" ]] || { printf 'Static Prefill map requires 16 redundant experts\n' >&2; exit 2; } ;;
+        16)
+            [[ "$dp" == 16 && -r "$static_map" ]] || { printf 'E23 requires DP16 and a readable static map\n' >&2; exit 2; }
+            eplb_json="$(python3 - "$static_map" <<'PY'
+import json,sys
+print(json.dumps(dict(num_redundant_experts=16,use_async=False,disable_rearrange=True,
+                     expert_map_path=sys.argv[1],static_dispatch_policy='token_hash')))
+PY
+)"
+            eplb_extra=(--enable-eplb --eplb-config "$eplb_json")
+            physical_experts=368
+            table_extra=(--require-m 65536)
+            ;;
+        *) printf 'Unsupported static Prefill redundant-expert count\n' >&2; exit 2 ;;
+    esac
+    if [[ -n "${STEP5_PREFILL_PROFILER_CONFIG:-}" ]]; then
+        profiler_extra=(--profiler-config "$STEP5_PREFILL_PROFILER_CONFIG")
+    fi
 else
-    export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_DP_MOE_PIPE_UNIFORM=0
+    export HCU_STEP5_DENSE_TUNING=0 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=0 HCU_STEP5_PREFILL_ASM_G1=0 HCU_DP_MOE_PIPE_UNIFORM=0
     tokens=32768; max_len=1048576
     case "${STEP5_DECODE_PARALLEL:-dp4tp4}" in
         dp4tp4) tp=4; dp=4; local_dp=1; gpu_util=0.85 ;;
@@ -206,7 +248,7 @@ command=(python3 -u -m vllm.entrypoints.cli.main serve "$model_dir"
     --no-enable-prefix-caching --max-cudagraph-capture-size 64
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["+swiglustep_and_mul"],"compile_sizes":[16,64]}'
     --speculative-config '{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.838992,0.598322,0.362686],"use_local_argmax_reduction":true}'
-    --limit-mm-per-prompt '{"image":0}' "${moe_backend_extra[@]}" "${scheduler_extra[@]}" "${extra[@]}")
+    --limit-mm-per-prompt '{"image":0}' "${moe_backend_extra[@]}" "${scheduler_extra[@]}" "${eplb_extra[@]}" "${profiler_extra[@]}" "${extra[@]}")
 if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'EP_FUSED_MOE_TABLE=%q\n' "$EP_FUSED_MOE_TABLE"
     printf 'VLLM_HCU_DP_PACKED_AG=%q HCU_STEP5_ROUTER_SHARED_MAX_M=%q HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS=%q\n' "${VLLM_HCU_DP_PACKED_AG:-0}" "${HCU_STEP5_ROUTER_SHARED_MAX_M:-64}" "$HCU_SHARED_EXPERTS_STREAM_MIN_TOKENS"
@@ -215,6 +257,7 @@ if [[ "${STEP5_DRY_RUN:-0}" == 1 ]]; then
     printf 'HCU_DP_MOE_PIPE_MIN_TOKENS=%q\n' "$HCU_DP_MOE_PIPE_MIN_TOKENS"
     printf 'HCU_DBO_MIN_TOKENS=%q HCU_EP_DIRECT_SUM=%q HCU_DP_MOE_PIPE_UNIFORM=%q\n' "$HCU_DBO_MIN_TOKENS" "$HCU_EP_DIRECT_SUM" "${HCU_DP_MOE_PIPE_UNIFORM:-0}"
     printf 'HCU_STEP5_DENSE_TUNING=%q HCU_STEP5_PREFILL_G1=%q HCU_STEP5_PREFILL_G2=%q\n' "${HCU_STEP5_DENSE_TUNING:-0}" "${HCU_STEP5_PREFILL_G1:-0}" "${HCU_STEP5_PREFILL_G2:-0}"
+    printf 'HCU_STEP5_PREFILL_ASM_G1=%q GPU_MAX_HW_QUEUES=%q\n' "${HCU_STEP5_PREFILL_ASM_G1:-0}" "$GPU_MAX_HW_QUEUES"
     printf 'VLLM_HCU_DP_CUSTOM_AG=%q\n' "$VLLM_HCU_DP_CUSTOM_AG"
     printf 'HCU_STEP5_DP_FABRIC=%q HCU_STEP5_CONTEXT_GRAPH_REGIONS=%q\n' "${HCU_STEP5_DP_FABRIC:-0}" "${HCU_STEP5_CONTEXT_GRAPH_REGIONS:-0}"
     printf 'HCU_STEP5_EXPERT_GRID=%q\n' "$HCU_STEP5_EXPERT_GRID"
@@ -233,7 +276,7 @@ fi
 if [[ "$phase" == prefill && -n "${VLLM_STEP5_EXPERT_PLACEMENT:-}" ]]; then
     [[ -f "$VLLM_STEP5_EXPERT_PLACEMENT" ]] || { printf 'Missing Prefill placement: %s\n' "$VLLM_STEP5_EXPERT_PLACEMENT" >&2; exit 2; }
 fi
-python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE" --ep-size "$((tp * dp))"
+python3 "$repo_root/benchmarks/step5/check_ep_table.py" "$EP_FUSED_MOE_TABLE" --ep-size "$((tp * dp))" --physical-experts "$physical_experts" "${table_extra[@]}"
 mkdir -p "$TMPDIR" "$HOME" "$XDG_CACHE_HOME" "$VLLM_CACHE_ROOT" \
     "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$MIOPEN_USER_DB_PATH"
 exec "${command[@]}"

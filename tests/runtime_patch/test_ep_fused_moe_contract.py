@@ -285,7 +285,7 @@ def test_modular_chunk_scratch_has_independent_full_output(chunk, full):
     "block", "not_per_token", "not_per_channel", "other_experts", "other_global",
     "other_topk", "silu", "no_map", "router_on_input", "lora", "bad_scale",
 ])
-@pytest.mark.parametrize("local_experts", [22, 44])
+@pytest.mark.parametrize("local_experts", [22, 23, 44])
 def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatch, case, local_experts):
     w1 = torch.empty(local_experts*2 if case=="other_experts" else local_experts,3072,4096,
                      device="meta",dtype=torch.float8_e4m3fn)
@@ -310,9 +310,10 @@ def test_bounded_step5_scratch_requires_the_actual_channel_ep_backend(monkeypatc
             "henvs":SimpleNamespace(optional_custom_op_enabled=lambda enabled:enabled and case!="master_disabled"),
         },
     )
+    global_experts = 368 if local_experts == 23 else 352
     result=fn(expert,w1,w2,"silu" if case=="silu" else "swiglustep",
-        704 if case=="other_global" else 352,
-        None if case=="no_map" else torch.empty(352,dtype=torch.int32,device="meta"),
+        704 if case=="other_global" else global_experts,
+        None if case=="no_map" else torch.empty(global_experts,dtype=torch.int32,device="meta"),
         4 if case=="other_topk" else 8,case=="router_on_input")
     assert result==(32768 if case=="enabled" else None)
 

@@ -353,7 +353,8 @@ def test_engine_args_rejects_conflicting_gdn_prefill_backend() -> None:
         )
 
 
-def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
+@pytest.mark.parametrize("policy", ["locality_fair", "token_hash"])
+def test_engine_args_extracts_nested_offline_eplb_fields(policy) -> None:
     module = _make_arg_utils_module()
     patch_engine_args.apply_to_module(module)
     eplb_config = {
@@ -361,7 +362,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
         "step_interval": 100,
         "expert_map_path": "/maps/hy4.json",
         "disable_rearrange": True,
-        "static_dispatch_policy": "locality_fair",
+        "static_dispatch_policy": policy,
     }
 
     args = module.EngineArgs(eplb_config=eplb_config)
@@ -371,7 +372,7 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert get_hcu_config(args) == HcuFeatureConfig(
         expert_map_path="/maps/hy4.json",
         eplb_disable_rearrange=True,
-        eplb_static_dispatch_policy="locality_fair",
+        eplb_static_dispatch_policy=policy,
     )
 
     config = args.create_engine_config()
@@ -381,8 +382,14 @@ def test_engine_args_extracts_nested_offline_eplb_fields() -> None:
     assert config.parallel_config._vllm_hcu_eplb_disable_rearrange is True
     assert (
         config.parallel_config._vllm_hcu_eplb_static_dispatch_policy
-        == "locality_fair"
+        == policy
     )
+
+
+@pytest.mark.parametrize("policy", ["hash", "tokenhash", "round_robin", ""])
+def test_unknown_static_eplb_dispatch_policy_is_rejected(policy) -> None:
+    with pytest.raises(ValueError, match="eplb_static_dispatch_policy"):
+        HcuFeatureConfig(eplb_static_dispatch_policy=policy)
 
 
 def test_engine_args_extracts_nested_offline_eplb_record_path() -> None:

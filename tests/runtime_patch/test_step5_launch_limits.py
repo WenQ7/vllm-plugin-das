@@ -112,6 +112,42 @@ def test_invalid_prefill_moe_backend_fails(launcher):
     assert launcher("prefill", STEP5_PREFILL_MOE_BACKEND="deep_gemm").returncode != 0
 
 
+def test_e22_cached_asm_profile_keeps_measured_limits(launcher):
+    result = launcher("prefill", STEP5_PREFILL_PROFILE="asm_g1_1021",
+                      STEP5_PREFILL_PLACEMENT="/external/prefill.pt")
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    assert "HCU_STEP5_PREFILL_ASM_G1=1 GPU_MAX_HW_QUEUES=4" in result.stdout
+    assert "HCU_STEP5_DENSE_TUNING=1 HCU_STEP5_PREFILL_G1=0 HCU_STEP5_PREFILL_G2=1" in result.stdout
+    assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
+    assert command[command.index("--max-model-len") + 1] == "70000"
+    assert "--enable-eplb" not in command
+
+
+def test_e23_cached_asm_requires_an_explicit_fixed_map(launcher, tmp_path):
+    settings = dict(STEP5_PREFILL_PROFILE="e23_asm_1021",
+                    STEP5_PREFILL_PLACEMENT="/external/prefill.pt")
+    assert launcher("prefill", **settings).returncode != 0
+    # Dry-run checks the CLI contract only; the normal static loader validates
+    # map shape, namespace and assignments before loading any model weights.
+    plan = tmp_path / "static.json"
+    plan.write_text("{}")
+    result = launcher("prefill", **settings, STEP5_PREFILL_REDUNDANT_EXPERTS="16",
+                      STEP5_PREFILL_STATIC_MAP=str(plan))
+    assert result.returncode == 0, result.stderr
+    command = shlex.split(result.stdout.splitlines()[-1])
+    assert "--enable-eplb" in command
+    assert "HCU_STEP5_PREFILL_ASM_G1=1 GPU_MAX_HW_QUEUES=8" in result.stdout
+    assert command[command.index("--max-num-batched-tokens") + 1] == "8192"
+    assert command[command.index("--max-model-len") + 1] == "70000"
+
+
+def test_decode_clears_prefill_cached_asm_switch(launcher):
+    result = launcher("decode", HCU_STEP5_PREFILL_ASM_G1="1")
+    assert result.returncode == 0, result.stderr
+    assert "HCU_STEP5_PREFILL_ASM_G1=0 GPU_MAX_HW_QUEUES=4" in result.stdout
+
+
 @pytest.mark.parametrize("settings", [
     {"STEP5_DECODE_PARALLEL": "dp8tp2"},
     {"STEP5_DECODE_PARALLEL": "dp16tp1", "STEP5_DECODE_PROFILE": "itl6479", "STEP5_DECODE_PLACEMENT": "/external/placement.pt"},

@@ -134,10 +134,6 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.op_opt.quantization.lightop_autoawq"
     ] == "always"
     framework_order = (
-        "worker.framework_opt.model_loader.static_eplb_preload",
-        "worker.framework_opt.model_loader.static_expert_mapping",
-        "worker.framework_opt.eplb.offline_expert_map",
-        "worker.framework_opt.eplb.gloo_profile_reservation",
         "worker.framework_opt.dp.deepep_low_latency",
         "worker.framework_opt.forward_context.hcu_runtime_fields",
         "worker.framework_opt.communicator.base_custom_sp",
@@ -148,6 +144,14 @@ def test_worker_inventory_is_complete_explicit_and_dependency_ordered():
         "worker.framework_opt.dbo.deep_gemm_sms_capability",
         "worker.framework_opt.dbo.ubatch_metadata",
         "worker.framework_opt.communicator.deep_ep_runtime",
+        "worker.framework_opt.step5_eplb_communicator",
+        "worker.framework_opt.step5_eplb_transfer",
+        "worker.framework_opt.step5_eplb_async_worker",
+        "worker.framework_opt.step5_eplb_state",
+        "worker.framework_opt.model_loader.static_eplb_preload",
+        "worker.framework_opt.model_loader.static_expert_mapping",
+        "worker.framework_opt.eplb.offline_expert_map",
+        "worker.framework_opt.eplb.gloo_profile_reservation",
     )
     assert tuple(positions[name] for name in framework_order) == tuple(
         sorted(positions[name] for name in framework_order)

@@ -50,3 +50,39 @@ def test_invalid_config_pairs_fail_before_model_start(tmp_path, pair, ep_size):
     path.write_text(json.dumps({key: {"256": pair}}))
     with pytest.raises(ValueError):
         CHECK.check_ep_table(path, ep_size)
+
+
+def test_e23_requires_its_own_table_and_explicit_hot_row(tmp_path):
+    data = json.loads(TABLE.read_text())
+    data.pop("E=23,N=3072,K=4096,topk=8", None)
+    path = tmp_path / "e23.json"
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="E=23"):
+        CHECK.check_ep_table(path, 16, 368, 65536)
+    data["E=23,N=3072,K=4096,topk=8"] = data[CHECK.KEY].copy()
+    path.write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="explicit tuned row at M=65536"):
+        CHECK.check_ep_table(path, 16, 368, 65536)
+    data["E=23,N=3072,K=4096,topk=8"]["65536"] = data[CHECK.KEY]["32768"]
+    path.write_text(json.dumps(data))
+    result = CHECK.check_ep_table(path, 16, 368, 65536)
+    assert result["physical_experts"] == 368 and result["local_experts"] == 23
+    assert result["selected"]["65536"]["table_m"] == 65536
+    assert CHECK.check_ep_table(path)["key"] == CHECK.KEY
+
+
+def test_e23_ships_the_measured_hot_row_and_preserves_small_shape_seeds():
+    data = json.loads(TABLE.read_text())
+    e22, e23 = data[CHECK.KEY], data["E=23,N=3072,K=4096,topk=8"]
+    assert {m: pair for m, pair in e23.items() if m != "65536"} == e22
+    assert e23["65536"][0]["GROUP_SIZE_M"] == 1
+    assert e23["65536"][1] == e22["32768"][1]
+    result = CHECK.check_ep_table(TABLE, 16, 368, 65536)
+    assert result["selected"]["256"]["table_m"] == 256
+    assert result["selected"]["65536"]["table_m"] == 65536
+
+
+@pytest.mark.parametrize("physical_experts,require_m", [(True, None), (353, None), (368, 0), (368, True)])
+def test_invalid_physical_count_or_hot_row_is_rejected(physical_experts, require_m):
+    with pytest.raises(ValueError):
+        CHECK.check_ep_table(TABLE, 16, physical_experts, require_m)

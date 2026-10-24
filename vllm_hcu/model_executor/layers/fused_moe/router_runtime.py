@@ -11,6 +11,7 @@ from .lightop_routing import (
 
 
 STATIC_PRIMARY_REPLICA_COUNT = "_vllm_hcu_static_primary_replica_count"
+_STATIC_LOAD_DIAGNOSTICS_ACTIVE = False
 
 
 def eplb_map_to_physical_and_record(
@@ -25,6 +26,12 @@ def eplb_map_to_physical_and_record(
 ):
     from vllm_hcu.platforms import envs as henvs
 
+    if _STATIC_LOAD_DIAGNOSTICS_ACTIVE:
+        from vllm_hcu.distributed.static_eplb_diagnostics import observe_router_path
+
+        observe_router_path(
+            expert_load_view, topk_ids, num_unpadded_tokens, record_enabled,
+        )
     if not henvs.VLLM_HCU_USE_TORCH_EPLB_MAP_RECORD:
         return original(
             topk_ids,

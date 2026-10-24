@@ -37,6 +37,7 @@ STEP5_EXPERT_GRID = os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 _step5_grid_announced = False
 STEP5_PREFILL_G1 = os.environ.get("HCU_STEP5_PREFILL_G1", "0") == "1"
 STEP5_PREFILL_G2 = os.environ.get("HCU_STEP5_PREFILL_G2", "0") == "1"
+STEP5_PREFILL_ASM_G1 = os.environ.get("HCU_STEP5_PREFILL_ASM_G1", "0") == "1"
 
 
 @triton.jit
@@ -617,7 +618,19 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
     # Modular workspaces may share the output's storage, including at an offset.
     cache1 = _carve(workspace13, (rows, N), out_dtype, dev,
                     avoid=preserve_chunk_output)
-    if presort and a_s.numel() == M:
+    asm_activation = None
+    if (STEP5_PREFILL_ASM_G1 and presort and a_s.numel() == M
+            and M == 65536 and topk == 8 and bm == 256):
+        from vllm_hcu.ops.step5.prefill_asm_g1 import try_step5_prefill_asm_g1
+
+        asm_activation = try_step5_prefill_asm_g1(
+            a_q, w1, w2, cache1, a_s, w1_scale, sorted_ids, sorted_w,
+            expert_ids, nvalid, num_tokens=M, top_k=topk, sort_block_m=bm,
+            limit=7.0 if gemm1_limit is None else gemm1_limit, workspace2=workspace2,
+        )
+    if asm_activation is not None:
+        act_q, act_s = asm_activation
+    elif presort and a_s.numel() == M:
         # A gathered into sorted order first (lives in workspace2, dead before act_q).
         a_g, s_g = ep_gather_sorted(a_q, a_s, sorted_ids, nvalid, rows, workspace2)
         specialized = False
@@ -636,9 +649,10 @@ def _ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map,
         _gemm(a_q, w1, cache1, a_s, w1_scale, topk_weights, topk_ids, sorted_ids, sorted_w,
               expert_ids, nvalid, topk, compute_type, cfg1, c_sorted=True, ck_sorting=True,
               ck_topk=topk, expert_layout=expert_layout)
-    act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
-                                       7.0 if gemm1_limit is None else gemm1_limit,
-                                       q=_carve(workspace2, (rows, N // 2), FP8, dev))
+    if asm_activation is None:
+        act_q, act_s = ep_swiglustep_quant(cache1, sorted_w, nvalid, rows,
+                                           7.0 if gemm1_limit is None else gemm1_limit,
+                                           q=_carve(workspace2, (rows, N // 2), FP8, dev))
     del cache1
     if out is None:
         out = torch.empty((M, K), dtype=out_dtype, device=dev)
