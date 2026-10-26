@@ -15,7 +15,7 @@ def _load_dispatch():
     path = (Path(__file__).parents[2]
             / "vllm_hcu/model_executor/layers/fused_moe/deepep_runtime.py")
     tree = ast.parse(path.read_text(encoding="utf-8"))
-    names = {"_uses_post_dispatch_channel_fp8_quant", "ht_do_dispatch"}
+    names = {"_apply_step5_ht_runtime_config", "_uses_post_dispatch_channel_fp8_quant", "ht_do_dispatch"}
     functions = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
     assert len(functions) == len(names)

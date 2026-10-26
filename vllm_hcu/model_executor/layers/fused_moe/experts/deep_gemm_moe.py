@@ -164,6 +164,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
     def __init__(self, moe_config: FusedMoEConfig, quant_config: FusedMoEQuantConfig):
         super().__init__(moe_config=moe_config, quant_config=quant_config)
         self._hcu_step5_owner = is_step5_owner(moe_config)
+        self._hcu_step5_compact_ht = (
+            self._hcu_step5_owner
+            and os.environ.get("HCU_STEP5_DEEPEP_COMPACT_ROWS", "0") == "1"
+        )
         # MXFP8: FP8 e4m3 values + UE8M0 1x32 block scales (Blackwell). Reuses
         # the same grouped GEMM (aliased to fp8_fp4) with recipe (1, 32).
         self.mxfp8 = quant_config.block_shape == [1, 32]
@@ -561,6 +565,13 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             )
             return
 
+        if (
+            step5_channel_fp8
+            and self._hcu_step5_compact_ht
+            and getattr(expert_tokens_meta, "_hcu_deepep_ht_local_counts", False)
+        ):
+            expert_tokens_meta._hcu_step5_compact_rows = True
+
         if current_platform.is_rocm():
             N = self._hcu_logical_n
             K = self._hcu_logical_k
@@ -585,19 +596,29 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             if self.quant_config.use_int8_w8a8
             else torch.float8_e4m3fn
         )
-        a1q_perm = _resize_cache(workspace13.view(dtype=permuted_dtype), (M_sum, K))
-        a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
-            aq=a1q,
-            aq_scale=a1q_scale,
-            topk_ids=topk_ids,
-            local_num_experts=local_num_experts,
-            expert_map=expert_map,
-            expert_tokens_meta=expert_tokens_meta,
-            aq_out=a1q_perm,
-            # MXFP8 uses a 32-element activation-scale group (block_shape[1]);
-            # FP8-block keeps the default (128) alignment.
-            block_size=self.block_shape[1] if self.mxfp8 else None,
-        )
+        fused_scatter = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter", None)
+        if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+            if not step5_channel_fp8 or fused_scatter is None or local_num_experts not in (22, 23):
+                raise ValueError("Step5 DeepGEMM requires matching fused-scatter metadata")
+            if topk_ids.size(0) == 0:
+                output.zero_()
+                return
+            a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
+            align_used = _HCU_HT_EP_TOKEN_ALIGNMENT
+            assert inv_perm.shape == topk_ids.shape and a1q.shape == (M_sum, K)
+            assert expert_ids.shape == (M_sum,) and a1q_scale.shape == (M_sum, 1)
+        else:
+            a1q_perm = _resize_cache(workspace13.view(dtype=permuted_dtype), (M_sum, K))
+            a1q, a1q_scale, expert_ids, inv_perm, align_used = deepgemm_moe_permute(
+                aq=a1q,
+                aq_scale=a1q_scale,
+                topk_ids=topk_ids,
+                local_num_experts=local_num_experts,
+                expert_map=expert_map,
+                expert_tokens_meta=expert_tokens_meta,
+                aq_out=a1q_perm,
+                block_size=self.block_shape[1] if self.mxfp8 else None,
+            )
         assert a1q.size(0) == M_sum
 
         # MXFP8 (1x32) drives the fp8_fp4-aliased grouped GEMM with recipe
@@ -720,6 +741,13 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
             expert_map=expert_map,
             output=output,
         )
+        if fused_scatter is not None and getattr(self, "_hcu_step5_fused_scatter_enabled", False):
+            stream = torch.cuda.current_stream()
+            for tensor in fused_scatter:
+                tensor.record_stream(stream)
+            event = torch.cuda.Event()
+            event.record(stream)
+            expert_tokens_meta._hcu_step5_fused_scatter_guard["last_use"] = event
 
 
 class DeepGemmFP4Experts(mk.FusedMoEExpertsModular):

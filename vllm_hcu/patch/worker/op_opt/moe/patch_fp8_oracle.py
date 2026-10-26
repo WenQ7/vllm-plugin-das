@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 
 from vllm_hcu.deepseek_v4_runtime import model_architectures
@@ -381,13 +382,20 @@ def apply_to_module(module: ModuleType) -> bool:
                 moe_config=moe_config,
                 routing_tables=routing_tables,
             )
-        return make_kernel(
+        kernel = make_kernel(
             moe_quant_config,
             moe_config,
             experts_cls,
             fp8_backend,
             routing_tables,
         )
+        if os.environ.get("HCU_STEP5_DEEPEP_PROFILE_DBO_OUTPUT", "0") == "1":
+            from vllm_hcu.model_executor.layers.fused_moe.deepep_runtime import (
+                configure_step5_ht_kernel,
+            )
+
+            configure_step5_ht_kernel(kernel, moe_quant_config, moe_config)
+        return kernel
 
     target._vllm_hcu_original_backend_to_kernel_cls = backend_to_cls
     target.backend_to_kernel_cls = hcu_backend_to_kernel_cls

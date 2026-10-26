@@ -4819,6 +4819,16 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
         def _sync_dbo_comm_if_needed(self):
             pass
 
+        def _get_dispatch_config(self):
+            return "config"
+
+        def _get_combine_config(self):
+            return "combine-config"
+
+        def _finalize(self, output, fused_expert_output, topk_weights, topk_ids,
+                      apply_router_weight_on_input, weight_and_reduce_impl, do_async):
+            return "legacy-finalizer"
+
         def _do_dispatch(
             self,
             tokens,
@@ -4873,7 +4883,8 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     class ExpertTokensMetadata:
         @staticmethod
         def make_from_list(values, device=None):
-            return values, device
+            return SimpleNamespace(expert_num_tokens_cpu=torch.tensor(values),
+                                   expert_num_tokens=torch.tensor(values))
 
     dispatched = {}
 
@@ -4981,7 +4992,7 @@ def test_deepep_ht_preserves_channel_quant_dispatch_contract(use_fp8: bool):
     else:
         assert expert_x is captured["tokens"]
         assert expert_scale is captured["token_scales"]
-    assert metadata[0] == [1]
+    assert metadata.expert_num_tokens_cpu.tolist() == [1]
 
 
 def test_router_factory_feature_gated_hcu_subclass_contract(
@@ -5798,6 +5809,10 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
 
         coordinator = ExactImportCoordinator(registry=PatchRegistry())
         coordinator.install()
+        # The runner imports join_dp_moe_pipe from the HCU modular kernel.
+        # Arm the same prerequisite as the production platform registration.
+        from vllm_hcu.patch.module_exchange import register_modular_kernel_exchange
+        register_modular_kernel_exchange(coordinator)
         coordinator.register_replacement(
             patch_shared_experts.PATCH_ID,
             patch_shared_experts.TARGET_MODULE,
