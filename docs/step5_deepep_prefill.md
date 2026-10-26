@@ -67,5 +67,16 @@ inactive return-fusion code, moves construction policy into one helper and adds
 an explicit EP16/MNVL gate; GEMM math and the enabled execution path are unchanged.
 CPU compatibility coverage includes151 tests and8 subtests. The cleaned version
 passed a real16-rank GPU smoke with208 checks, including DBO output canaries,
-empty-rank routing and conservative startup planning. Post-cleanup repeated
-performance and profiling are recorded separately as they complete.
+empty-rank routing and conservative startup planning. Post-cleanup formal repeats were45,578.4 /45,598.6 /45,549.0tps
+(mean45,575.4), all64 complete and zero preemption. A calibrated16-rank
+trace captured6 steps each and aligned5 common global steps.
+
+E23 removed the persistent rank0 tail: rank0 was latest in58/880 observed G2
+waves; ranks2,4,3 were most often late. This ordered-wave comparison includes
+upstream attention delay and is not an isolated GEMM latency attribution.
+Heavy ranks spent roughly730-760ms in G1/G2 and14-48ms in exposed communication.
+
+SM12 did not improve throughput. SM18 dispatch8/combine8 produced one47,967.0tps
+round but two repeats were45,796.6 /45,795.2tps;47,967 is not a sustained score.
+The48,000tps follow-up target has not yet been achieved. Complete trial data
+are retained in the accompanying aggregate result JSON.
