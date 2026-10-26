@@ -40,20 +40,20 @@ def _apply_step5_ht_runtime_config(prepare) -> None:
         recv_tokens = config.get("recv_tokens", 512)
         async_layout = config.get("async_layout", False)
         overlap = config.get("overlap", False)
-        if type(version) is not int or version < 1 or num_sms not in (12, 18, 24, 30, 36):
-            raise ValueError("Step5 DeepEP runtime config requires a positive version and num_sms in12/18/24/30/36")
-        if dispatch_send not in (8, 16, 32, 64) or combine_send not in (8, 16, 32, 64) or type(async_layout) is not bool:
+        if type(version) is not int or version < 1 or type(num_sms) is not int or num_sms not in (12, 16, 18, 24, 30, 36):
+            raise ValueError("Step5 DeepEP runtime config requires a positive version and num_sms in12/16/18/24/30/36")
+        if type(dispatch_send) is not int or type(combine_send) is not int or dispatch_send not in (8, 16, 32, 64) or combine_send not in (8, 16, 32, 64) or type(async_layout) is not bool:
             raise ValueError("Step5 DeepEP runtime config has invalid NVL chunk or async_layout")
         if type(overlap) is not bool:
             raise ValueError("Step5 DeepEP overlap must be a boolean")
-        if recv_tokens not in (256, 512):
+        if type(recv_tokens) is not int or recv_tokens not in (256, 512):
             raise ValueError("Step5 DeepEP NVL receive queue must contain256 or512 tokens")
         cached = (path, stamp, version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens)
         _step5_ht_runtime_config = cached
     _, _, version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens = cached
-    buffer_type = type(prepare.buffer)
-    if buffer_type.num_sms != num_sms:
-        buffer_type.set_num_sms(num_sms)
+    # The selected profile belongs to this prepare/finalize instance. Do not
+    # change DeepEP's class-wide defaults used by unrelated model instances.
+    prepare._hcu_step5_num_sms = num_sms
     prepare._hcu_step5_dispatch_send = dispatch_send
     prepare._hcu_step5_combine_send = combine_send
     prepare._hcu_step5_recv_tokens = recv_tokens
@@ -67,7 +67,7 @@ def _apply_step5_ht_runtime_config(prepare) -> None:
 
         init_logger("vllm.hcu.step5_deepep").info(
             "Step5 DeepEP runtime config: version=%d num_sms=%d dispatch_send=%d combine_send=%d async_layout=%s overlap=%s recv_tokens=%d",
-            version, buffer_type.num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens,
+            version, num_sms, dispatch_send, combine_send, async_layout, overlap, recv_tokens,
         )
         _step5_ht_runtime_applied = applied
 
@@ -77,11 +77,11 @@ def step5_ht_launch_config(prepare, original, *, combine=False):
         return original
     send = getattr(prepare, "_hcu_step5_combine_send" if combine else "_hcu_step5_dispatch_send", 8)
     recv_tokens = getattr(prepare, "_hcu_step5_recv_tokens", 512)
-    if send == 8 and recv_tokens == 512:
+    if not hasattr(prepare, "_hcu_step5_num_sms"):
         return original
     if prepare.num_dispatchers_ != 16 or original is None:
         raise ValueError("Step5 custom NVL chunks require EP16 high-throughput configuration")
-    config = type(original)(type(prepare.buffer).num_sms, send, recv_tokens, 16, 128)
+    config = type(original)(prepare._hcu_step5_num_sms, send, recv_tokens, 16, 128)
     # A smaller receive queue lets more channels fit the startup allocation.
     # Enforce the conservative BF16-width hint even for FP8 dispatch.
     if config.get_nvl_buffer_size_hint(4096 * 2, 16) > prepare.buffer.num_nvl_bytes:
@@ -100,7 +100,7 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
     if type(prepare).__name__ == "DeepEPHTPrepareAndFinalize":
         wrapper = getattr(kernel, "fused_experts", None)
         experts = getattr(wrapper, "experts", wrapper)
-        owner = getattr(experts, "_hcu_step5_owner", False) or is_step5_owner(moe_config)
+        owner = getattr(experts, "_hcu_step5_owner", False) is True or is_step5_owner(moe_config)
         config = get_current_vllm_config_or_none()
         configured_dbo = (
             config is not None and config.parallel_config.enable_dbo
@@ -112,6 +112,18 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
         if owner and configured_dbo and os.environ.get("HCU_STEP5_DEEPEP_DBO_BUFFER_PAIR", "0") == "1":
             if prepare.num_dispatchers_ != 16 or os.environ.get("DEEP_EP_NORMAL_MNVL") != "1":
                 raise ValueError("Step5 DeepEP buffer-pair overlap requires EP16 NORMAL MNVL")
+            fused_scatter_requested = os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1"
+            if fused_scatter_requested:
+                if not (
+                    type(experts).__name__ == "DeepGemmExperts"
+                    and getattr(experts, "_hcu_logical_n", None) == 3072
+                    and getattr(experts, "_hcu_logical_k", None) == 4096
+                    and moe_quant_config.use_fp8_w8a8
+                    and moe_quant_config.per_out_ch_quant
+                    and moe_quant_config.per_act_token_quant
+                    and moe_quant_config.block_shape is None
+                ):
+                    raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
             import deep_ep
             from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
@@ -131,17 +143,7 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                 "Step5 DeepEP DBO buffer pair preallocated before KV planning",
                 scope="all",
             )
-            if os.environ.get("HCU_STEP5_DEEPEP_FUSED_SCATTER", "0") == "1":
-                if not (
-                    type(experts).__name__ == "DeepGemmExperts"
-                    and getattr(experts, "_hcu_logical_n", None) == 3072
-                    and getattr(experts, "_hcu_logical_k", None) == 4096
-                    and moe_quant_config.use_fp8_w8a8
-                    and moe_quant_config.per_out_ch_quant
-                    and moe_quant_config.per_act_token_quant
-                    and moe_quant_config.block_shape is None
-                ):
-                    raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
+            if fused_scatter_requested:
                 if not hasattr(manager, "_hcu_step5_scatter_buffers"):
                     manager._hcu_step5_scatter_buffers = {}
                     manager._hcu_step5_scatter_guards = {}

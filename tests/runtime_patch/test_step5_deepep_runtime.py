@@ -61,6 +61,16 @@ class RuntimeConfigurationTest(unittest.TestCase):
             self.scope["_apply_step5_ht_runtime_config"](self.prepare)
         self.assertFalse(hasattr(self.prepare, "_hcu_step5_overlap"))
 
+    def test_step5_profile_keeps_other_instances_and_library_defaults_unchanged(self):
+        other = SimpleNamespace(buffer=type(self.prepare.buffer)(),
+                                _hcu_step5_runtime_tuning_allowed=False)
+        original = object()
+        self.apply(dict(version=1, num_sms=16, dispatch_send=8,
+                        combine_send=8, overlap=True, async_layout=True))
+        self.assertEqual(type(other.buffer).num_sms, 18)
+        self.assertIs(self.scope["step5_ht_launch_config"](other, original), original)
+        self.assertFalse(hasattr(other, "_hcu_step5_num_sms"))
+
     def test_disabled_profile_returns_original_config_object(self):
         self.prepare._hcu_step5_runtime_tuning_allowed = False
         original = object()
@@ -70,7 +80,8 @@ class RuntimeConfigurationTest(unittest.TestCase):
     def test_runtime_budget_and_overlap_are_applied_together(self):
         self.apply(dict(version=1, num_sms=24, dispatch_send=8,
                         combine_send=32, overlap=True, async_layout=True))
-        self.assertEqual(type(self.prepare.buffer).num_sms, 24)
+        self.assertEqual(self.prepare._hcu_step5_num_sms, 24)
+        self.assertEqual(type(self.prepare.buffer).num_sms, 18)
         self.assertTrue(self.prepare._hcu_step5_overlap)
         self.assertTrue(self.prepare._hcu_step5_async_layout)
         self.assertEqual(self.prepare._hcu_step5_combine_send, 32)
@@ -80,8 +91,17 @@ class RuntimeConfigurationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "two preallocated"):
             self.apply(dict(version=1, num_sms=18, overlap=True))
 
+    def test_mnvl_sm16_profile_is_accepted(self):
+        self.apply(dict(version=1, num_sms=16, dispatch_send=8,
+                        combine_send=8, overlap=True, async_layout=True))
+        self.assertEqual(self.prepare._hcu_step5_num_sms, 16)
+        self.assertEqual(type(self.prepare.buffer).num_sms, 18)
+        self.assertTrue(self.prepare._hcu_step5_overlap)
+
     def test_invalid_budget_is_rejected(self):
         for config in [dict(version=1, num_sms=6),
+                       dict(version=1, num_sms=16.0),
+                       dict(version=1, num_sms=16, dispatch_send=8.0),
                        dict(version=1, num_sms=18, combine_send=128),
                        dict(version=1, num_sms=18, overlap="true"),
                        dict(version=1, num_sms=18, recv_tokens=64)]:
@@ -97,6 +117,7 @@ class RuntimeConfigurationTest(unittest.TestCase):
                 return self.required
 
         self.prepare._hcu_step5_combine_send = 32
+        self.prepare._hcu_step5_num_sms = 16
         Config.required = self.prepare.buffer.num_nvl_bytes + 1
         with self.assertRaisesRegex(ValueError, "reserved NVL buffer"):
             self.scope["step5_ht_launch_config"](
