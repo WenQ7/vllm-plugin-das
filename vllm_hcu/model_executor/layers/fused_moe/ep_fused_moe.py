@@ -34,6 +34,7 @@ from vllm_hcu.platforms import envs as henvs
 
 FP8 = torch.float8_e4m3fn
 _announced = False
+_step5_packed_dispatch = False
 STEP5_EXPERT_GRID = henvs.optional_custom_op_enabled(
     os.environ.get("HCU_STEP5_EXPERT_GRID", "0") == "1"
 )
@@ -769,6 +770,10 @@ def _ep_direct_combine(act_q, act_s, w2, w2_scale, topk_weights, topk_ids, exper
 
 def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, w1_scale, w2_scale,
                      **kw):
+    if _step5_packed_dispatch:
+        from vllm_hcu.model_executor.layers.fused_moe.step5_packed import is_packed, run_packed_experts
+        if is_packed(w1,w2):
+            return run_packed_experts(hidden_states,w1,w2,topk_weights,topk_ids,expert_map,w1_scale,w2_scale,**kw)
     global _announced
     if not _announced:
         _announced = True

@@ -88,6 +88,24 @@ def _init_hcu_workspace_manager(
     init_workspace_manager(device, num_ubatches, num_lanes)
 
 
+def _prepare_step5_packed_weights(worker, *, reloaded=False):
+    from vllm_hcu.runtime_compat.step5 import is_step5_config
+
+    config = getattr(worker, "vllm_config", None)
+    if not is_step5_config(config):
+        return
+    parallel = config.parallel_config
+    if parallel.tensor_parallel_size != 4 or parallel.data_parallel_size != 4:
+        return
+    if not all(hasattr(torch.ops.hcu_ops, name) for name in (
+        "step5_fp8_packed_masked", "step5_fp8_packed_contiguous"
+    )):
+        return
+    from vllm_hcu.model_executor.layers.fused_moe.step5_packed import prepare_model_weights
+
+    prepare_model_weights(worker, reloaded=reloaded)
+
+
 class HcuGPUWorker(Worker):
     """A worker class that executes (a partition of) the model on a HCU.
     Each worker is associated with a single HCU. In case of
@@ -154,9 +172,13 @@ class HcuGPUWorker(Worker):
                 "GLM5Next FP32 router GEMV bound to %d layers", num_router_gates
             )
         validate_worker_patches(require_applied=True)
+        if getattr(self, "vllm_config", None) is not None:
+            _prepare_step5_packed_weights(self)
+
 
     def reload_weights(self, *args, **kwargs) -> None:
         super().reload_weights(*args, **kwargs)
+        _prepare_step5_packed_weights(self, reloaded=True)
         from vllm_hcu.patch.worker.core_fix.patch_deepseek_v4_attention import (
             refresh_compressor_nt_weights,
         )
@@ -171,6 +193,8 @@ class HcuGPUWorker(Worker):
 
     def finish_weight_update(self) -> None:
         super().finish_weight_update()
+        if not self._weight_update_is_draft:
+            _prepare_step5_packed_weights(self, reloaded=True)
         if self._weight_update_is_draft:
             get_draft_model = getattr(self.model_runner, "get_draft_model", None)
             model = get_draft_model() if callable(get_draft_model) else None
