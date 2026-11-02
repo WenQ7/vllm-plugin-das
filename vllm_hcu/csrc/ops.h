@@ -65,3 +65,12 @@ at::Tensor step5_fp8_dense_gemm(const at::Tensor& x, const at::Tensor& xs,
                               int64_t algorithm_id, bool allow_initialize);
 std::string step5_fp8_dense_backend_library();
 #endif
+
+#ifdef VLLM_HCU_BUILD_STEP5_PACKED
+void step5_fp8_packed_masked(torch::Tensor a, torch::Tensor weight,
+    torch::Tensor a_scale, torch::Tensor weight_scale, torch::Tensor counts,
+    torch::Tensor output);
+void step5_fp8_packed_contiguous(torch::Tensor a, torch::Tensor weight,
+    torch::Tensor a_scale, torch::Tensor weight_scale, torch::Tensor indices,
+    torch::Tensor output);
+#endif

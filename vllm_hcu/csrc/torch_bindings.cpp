@@ -30,6 +30,15 @@
   }
 
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+#ifdef VLLM_HCU_BUILD_STEP5_PACKED
+  ops.def("step5_fp8_packed_masked(Tensor a, Tensor weight, Tensor a_scale, "
+          "Tensor weight_scale, Tensor counts, Tensor(a!) output) -> ()");
+  ops.impl("step5_fp8_packed_masked", torch::kCUDA, &step5_fp8_packed_masked);
+  ops.def("step5_fp8_packed_contiguous(Tensor a, Tensor weight, Tensor a_scale, "
+          "Tensor weight_scale, Tensor indices, Tensor(a!) output) -> ()");
+  ops.impl("step5_fp8_packed_contiguous", torch::kCUDA, &step5_fp8_packed_contiguous);
+#endif
+
 #ifdef VLLM_HCU_BUILD_STEP5_DENSE
   ops.def("step5_fp8_dense_gemm(Tensor x, Tensor xs, Tensor w, Tensor ws, "
           "int algorithm_id, bool allow_initialize=False) -> Tensor");
