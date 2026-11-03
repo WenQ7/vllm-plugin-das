@@ -6,6 +6,7 @@ import torch
 
 from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime as runtime
 from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+from vllm_hcu.runtime_compat.step5 import configure_step5_deepep_hca
 
 
 def config(model_type="step5", tp=4, dp=4, backend="deepep_low_latency", sp=False, dbo=False):
@@ -26,6 +27,26 @@ def test_other_routes_retain_their_transport(kwargs):
 def test_only_the_requested_step5_route_is_selected():
     assert is_step5_tp4_deepep_ll(config())
     assert not is_step5_tp4_deepep_ll(SimpleNamespace(model_type="step5"))
+
+
+@pytest.mark.parametrize("rank", range(8))
+def test_nic_mapping_uses_logical_rank_with_reordered_physical_devices(monkeypatch, rank):
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1,2,3,4,6,7,5")
+    monkeypatch.setenv("DEEP_EP_DEVICE_TO_HCA_MAPPING", ",".join(f"{i}:mlx5_{i}:1" for i in range(8)))
+    monkeypatch.setenv("ROCSHMEM_USE_IB_HCA", "mlx5_0")
+    configure_step5_deepep_hca(config(), rank)
+    import os
+    assert os.environ["ROCSHMEM_USE_IB_HCA"] == f"mlx5_{rank}"
+
+
+@pytest.mark.parametrize("kwargs", [dict(model_type="qwen2_moe"), dict(tp=8, dp=2),
+                                    dict(backend="allgather_reducescatter")])
+def test_other_routes_ignore_step5_nic_mapping(monkeypatch, kwargs):
+    monkeypatch.setenv("DEEP_EP_DEVICE_TO_HCA_MAPPING", "invalid")
+    monkeypatch.setenv("ROCSHMEM_USE_IB_HCA", "original")
+    configure_step5_deepep_hca(config(**kwargs), 7)
+    import os
+    assert os.environ["ROCSHMEM_USE_IB_HCA"] == "original"
 
 
 @pytest.mark.parametrize("n", [4, 16, 64])
@@ -76,11 +97,13 @@ def test_dispatch_shards_and_combine_restores_full_rows(monkeypatch, n, rank, ev
         group_size = 16
 
         def low_latency_dispatch(self, x, i, w, *args, **kwargs):
+            assert kwargs["return_recv_hook"] is False
             torch.testing.assert_close(x, source.chunk(4)[rank], rtol=0, atol=0)
             assert torch.equal(i, ids.chunk(4)[rank]) and torch.equal(w, weights.chunk(4)[rank])
             return x, "counts", native_handle, None, None
 
         def low_latency_combine(self, x, i, w, handle, **kwargs):
+            assert kwargs["return_recv_hook"] is False
             assert handle is native_handle
             assert torch.equal(i, ids.chunk(4)[rank])
             assert torch.equal(w, weights.chunk(4)[rank])
@@ -90,7 +113,8 @@ def test_dispatch_shards_and_combine_restores_full_rows(monkeypatch, n, rank, ev
                 order.append("receive")
                 kwargs["out"].copy_(expected.chunk(4)[rank])
 
-            return kwargs["out"], Event(), receive
+            receive()
+            return kwargs["out"], Event(), None
 
     proxy = runtime._Step5TPTokenBuffer(Buffer(), 64, hidden)
     _, counts, handle, _, _ = proxy.low_latency_dispatch(source, ids, weights, 64, 352)
@@ -108,8 +132,8 @@ def test_dispatch_shards_and_combine_restores_full_rows(monkeypatch, n, rank, ev
 
 
 @pytest.mark.parametrize("n", [1, 2, 7])
-def test_unpartitioned_tails_preserve_native_handle_and_hook(n):
-    handle, event, hook = object(), object(), object()
+def test_unpartitioned_tails_preserve_tokens_and_native_handle(n):
+    handle, event, hook = object(), SimpleNamespace(event=None), None
     source = torch.ones((n, 8), dtype=torch.bfloat16)
     ids = torch.zeros((n, 8), dtype=torch.int64)
     weights = torch.ones((n, 8))
@@ -132,7 +156,8 @@ def test_unpartitioned_tails_preserve_native_handle_and_hook(n):
     proxy._buffer, proxy._size, proxy._rank = Buffer(), 4, 1
     received = proxy.low_latency_dispatch(source, ids, weights, 64, 352)
     assert received[2] == (handle, None)
-    assert proxy.low_latency_combine(source, ids, weights, received[2]) is result
+    actual = proxy.low_latency_combine(source, ids, weights, received[2])
+    assert actual[0] is source and actual[1] is event and actual[2] is None
     assert proxy.get_next_low_latency_combine_buffer(received[2]) == "next"
 
 
@@ -143,6 +168,13 @@ def test_async_combine_is_rejected_before_native_side_effects():
     with pytest.raises(ValueError, match="synchronous combine"):
         proxy.low_latency_combine(torch.empty((22, 3, 8)), None, None,
                                   (object(), 16), async_finish=True)
+
+
+def test_async_dispatch_is_rejected_before_native_side_effects():
+    proxy = object.__new__(runtime._Step5TPTokenBuffer)
+    proxy._buffer = SimpleNamespace(low_latency_dispatch=lambda *a, **k: pytest.fail("native call"))
+    with pytest.raises(ValueError, match="synchronous dispatch"):
+        proxy.low_latency_dispatch(None, None, None, 512, 352, async_finish=True)
 
 
 @pytest.mark.parametrize("cold_capture", [False, True])

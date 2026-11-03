@@ -46,3 +46,21 @@ def is_step5_tp4_deepep_ll(config=None):
         and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
         and not getattr(passes, "enable_sp", False)
     )
+
+
+def configure_step5_deepep_hca(config, local_rank):
+    """Bind rocSHMEM to the NIC selected by DeepEP for this logical device."""
+    if not is_step5_tp4_deepep_ll(config):
+        return
+    import os
+
+    mapping = os.environ.get("DEEP_EP_DEVICE_TO_HCA_MAPPING")
+    if not mapping:
+        return
+    devices = {}
+    for entry in mapping.split(","):
+        device, hca = entry.split(":", 1)
+        devices[int(device)] = hca.split(":", 1)[0]
+    if local_rank not in devices or not devices[local_rank]:
+        raise ValueError(f"DeepEP NIC mapping omits logical device {local_rank}")
+    os.environ["ROCSHMEM_USE_IB_HCA"] = devices[local_rank]

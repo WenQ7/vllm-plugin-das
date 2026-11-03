@@ -903,6 +903,13 @@ class _Step5TPTokenBuffer:
     def __getattr__(self, name):
         return getattr(self._buffer, name)
 
+    @staticmethod
+    def _complete_receive(event, hook):
+        if hook is not None:
+            hook()
+        if event is not None and event.event is not None:
+            event.current_stream_wait()
+
     def low_latency_dispatch(
         self, x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank,
         num_experts, quant_type=1, quant_group_size=0, fp8_round_scale=False,
@@ -910,6 +917,8 @@ class _Step5TPTokenBuffer:
     ):
         import torch
 
+        if async_finish:
+            raise ValueError("Step5 TP partition requires synchronous dispatch")
         if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
             raise ValueError("Step5 LL dispatch expects BF16 input before its FP8 quantization")
         n = x.shape[0]
@@ -922,19 +931,27 @@ class _Step5TPTokenBuffer:
         received, counts, handle, event, hook = self._buffer.low_latency_dispatch(
             x, topk_idx, topk_weight, num_max_dispatch_tokens_per_rank, num_experts,
             quant_type=quant_type, quant_group_size=quant_group_size,
-            fp8_round_scale=fp8_round_scale, async_finish=async_finish,
-            return_recv_hook=return_recv_hook, x_scales=x_scales, ll_route_hint=ll_route_hint)
-        return received, counts, (handle, n if partition else None), event, hook
+            fp8_round_scale=fp8_round_scale, async_finish=False,
+            return_recv_hook=False, x_scales=x_scales, ll_route_hint=ll_route_hint)
+        self._complete_receive(event, hook)
+        return received, counts, (handle, n if partition else None), event, (
+            (lambda: None) if return_recv_hook else None)
 
     def low_latency_combine(self, x, topk_idx, topk_weights, handle, **kwargs):
         import torch
 
         native_handle, n = handle
-        if n is None:
-            return self._buffer.low_latency_combine(
-                x, topk_idx, topk_weights, native_handle, **kwargs)
         if kwargs.get("async_finish", False):
             raise ValueError("Step5 TP partition requires the DBO-disabled synchronous combine")
+        requested_hook = kwargs.get("return_recv_hook", False)
+        # This route disables DBO. Complete send/receive in one native kernel
+        # and preserve the modular caller's callback contract with a no-op.
+        kwargs["return_recv_hook"] = False
+        if n is None:
+            output, event, hook = self._buffer.low_latency_combine(
+                x, topk_idx, topk_weights, native_handle, **kwargs)
+            self._complete_receive(event, hook)
+            return output, event, ((lambda: None) if requested_hook else None)
         output = kwargs.pop("out", None)
         if output is None or output.shape != (n, x.shape[-1]) or not output.is_contiguous():
             raise ValueError("Step5 TP partition requires a contiguous caller-owned full output")
@@ -945,14 +962,11 @@ class _Step5TPTokenBuffer:
         _, event, hook = self._buffer.low_latency_combine(
             x, topk_idx[start:start + width], topk_weights[start:start + width],
             native_handle, out=local, **kwargs)
-        if hook is not None:
-            hook()
-        if event is not None and event.event is not None:
-            event.current_stream_wait()
+        self._complete_receive(event, hook)
         # Enqueue at the combine call site, before shared-expert TP reduction.
         # A deferred gather callback could invert collective order between ranks.
         self._gather_comm.all_gather(output, local, stream=torch.cuda.current_stream())
-        return output, event, ((lambda: None) if kwargs.get("return_recv_hook", False) else None)
+        return output, event, ((lambda: None) if requested_hook else None)
 
     def get_next_low_latency_combine_buffer(self, handle):
         native_handle, _ = handle
