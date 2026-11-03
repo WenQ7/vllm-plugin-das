@@ -1,5 +1,7 @@
 """Step5-only library dispatch; other owners retain the existing adapter."""
+import ast
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -59,3 +61,37 @@ def test_other_models_keep_original_lightop_adapter(monkeypatch):
     layer, x = owner(False), tensor()
     assert norms.HcuGemmaRMSNorm.forward_hip(layer, x) == "original-output"
     assert calls == [((x, layer.weight, layer.variance_epsilon), dict(out="original-output"))]
+
+
+@pytest.mark.parametrize("step5,selected,master", [
+    (True, True, True), (True, False, True), (False, True, True), (True, True, False)])
+def test_model_constructor_preserves_fp32_and_explicit_provider(monkeypatch, step5, selected, master):
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if master else "0")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM", "1")
+
+    class Norm:
+        def __init__(self, *args):
+            self._hcu_step5_owner = step5
+            self._forward_method = self.forward_hip if selected else self.forward_native
+
+        def forward_hip(self, *args):
+            pass
+
+        def forward_native(self, *args):
+            pass
+
+    path = Path(__file__).parents[2] / 'vllm_hcu/models/step5_text.py'
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == '_fp32_gemma_rms_norm')
+    namespace = dict(GemmaRMSNorm=Norm, torch=torch, nn=torch.nn, henvs=norms.henvs)
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), 'exec'), namespace)
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        layer = namespace['_fp32_gemma_rms_norm'](4096, 1e-6)
+    finally:
+        torch.set_default_dtype(previous)
+    assert layer.weight.dtype == torch.float32
+    expected = 'forward_hip' if step5 and selected and master else 'forward_native'
+    assert layer._forward_method.__name__ == expected

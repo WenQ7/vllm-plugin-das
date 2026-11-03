@@ -442,7 +442,7 @@ class BF16FP32RouterLinear(ReplicatedLinear):
 
 
 def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
-    """GemmaRMSNorm holding its weight in fp32, on the native forward path.
+    """Preserve checkpoint gamma in FP32, with an explicitly selected provider.
 
     Every norm weight in the Step-5 checkpoint is serialized as fp32, and the
     reference implementation keeps it that way. GemmaRMSNorm allocates with the
@@ -451,15 +451,20 @@ def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
     perturbs ``1 + w`` by up to ~8e-3 -- far above bf16 compute noise, on all
     four norms of all 92 layers.
 
-    Device-specific GemmaRMSNorm kernels require the activation and the weight to
-    share a dtype, so an fp32 weight also has to opt out of them. forward_native
-    reduces in fp32 and returns the input dtype, which is the wanted semantics.
+    The Step5 library adapter supports mixed activation/gamma dtypes without
+    rounding gamma. Other providers retain the native FP32 reduction path.
     """
     norm = GemmaRMSNorm(hidden_size, eps)
     norm.weight = nn.Parameter(
         torch.zeros(hidden_size, dtype=torch.float32), requires_grad=False
     )
-    norm._forward_method = norm.forward_native
+    library_selected = (
+        getattr(norm, "_hcu_step5_owner", False)
+        and norm._forward_method.__name__ == "forward_hip"
+        and henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM)
+    )
+    if not library_selected:
+        norm._forward_method = norm.forward_native
     return norm
 
 
