@@ -24,3 +24,25 @@ def is_step5_owner(owner=None):
 
         config = get_current_vllm_config_or_none()
     return config is not None and is_step5_config(config)
+
+
+def is_step5_tp4_deepep_ll(config=None):
+    """Identify the non-SP Step5 TP4/DP4 low-latency transport route."""
+    if config is None:
+        from vllm.config import get_current_vllm_config_or_none
+
+        config = get_current_vllm_config_or_none()
+    if config is None or not is_step5_config(config):
+        return False
+    parallel = getattr(config, "parallel_config", None)
+    passes = getattr(getattr(config, "compilation_config", None), "pass_config", None)
+    return bool(
+        parallel is not None
+        and getattr(parallel, "tensor_parallel_size", None) == 4
+        and getattr(parallel, "data_parallel_size", None) == 4
+        and getattr(parallel, "enable_expert_parallel", False)
+        and not getattr(parallel, "enable_dbo", True)
+        and getattr(parallel, "pipeline_parallel_size", None) == 1
+        and getattr(parallel, "all2all_backend", None) == "deepep_low_latency"
+        and not getattr(passes, "enable_sp", False)
+    )

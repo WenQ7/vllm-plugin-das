@@ -1383,7 +1383,10 @@ class Step5Model(nn.Module):
         self.dsa_slots = {idx: slot for slot, idx in enumerate(sparse_layers)}
         self.dsa_state: Step4DSAState | None = None
         if sparse_layers:
+            from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+
             self.dsa_state = Step4DSAState(
+                step5_ll_allocation_barrier=is_step5_tp4_deepep_ll(vllm_config),
                 num_layers=len(sparse_layers),
                 geometry=Step4DSAGeometry.from_config(config.sparse_config),
                 # A running request holds at most one half-filled region, so

@@ -45,6 +45,20 @@ def step5_decode_workspace_plan(config, dtype):
     scheduler = config.scheduler_config
     spec = config.speculative_config
     model = config.model_config.hf_text_config
+    from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+    if (
+        is_step5_tp4_deepep_ll(config)
+        and scheduler.max_num_batched_tokens == 512
+        and scheduler.max_num_seqs == 64
+        and dtype == torch.bfloat16
+        and (model.hidden_size, model.moe_intermediate_size,
+             model.moe_num_experts, model.moe_top_k) == (4096, 1536, 352, 8)
+        and spec is not None and spec.method == "mtp" and spec.num_speculative_tokens == 3
+    ):
+        # Reserve the reviewed masked-expert workspace before transport starts.
+        # It remains inside Worker's measured non-KV memory budget.
+        return {"shapes": ((5 * 1024**3 // dtype.itemsize,),),
+                "required_bytes": 5 * 1024**3}
     chunk = int(os.environ.get("EP_FUSED_MOE_CHUNK", "16384"))
     if not (
         parallel.tensor_parallel_size == parallel.data_parallel_size == 4
