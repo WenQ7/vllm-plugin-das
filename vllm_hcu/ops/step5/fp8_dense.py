@@ -89,15 +89,18 @@ def _quant_per_token_fp8_torch(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return (xf / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn), s
 
 
-def _can_use_decode_fp8_quant(x: torch.Tensor) -> bool:
+def _can_use_dense_fp8_quant_op(x: torch.Tensor) -> bool:
     return (
         henvs.optional_custom_op_enabled(_DECODE_TOKEN_QUANT)
         and x.is_cuda
         and x.ndim == 2
         and x.dtype in (torch.bfloat16, torch.float32)
-        and x.shape[0] <= 64
         and 0 < x.shape[1] <= 8192
     )
+
+
+def _can_use_decode_fp8_quant(x: torch.Tensor) -> bool:
+    return _can_use_dense_fp8_quant_op(x) and x.shape[0] <= 64
 
 
 def _step5_dense_fp8_quant(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -130,9 +133,14 @@ direct_register_custom_op(
 )
 
 
-def quant_per_token_fp8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token dense quantization; keep large batches available for fusion."""
-    if _can_use_decode_fp8_quant(x):
+def quant_per_token_fp8(
+    x: torch.Tensor, dynamic_small_m: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep eager-backend M dispatch inside the op, avoiding shape specialization.
+
+    Other backends retain the Torch producer-fusion path for large batches.
+    """
+    if _can_use_dense_fp8_quant_op(x) and (dynamic_small_m or x.shape[0] <= 64):
         return torch.ops.vllm.step5_dense_fp8_quant(x)
     return _quant_per_token_fp8_torch(x)
 
@@ -174,14 +182,16 @@ direct_register_custom_op(
 
 
 def fp8_linear(
-    x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, n: int | None = None
+    x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, n: int | None = None,
+    *, dynamic_small_m: bool = False,
 ) -> torch.Tensor:
     """``x [..., K]`` bf16 @ quantize_weight_fp8 output -> bf16 ``[..., N]``.
 
     With ``n=None`` the pad columns are kept (for callers that split anyway).
     """
     lead = x.shape[:-1]
-    xq, xs = quant_per_token_fp8(x.reshape(-1, x.shape[-1]))
+    xq, xs = quant_per_token_fp8(
+        x.reshape(-1, x.shape[-1]), dynamic_small_m=dynamic_small_m)
     out = torch.ops.vllm.step5_fp8_gemm(xq, xs, wq, ws)
     if n is not None and n != wq.shape[0]:
         out = out[:, :n]

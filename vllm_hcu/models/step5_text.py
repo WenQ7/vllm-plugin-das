@@ -196,6 +196,9 @@ FP8_BF16_MOE = henvs.optional_custom_op_enabled(
 SWA_FUSED_QK = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_SWA_FUSED_QK", "0") == "1"
 )
+DSA_FUSED_QK = henvs.optional_custom_op_enabled(
+    os.environ.get("VLLM_HCU_STEP5_DSA_FUSED_QK", "0") == "1"
+)
 FUSED_GATE = henvs.optional_custom_op_enabled(
     os.environ.get("VLLM_HCU_STEP5_FUSED_GATE", "0") == "1"
 )
@@ -205,6 +208,11 @@ if SWA_FUSED_QK or FUSED_GATE:
     # Enabled custom ops must register during model-module initialization,
     # before torch.compile tracing or CUDA/HCU graph capture begins.
     from vllm_hcu.models import step5_swa_fused
+
+step5_dsa_qk_fused = None
+if DSA_FUSED_QK:
+    # Register before tracing; the disabled profile never imports this provider.
+    from vllm_hcu.models import step5_dsa_qk_fused
 
 
 def _get_step5_swa_fused():
@@ -478,7 +486,12 @@ class Step5FP8LinearMethod(LinearMethodBase):
     """
 
     def __init__(self, post: Callable[[], None] | None = None):
+        from vllm.config import get_current_vllm_config_or_none
+
         self.post = post
+        config = get_current_vllm_config_or_none()
+        compilation = getattr(config, "compilation_config", None)
+        self.dynamic_small_m = getattr(compilation, "backend", None) == "eager"
 
     def create_weights(self, *args, **kwargs):
         raise NotImplementedError("swapped in after the layer is created")
@@ -509,7 +522,9 @@ class Step5FP8LinearMethod(LinearMethodBase):
             if layer.fp8_n != out.shape[-1]:
                 out = out[:, : layer.fp8_n]
             return out if bias is None else out + bias
-        out = fp8_linear(x, layer.fp8_wq, layer.fp8_ws, layer.fp8_n)
+        out = fp8_linear(
+            x, layer.fp8_wq, layer.fp8_ws, layer.fp8_n,
+            dynamic_small_m=self.dynamic_small_m)
         return out if bias is None else out + bias
 
 
@@ -824,6 +839,12 @@ class Step5Attention(nn.Module):
         self.max_position_embeddings = max_position
         # Sliding layers: q/k norm + RoPE + q quant + KV cache write in one op.
         self.swa_fused_qk = SWA_FUSED_QK and _get_step5_swa_fused().can_use(self)
+        self.dsa_fused_qk = False
+        if DSA_FUSED_QK and self.is_sparse_layer:
+            from vllm_hcu.runtime_compat.step5 import is_step5_owner
+
+            self._hcu_step5_owner = is_step5_owner()
+            self.dsa_fused_qk = step5_dsa_qk_fused.can_dispatch(self)
         # Gate + fp8 quant of the o_proj input as one op (folded into the SWA
         # decode combine when swa_fused_qk); needs the fused qkvg fp8 GEMM.
         self.fused_gate = (
@@ -903,12 +924,20 @@ class Step5Attention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        prepared_qkvg: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         if self.qkvg_wq is not None:
             from vllm_hcu.ops.step5.fp8_dense import fp8_linear
 
             # N is padded; slice instead of split.
-            qkvg = fp8_linear(hidden_states, self.qkvg_wq, self.qkvg_ws)
+            if prepared_qkvg is None:
+                qkvg = fp8_linear(
+                    hidden_states, self.qkvg_wq, self.qkvg_ws,
+                    dynamic_small_m=getattr(self.qkv_proj.quant_method, "dynamic_small_m", False))
+            else:
+                qkvg = torch.ops.vllm.step5_fp8_gemm(
+                    *prepared_qkvg, self.qkvg_wq, self.qkvg_ws)
+                qkvg = qkvg.view(*hidden_states.shape[:-1], qkvg.shape[-1])
             nqkv = self.q_size + 2 * self.kv_size
             qkv = qkvg[..., :nqkv]
             extra_dims = qkvg[..., nqkv : nqkv + self.num_heads]
@@ -931,15 +960,18 @@ class Step5Attention(nn.Module):
                 gate=extra_dims if self.fused_gate else None,
             )
             return self._gate_o_proj(attn_output, extra_dims, hidden_states)
-        q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
-        q_by_head = self.q_norm(q_by_head.contiguous())
-        q = q_by_head.view(q.shape)
+        if self.dsa_fused_qk:
+            q, k = step5_dsa_qk_fused.forward(self, positions, qkv)
+        else:
+            q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+            q_by_head = self.q_norm(q_by_head.contiguous())
+            q = q_by_head.view(q.shape)
 
-        k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
-        k_by_head = self.k_norm(k_by_head.contiguous())
-        k = k_by_head.view(k.shape)
-        if self.use_rope:
-            q, k = self.rotary_emb(positions, q, k)
+            k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+            k_by_head = self.k_norm(k_by_head.contiguous())
+            k = k_by_head.view(k.shape)
+            if self.use_rope:
+                q, k = self.rotary_emb(positions, q, k)
         if self.indexer is not None:
             # Publishes layer.attn.step4_sparse_plan, which the DSA backend
             # reads. It needs hidden_states, which Attention.forward never sees
@@ -1331,6 +1363,24 @@ class Step5DecoderLayer(nn.Module):
             combined = tensor_model_parallel_all_reduce(combined)
         return combined
 
+    def forward_with_pending(
+        self, positions: torch.Tensor, pending: torch.Tensor | None,
+        residual: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep the preceding FFN addition in FP32, at the next layer's producer.
+        residual, hidden_states, q, scale = torch.ops.vllm.step5_decode_input_producer_v1(
+            residual, pending, self.input_layernorm.weight,
+            self.input_layernorm.variance_epsilon)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, prepared_qkvg=(q, scale))
+        residual, hidden_states = torch.ops.vllm.step5_decode_post_producer_v1(
+            residual, hidden_states, self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.variance_epsilon)
+        pending = self._forward_ffn(
+            hidden_states, input_is_sequence_parallel=False, residual=None,
+            orig_num_tokens=hidden_states.shape[0])
+        return pending, residual
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -1442,6 +1492,17 @@ class Step5Model(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
+        self.decode_fused_producers = bool(
+            os.environ.get("VLLM_HCU_STEP5_DECODE_PRODUCERS", "0") == "1"
+            and henvs.optional_custom_op_enabled(True)
+            and self.fp32_residual_connection and FP8_DENSE
+            and self.compute_dtype == torch.bfloat16 and config.hidden_size == 4096
+            and config.num_hidden_layers == 92
+            and self.start_layer == 0 and self.end_layer == config.num_hidden_layers
+            and vllm_config.compilation_config.backend == "eager")
+        if self.decode_fused_producers:
+            from vllm_hcu.ops.step5 import decode_producers_runtime
+
         if get_pp_group().is_last_rank:
             self.norm = _fp32_gemma_rms_norm(config.hidden_size, config.rms_norm_eps)
         else:
@@ -1473,9 +1534,16 @@ class Step5Model(nn.Module):
         if self.fp32_residual_connection:
             hidden_states = hidden_states.float()
 
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states = layer(positions, hidden_states)
+        if self.decode_fused_producers:
+            residual, pending = hidden_states, None
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                pending, residual = layer.forward_with_pending(positions, pending, residual)
+            hidden_states = pending.float() + residual
+        else:
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states = layer(positions, hidden_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(

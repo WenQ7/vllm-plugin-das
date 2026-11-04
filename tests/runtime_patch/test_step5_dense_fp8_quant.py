@@ -1,6 +1,7 @@
 """Dispatch, fake and fallback contracts for Step5 dense FP8 quantization."""
 from contextlib import contextmanager
 import __future__
+import ast
 import importlib.util
 import math
 import os
@@ -77,6 +78,43 @@ class DenseDecodeQuantContracts(unittest.TestCase):
                     TensorMetadata((16,4096),device='cpu'),TensorMetadata((16,4096),dtype=torch.float16),
                     TensorMetadata((4096,)),TensorMetadata((1,16,4096))]
             for x in inputs:self.assertEqual(module.quant_per_token_fp8(x),('original-q','original-s'));self.assertIs(seen[-1],x)
+    def test_dynamic_row_policy_dispatches_op_without_inspecting_symbolic_m(self):
+        class SymbolicM:
+            def __le__(self,other):raise AssertionError('M guard escaped the opaque real implementation')
+        with runtime() as (module,torch,launches,registered,imports):
+            seen=[];torch.ops.vllm.step5_dense_fp8_quant=lambda x:seen.append(x) or ('q','s')
+            x=TensorMetadata((SymbolicM(),4096),torch.float32)
+            self.assertEqual(module.quant_per_token_fp8(x,dynamic_small_m=True),('q','s'))
+            self.assertEqual(seen,[x])
+    def test_dynamic_row_policy_preserves_large_batch_math_in_real_op(self):
+        with runtime() as (module,torch,launches,registered,imports):
+            seen=[];module._quant_per_token_fp8_torch=lambda x:seen.append(x) or ('original-q','original-s')
+            x=TensorMetadata((512,4096),torch.float32)
+            self.assertEqual(module.quant_per_token_fp8(x,dynamic_small_m=True),('original-q','original-s'))
+            self.assertEqual(seen,[x]);self.assertEqual(launches,[])
+    def test_dynamic_row_policy_still_obeys_master_and_structural_guards(self):
+        with runtime() as (module,torch,launches,registered,imports):
+            module._quant_per_token_fp8_torch=lambda x:('original-q','original-s')
+            torch.ops.vllm.step5_dense_fp8_quant=lambda x:self.fail('Unexpected custom-op dispatch')
+            for x in [TensorMetadata((512,8193)),TensorMetadata((64,4096),device='cpu'),
+                      TensorMetadata((64,4096),dtype=torch.float16)]:
+                self.assertEqual(module.quant_per_token_fp8(x,dynamic_small_m=True),('original-q','original-s'))
+            os.environ['VLLM_HCU_USE_CUSTOM_OPS']='0'
+            self.assertEqual(module.quant_per_token_fp8(TensorMetadata((64,4096)),dynamic_small_m=True),('original-q','original-s'))
+    def test_linear_policy_is_latched_from_actual_construction_config(self):
+        source=ROOT/'vllm_hcu/models/step5_text.py'
+        cls=next(n for n in ast.parse(source.read_text(encoding='utf-8')).body
+                 if isinstance(n,ast.ClassDef) and n.name=='Step5FP8LinearMethod')
+        namespace={'LinearMethodBase':object}
+        exec(compile(ast.Module(body=[cls],type_ignores=[]),str(source),'exec',
+                     flags=__future__.annotations.compiler_flag),namespace)
+        policy=namespace['Step5FP8LinearMethod'];config_module=ModuleType('vllm.config')
+        for backend,expected in [('eager',True),('inductor',False),(None,False)]:
+            config=SimpleNamespace(compilation_config=SimpleNamespace(backend=backend))
+            config_module.get_current_vllm_config_or_none=lambda:config
+            with patch.dict(sys.modules,{'vllm.config':config_module}):self.assertIs(policy().dynamic_small_m,expected)
+        config_module.get_current_vllm_config_or_none=lambda:None
+        with patch.dict(sys.modules,{'vllm.config':config_module}):self.assertFalse(policy().dynamic_small_m)
     def test_runtime_master_off_cannot_be_bypassed_by_cached_opt_in(self):
         with runtime() as (module,torch,launches,registered,imports):
             module._quant_per_token_fp8_torch=lambda x:('original-q','original-s')
