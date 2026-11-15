@@ -12,7 +12,10 @@ sys.path.insert(0, str(ROOT / '.github/scripts/hcu_ci'))
 from select_v033_tests import select_jobs
 from select_hcu_tests import _load_config, _git_changed_paths, DEFAULT_CONFIG, select_jobs as legacy_select
 
-EXPECTED = {'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938'}
+EXPECTED = {
+    'v033-source-contract', 'v033-device-gfx936',
+    'v033-device-gfx938', 'v033-device-gfx938-k8s',
+}
 
 
 class SelectionTests(unittest.TestCase):
@@ -31,7 +34,7 @@ class SelectionTests(unittest.TestCase):
                 new = self.ids([path])
                 self.assertFalse(new['fallback'])
 
-    def test_every_delivered_python_file_selects_both_tiers(self):
+    def test_every_delivered_python_file_selects_release_scope(self):
         paths = list((ROOT / 'adapter_extension/src').rglob('*.py'))
         self.assertTrue(paths)
         for path in paths:
@@ -120,6 +123,18 @@ class SelectionTests(unittest.TestCase):
                     validate_result(report)
             report.write_text('<testsuite><testcase name="real"/></testsuite>')
             validate_result(report)
+
+    def test_gfx938_single_and_multi_card_contracts_are_disjoint(self):
+        sys.path.insert(0, str(ROOT / 'tools'))
+        from run_v033_ci import test_files
+
+        single = set(test_files('device-gfx938'))
+        multi = set(test_files('device-gfx938-multi-card'))
+        self.assertTrue(single)
+        self.assertIn('tests/vllm033/gfx938/multi_card/test_rccl_collectives_hcu.py', multi)
+        self.assertTrue(multi.isdisjoint(single))
+        for tier in ['source', 'portable', 'device']:
+            self.assertTrue(multi.isdisjoint(test_files(tier)))
 
     def test_workflow_is_release_scoped_and_keeps_cpu_device_separate(self):
         source = (ROOT / '.github/workflows/hcu-pr-ci-v033.yml').read_text()

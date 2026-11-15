@@ -24,7 +24,11 @@ PUBLIC_SELECTOR_CASES = ('normal', 'optional', 'required', 'commit',
                          'config', 'fork', 'spawn')
 
 
-DEVICE_TIERS = ('device', 'device-gfx938')
+GFX938_DEVICE_DIRS = {
+    'device-gfx938': 'gfx938',
+    'device-gfx938-multi-card': 'gfx938/multi_card',
+}
+DEVICE_TIERS = ('device', *GFX938_DEVICE_DIRS)
 
 
 def _has_hcu_contracts(path):
@@ -50,8 +54,8 @@ def test_files(tier):
     if tier == 'source':
         return SOURCE_TESTS
     directory = ROOT / 'tests/vllm033'
-    if tier == 'device-gfx938':
-        directory = directory / 'gfx938'
+    if tier in GFX938_DEVICE_DIRS:
+        directory = directory / GFX938_DEVICE_DIRS[tier]
     return [p.relative_to(ROOT).as_posix()
             for p in sorted(directory.glob('test_*.py'))
             if p.relative_to(ROOT).as_posix() != PUBLIC_SELECTOR_TEST
@@ -112,12 +116,33 @@ def validate_result(path):
         raise ValueError('empty, skipped/xfail, failed or errored v0.33 tier; not a pass')
 
 
+def _require_gfx938_cards(expected, environment):
+    subprocess.run([sys.executable, '-B', '-c', """
+import sys
+import torch
+
+expected = int(sys.argv[1])
+actual = torch.cuda.device_count()
+if actual != expected:
+    raise SystemExit(f'K8s allocated {actual} visible cards; expected {expected}')
+for device in range(actual):
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(':', 1)[0]
+    if arch != 'gfx938':
+        raise SystemExit(f'K8s card {device}: expected gfx938, got {arch}')
+print(f'K8s allocation verified: {actual} gfx938 card(s)', flush=True)
+""", str(expected)], cwd=ROOT, env=environment, check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--tier', choices=('source', 'portable', 'device', 'device-gfx938'), required=True)
+    parser.add_argument('--tier', choices=('source', 'portable', *DEVICE_TIERS), required=True)
     parser.add_argument('--list', action='store_true')
+    parser.add_argument('--expected-cards', type=int, choices=(1, 2, 4, 8),
+                        help='Verify the exact gfx938 allocation from the runner pool')
     parser.add_argument('--junit', type=Path, default=Path('v033-results.xml'))
     args = parser.parse_args()
+    if args.expected_cards is not None and args.tier not in GFX938_DEVICE_DIRS:
+        parser.error('--expected-cards requires a gfx938 device tier')
     files = test_files(args.tier)
     if args.list:
         print(json.dumps(files)); return 0
@@ -140,6 +165,8 @@ def main():
         # Small CI suites do not need the default compiler sidecar pool. Its
         # interpreter startup can still run Adapter bootstrap during pytest exit.
         environment.setdefault('TORCHINDUCTOR_COMPILE_THREADS', '1')
+        if args.expected_cards is not None:
+            _require_gfx938_cards(args.expected_cards, environment)
         # Image must already contain ABI-matched Core, Adapter and vendor wheels.
         # Install only this independent Plugin project, not repository-root setup.py.
         if args.tier in DEVICE_TIERS:

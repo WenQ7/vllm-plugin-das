@@ -92,7 +92,8 @@ class ReleaseGateTests(unittest.TestCase):
         cls.script = textwrap.dedent(block.split('run: |\n', 1)[1])
         cls.good = dict(SELECT_RESULT='success', HAS_JOBS='true', SOURCE_RESULT='success',
                         AUTH_RESULT='success', AUTHORIZED='true',
-                        IMAGE_RESULT='success', DEVICE_RESULT='success', GFX938_RESULT='success')
+                        IMAGE_RESULT='success', DEVICE_RESULT='success', GFX938_RESULT='success',
+                        HCU_CI_V033_K8S_MODE='legacy', GFX938_K8S_RESULT='skipped')
 
     def gate(self, **overrides):
         return subprocess.run(['bash', '--noprofile', '--norc', '-e', '-c', self.script],
@@ -104,6 +105,23 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(self.gate(HAS_JOBS='false', SOURCE_RESULT='skipped',
                                   AUTH_RESULT='skipped', AUTHORIZED='',
                                   IMAGE_RESULT='skipped', DEVICE_RESULT='skipped', GFX938_RESULT='skipped'), 0)
+
+    def test_compare_keeps_the_legacy_gfx938_gate(self):
+        self.assertEqual(self.gate(HCU_CI_V033_K8S_MODE='compare',
+                                   GFX938_K8S_RESULT='failure'), 0)
+        self.assertNotEqual(self.gate(HCU_CI_V033_K8S_MODE='compare',
+                                      GFX938_RESULT='failure',
+                                      GFX938_K8S_RESULT='success'), 0)
+
+    def test_k8s_cutover_requires_the_card_matrix_to_pass(self):
+        common = dict(HCU_CI_V033_K8S_MODE='k8s', GFX938_RESULT='skipped')
+        self.assertEqual(self.gate(**common, GFX938_K8S_RESULT='success'), 0)
+        for result in ['failure', 'cancelled', 'skipped', '']:
+            with self.subTest(result=result):
+                self.assertNotEqual(self.gate(**common, GFX938_K8S_RESULT=result), 0)
+        self.assertNotEqual(self.gate(**common, GFX938_K8S_RESULT='success',
+                                      DEVICE_RESULT='failure'), 0)
+        self.assertNotEqual(self.gate(HCU_CI_V033_K8S_MODE='unknown'), 0)
 
     def test_failed_cancelled_skipped_or_unauthorized_selected_stage_fails(self):
         for field in ['SELECT_RESULT', 'SOURCE_RESULT', 'AUTH_RESULT',

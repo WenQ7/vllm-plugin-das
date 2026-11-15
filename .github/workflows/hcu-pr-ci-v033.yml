@@ -15,9 +15,13 @@ concurrency:
   group: hcu-v033-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+env:
+  HCU_CI_V033_K8S_MODE: ${{ vars.HCU_CI_V033_K8S_MODE || 'legacy' }}
+
 jobs:
   select:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     outputs:
@@ -60,6 +64,7 @@ jobs:
     needs: select
     if: needs.select.outputs.has_jobs == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -92,6 +97,7 @@ jobs:
     needs: select
     if: needs.select.outputs.has_jobs == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
       issues: read
@@ -127,6 +133,7 @@ jobs:
     needs: [select, authorize-device]
     if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       image: ${{ steps.image.outputs.image }}
     steps:
@@ -191,7 +198,10 @@ jobs:
 
   v033-device-gfx938:
     needs: [select, authorize-device, resolve-device-image]
-    if: needs.select.outputs.has_jobs == 'true' && needs.authorize-device.outputs.authorized == 'true'
+    if: >-
+      needs.select.outputs.has_jobs == 'true' &&
+      needs.authorize-device.outputs.authorized == 'true' &&
+      vars.HCU_CI_V033_K8S_MODE != 'k8s'
     runs-on: [self-hosted, ci, bw1100]
     permissions:
       contents: read
@@ -219,10 +229,61 @@ jobs:
           name: v033-device-gfx938
           path: v033-device.xml
 
+  v033-device-gfx938-k8s:
+    name: v033-device-gfx938-k8s (${{ matrix.cards }}card)
+    needs: [select, authorize-device, resolve-device-image]
+    if: >-
+      needs.select.outputs.has_jobs == 'true' &&
+      needs.authorize-device.outputs.authorized == 'true' &&
+      (vars.HCU_CI_V033_K8S_MODE == 'compare' || vars.HCU_CI_V033_K8S_MODE == 'k8s')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cards: 1
+            tier: device-gfx938
+            timeout_minutes: 60
+          - cards: 2
+            tier: device-gfx938-multi-card
+            timeout_minutes: 90
+    runs-on: hygon-bw1100-${{ matrix.cards }}card
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.resolve-device-image.outputs.image }}
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Run installed device contracts on the assigned cards
+        env:
+          HCU_TEST_TIER: ${{ matrix.tier }}
+          HCU_EXPECTED_CARDS: ${{ matrix.cards }}
+        run: |
+          test "${HCU_CI_IN_K8S:-}" = 1
+          source /opt/dtk/env.sh
+          python -I tools/run_v033_ci.py --tier "$HCU_TEST_TIER" \
+            --expected-cards "$HCU_EXPECTED_CARDS" --junit v033-device.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v033-device-gfx938-k8s-${{ matrix.cards }}card
+          path: v033-device.xml
+          retention-days: 30
+
   v033-ci-gate:
     if: always()
-    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938]
+    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938, v033-device-gfx938-k8s]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       SELECT_RESULT: ${{ needs.select.result }}
       HAS_JOBS: ${{ needs.select.outputs.has_jobs }}
@@ -231,6 +292,7 @@ jobs:
       AUTHORIZED: ${{ needs.authorize-device.outputs.authorized }}
       IMAGE_RESULT: ${{ needs.resolve-device-image.result }}
       GFX938_RESULT: ${{ needs.v033-device-gfx938.result }}
+      GFX938_K8S_RESULT: ${{ needs.v033-device-gfx938-k8s.result }}
       DEVICE_RESULT: ${{ needs.v033-device-gfx936.result }}
     steps:
       - name: Require each selected stage to pass
@@ -244,4 +306,9 @@ jobs:
             echo 'Selected HCU tests require a trusted author or trusted ready-hcu authorization' >&2
             exit 1
           fi
-          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success && "$GFX938_RESULT" == success ]] || exit 1
+          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success ]] || exit 1
+          case "$HCU_CI_V033_K8S_MODE" in
+            legacy|compare) [[ "$GFX938_RESULT" == success ]] ;;
+            k8s) [[ "$GFX938_K8S_RESULT" == success ]] ;;
+            *) echo 'HCU_CI_V033_K8S_MODE must be legacy, compare or k8s' >&2; exit 2 ;;
+          esac

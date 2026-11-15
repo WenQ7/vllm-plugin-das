@@ -99,8 +99,19 @@ class ImagePolicyTests(unittest.TestCase):
                     self.assertNotIn(forbidden, block)
         self.assertIn('needs: select\n', job_block(self.source, 'v033-source-contract'))
 
+    def test_k8s_uses_approved_container_without_host_overrides(self):
+        device = job_block(self.source, 'v033-device-gfx938-k8s')
+        self.assertIn('runs-on: hygon-bw1100-${{ matrix.cards }}card', device)
+        self.assertIn('timeout-minutes: ${{ matrix.timeout_minutes }}', device)
+        self.assertIn('image: ${{ needs.resolve-device-image.outputs.image }}', device)
+        self.assertIn("needs.authorize-device.outputs.authorized == 'true'", device)
+        for forbidden in ['options:', 'volumes:', 'VISIBLE_DEVICES',
+                          'docker ', '--privileged', '/dev/dri', '/dev/kfd']:
+            self.assertNotIn(forbidden, device)
+
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
-        for name in ['select', 'v033-source-contract', 'v033-device-gfx936', 'v033-device-gfx938']:
+        for name in ['select', 'v033-source-contract', 'v033-device-gfx936',
+                     'v033-device-gfx938', 'v033-device-gfx938-k8s']:
             with self.subTest(job=name):
                 block = job_block(self.source, name)
                 self.assertIn('    permissions:\n      contents: read\n', block)

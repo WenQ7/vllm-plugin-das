@@ -8,6 +8,9 @@
     "v033-device-gfx938": {
       "scope": "installed-wheel Channel-FP8 DeepGEMM numerical contract"
     },
+    "v033-device-gfx938-k8s": {
+      "scope": "ARC comparison or cutover: one-card numerics and two-card RCCL collectives"
+    },
     "v033-device-gfx936": {
       "scope": "installed-wheel HCU operator and Graph contracts"
     }
@@ -38,6 +41,7 @@
   "fallback_jobs": [
     "v033-source-contract",
     "v033-device-gfx936",
-    "v033-device-gfx938"
+    "v033-device-gfx938",
+    "v033-device-gfx938-k8s"
   ]
 }

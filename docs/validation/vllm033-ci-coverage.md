@@ -10,12 +10,12 @@ independent `hcu-test-map-v033.json`. The default CLI, legacy map, registry and
 workflows retain the v0.28.1 behavior. It never sends v0.33 changes to legacy
 vllm_hcu jobs or substitutes the v0.28.1 image.
 
-Every mapped code change selects `v033-source-contract` and
-`v033-device-gfx936`. Every unmapped non-documentation path selects both and is
-reported in `unmapped_paths` with `fallback=true`. Deleted paths are included
-in release diff selection. Documentation alone selects no jobs; `--full` and
+Every mapped code change selects the v0.33 source and device contracts.
+Every unmapped non-documentation path selects the same scope and is reported in
+`unmapped_paths` with `fallback=true`. Deleted paths are included in release
+diff selection. Documentation alone selects no jobs; `--full` and
 `--accuracy` expand to the full declared v0.33 scope even for empty/doc diffs.
-The CI selector/map/workflow and test tooling themselves select both jobs.
+The CI selector/map/workflow and test tooling also select the full scope.
 An explicit `--config` is passed to the selected release's parser; the default
 map is chosen by release only when no override is provided. Invalid overrides
 fail selection rather than silently using the built-in map.
@@ -77,17 +77,44 @@ requires reviewed pre-existing runner registry authentication or credentials
 available to that event. The credentials declaration does not prove pull success.
 Missing authorization or pull access remains a failure; do not switch to
 `pull_request_target`, expose secrets to PR code, or let a PR head authorize itself.
-The container mounts `/opt/hyhal` read-only and uses the existing
-`scripts/ci/hcu/hcu_ci_start_container.sh` default 32GiB shared-memory policy
-without privileged mode.
-The hosted selector/source jobs receive no Harbor secrets or HCU device mounts.
-PR-code jobs use read-only contents permissions and every checkout disables
-persisted git credentials, including the source job's separate official checkout.
+### ARC rollout for BW1100 / gfx938
+
+Set the repository Actions variable `HCU_CI_V033_K8S_MODE` to choose the runner
+for gfx938:
+
+| Mode | gfx938 execution | Required by `v033-ci-gate` |
+| --- | --- | --- |
+| Unset or `legacy` | Existing BW1100 runner | Legacy gfx938 job |
+| `compare` | Legacy job plus ARC one- and two-card jobs | Legacy gfx938 job; review the ARC job results separately |
+| `k8s` | ARC one- and two-card jobs | Both ARC matrix entries must pass |
+
+Start with `compare` and compare the same DeepGEMM numerical contract on the same
+image digest before switching to `k8s`. The ARC jobs run inside the resolved
+job container: no nested Docker, manual device mappings, mounts, or visibility
+mask. The runner verifies the visible card count and architecture. The existing
+BW1000/gfx936 job (including its portable tier), authorization and CPU source
+gate remain on their existing runners. The legacy device containers retain the
+read-only `/opt/hyhal` mount and 32 GiB shared memory.
+
+| ARC pool | Workload | Job timeout |
+| --- | --- | --- |
+| `hygon-bw1100-1card` | Existing Channel-FP8 DeepGEMM numerics | 60 min |
+| `hygon-bw1100-2card` | Single-node RCCL all-gather and all-reduce on two ranks | 90 min |
+
+The two-card job is a communication smoke test. There are no v0.33 four- or
+eight-card model cases in this workflow. Add entries for
+`hygon-bw1100-4card` or `hygon-bw1100-8card` only when the corresponding workloads
+exist; keep long suites out of the PR workflow. Job timeouts do not give
+GitHub's queued state a deadline. ARC also has its own Pod startup limits.
+JUnit reports from the ARC entries have separate artifact names and 30-day
+retention. The hosted selector/source jobs receive no Harbor secrets or
+HCU devices. PR-code jobs use read-only contents permissions and disable
+persisted git credentials, including the official source checkout.
+
 A configured digest is not evidence that the image or hardware tier passed.
-The runner must provide the host `/opt/hyhal` runtime, gfx936 devices
-and the normal prepared DTK environment. This candidate does not create or
-validate such an image, allocate runner resources, or certify models and
-other HCU architectures. Image/wheel provenance, model quality, performance
+Each device pool must provide its documented runtime, the requested devices,
+and access to the prepared DTK image. This workflow does not create an image
+or certify models and other HCU architectures. Image/wheel provenance, model quality, performance
 and the remaining release matrix remain separate acceptance gates.
 
 Installed tiers use the existing `packaging` dependency to parse PEP 440 epoch
