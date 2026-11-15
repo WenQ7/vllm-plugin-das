@@ -73,6 +73,30 @@ class MixedTierContracts(unittest.TestCase):
             self.assertEqual(self.run_tier(tier).kwargs['env'].get(
                 'HCU_V033_VERIFY_INSTALLED'), '1')
 
+    def test_model_uses_one_selected_test_and_requires_matching_card_count(self):
+        argv = ['run_v033_ci.py', '--tier', 'model', '--model-case', 'qwen35-tp4-ep4']
+        with patch.object(sys, 'argv', [*argv, '--expected-cards', '2']), \
+                patch.object(RUNNER.subprocess, 'run') as run:
+            with self.assertRaises(SystemExit) as error:
+                RUNNER.main()
+            self.assertEqual(error.exception.code, 2)
+            run.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(sys, 'argv', [*argv, '--expected-cards', '4',
+                                          '--junit', str(Path(root) / 'pytest.xml')]), \
+                patch.object(RUNNER, '_installed_vllm', return_value=('0.33.0', '/installed')), \
+                patch.object(RUNNER, '_vllm_release', return_value=(0, 33, 0)), \
+                patch.object(RUNNER, '_require_gfx938_cards') as preflight, \
+                patch.object(RUNNER, 'validate_result'), \
+                patch.object(RUNNER.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.assertEqual(RUNNER.main(), 0)
+            self.assertEqual(preflight.call_args.args[0], 4)
+            call = next(call for call in run.call_args_list if 'pytest' in call.args[0])
+            self.assertIn('tests/vllm033/models/test_v033_models.py::test_tp_ep[qwen35-tp4-ep4]', call.args[0])
+            self.assertEqual(call.kwargs['env']['VLLM_PLUGINS'], 'hcu_adapter')
+            self.assertEqual(call.kwargs['env']['HF_HUB_OFFLINE'], '1')
+
     def test_source_discards_inherited_installed_guard(self):
         with patch.dict(os.environ, {'HCU_V033_VERIFY_INSTALLED': '1',
                                      'VLLM_TARGET_ROOT': '/source'}):

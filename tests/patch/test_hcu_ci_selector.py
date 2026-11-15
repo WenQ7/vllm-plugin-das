@@ -290,6 +290,7 @@ def test_every_hcu_marked_test_file_is_registered() -> None:
         ("device", "v033-device-gfx936"),
         ("device-gfx938", "v033-device-gfx938"),
         ("device-gfx938-multi-card", "v033-device-gfx938-k8s"),
+        ("model", "v033-models-k8s"),
     ]:
         for path in v033_test_files(tier):
             assert job_id in {job["id"] for job in select_v033([path])["jobs"]}

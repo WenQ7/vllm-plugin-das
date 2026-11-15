@@ -101,15 +101,43 @@ read-only `/opt/hyhal` mount and 32 GiB shared memory.
 | `hygon-bw1100-1card` | Existing Channel-FP8 DeepGEMM numerics | 60 min |
 | `hygon-bw1100-2card` | Single-node RCCL all-gather and all-reduce on two ranks | 90 min |
 
-The two-card job is a communication smoke test. There are no v0.33 four- or
-eight-card model cases in this workflow. Add entries for
-`hygon-bw1100-4card` or `hygon-bw1100-8card` only when the corresponding workloads
-exist; keep long suites out of the PR workflow. Job timeouts do not give
-GitHub's queued state a deadline. ARC also has its own Pod startup limits.
+The two-card device contract is a communication smoke test, separate from
+real model checks. Job timeouts do not give GitHub's queued state a deadline;
+ARC also has its own Pod startup limits.
+
 JUnit reports from the ARC entries have separate artifact names and 30-day
 retention. The hosted selector/source jobs receive no Harbor secrets or
 HCU devices. PR-code jobs use read-only contents permissions and disable
 persisted git credentials, including the official source checkout.
+
+### Real-model checks in v0.33 PR CI
+
+For a selected executable change, the authorized `v033-models-k8s` matrix runs
+in the same immutable v0.33 image, regardless of the device comparison mode.
+The existing gate requires the model matrix to pass. This uses the v0.33
+Core/Adapter/Plugin path and never installs the v0.28.1 project.
+
+| ARC pool | Checks | Job timeout |
+| --- | --- | --- |
+| `hygon-bw1100-1card` | Qwen3.5-9B and Qwen3-8B GSM8K; Qwen3-4B LoRA A → B → A | GSM8K 90 min; LoRA 60 min |
+| `hygon-bw1100-2card` | Qwen3.5-35B-A3B TP2/EP2 | 90 min |
+| `hygon-bw1100-4card` | Qwen3.5-35B-A3B TP4/EP4 | 90 min |
+| `hygon-bw1100-8card` | DeepSeek-R1 Channel-INT8 TP8/EP8; DeepSeek-R1 Channel-FP8 GSM8K | TP/EP 240 min; GSM8K 360 min |
+
+GSM8K uses the fixed first 100 test questions and the 95% pass threshold,
+including exact prediction, review and report counts. EvalScope 1.9.1 is
+installed in the disposable evaluation job only, with the Core and Adapter
+packages protected. TP/EP checks the live engine topology and token generation
+using v0.33's backend selection. It does not force v0.28.1-specific kernels.
+
+The pools supply read-only model storage. By default model paths are looked up
+under `/public/opendas/DL_DATA/llm-models` and
+`/public4/opendas/DL_DATA/llm-models`; GSM8K expects local train/test parquet
+under the corresponding `ci_datasets/gsm8k` path. Configure
+`HCU_CI_V033_MODEL_ROOTS` (colon-separated) or `HCU_CI_V033_GSM8K_PATH` only
+when the pool uses a different layout. Missing resources fail the check;
+the workflow does not download models or data. The model reports, logs and
+JUnit files are uploaded as GitHub artifacts for 30 days.
 
 A configured digest is not evidence that the image or hardware tier passed.
 Each device pool must provide its documented runtime, the requested devices,
@@ -140,8 +168,7 @@ The upgrade audit preserves the original zero-job probe and the first full
 regression failure: the old global registration assertion did not recognize
 three existing v0.33 HCU-marked files. The candidate accounts for them via the
 actual release runner rather than weakening registration for other files.
-No GPU job, remote CI, image publication, push or PR is claimed by these local
-CPU results.
+Local CPU results do not certify the ARC pool, model or hardware tests.
 
 The integration follow-up incorporates the merged optional SlimQuant format
 from MR363. Its generic public Core PLE interface remains an enablement and

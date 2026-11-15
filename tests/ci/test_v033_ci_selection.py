@@ -14,7 +14,7 @@ from select_hcu_tests import _load_config, _git_changed_paths, DEFAULT_CONFIG, s
 
 EXPECTED = {
     'v033-source-contract', 'v033-device-gfx936',
-    'v033-device-gfx938', 'v033-device-gfx938-k8s',
+    'v033-device-gfx938', 'v033-device-gfx938-k8s', 'v033-models-k8s',
 }
 
 
@@ -71,7 +71,15 @@ class SelectionTests(unittest.TestCase):
                 '--release', 'v0.33.0', '--paths-from', str(paths), '--github-output', str(output)],
                 capture_output=True, text=True, check=True)
             self.assertEqual({j['id'] for j in json.loads(result.stdout)['jobs']}, EXPECTED)
-            self.assertIn('has_jobs=true', output.read_text())
+            outputs = dict(line.split('=', 1) for line in output.read_text().splitlines())
+        self.assertEqual(outputs['has_jobs'], 'true')
+        matrix = json.loads(outputs['model_matrix'])
+        self.assertEqual({case['id']: case['cards'] for case in matrix}, {
+            'qwen35-gsm8k': 1, 'qwen3-8b-gsm8k': 1, 'lora': 1,
+            'qwen35-tp2-ep2': 2, 'qwen35-tp4-ep4': 4,
+            'deepseek-tp8-ep8': 8, 'deepseek-gsm8k': 8,
+        })
+        self.assertEqual(select_jobs(['README.md'])['model_matrix'], [])
 
     def test_cli_uses_explicit_release_config_and_rejects_invalid_config(self):
         with tempfile.TemporaryDirectory() as directory:

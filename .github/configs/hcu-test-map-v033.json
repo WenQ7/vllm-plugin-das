@@ -11,10 +11,76 @@
     "v033-device-gfx938-k8s": {
       "scope": "ARC comparison or cutover: one-card numerics and two-card RCCL collectives"
     },
+    "v033-models-k8s": {
+      "scope": "installed v0.33 model regressions: GSM8K, LoRA and TP/EP"
+    },
     "v033-device-gfx936": {
       "scope": "installed-wheel HCU operator and Graph contracts"
     }
   },
+  "model_cases": [
+    {
+      "id": "qwen35-gsm8k",
+      "kind": "gsm8k",
+      "cards": 1,
+      "timeout_minutes": 90,
+      "model": "qwen3.5/Qwen3.5-9B",
+      "config": "qwen35_9b_gsm8k_evalscope.yaml"
+    },
+    {
+      "id": "qwen3-8b-gsm8k",
+      "kind": "gsm8k",
+      "cards": 1,
+      "timeout_minutes": 90,
+      "model": "qwen3/Qwen3-8B",
+      "config": "qwen3_8b_gsm8k_evalscope.yaml"
+    },
+    {
+      "id": "lora",
+      "kind": "lora",
+      "cards": 1,
+      "timeout_minutes": 60,
+      "model": "qwen3/Qwen3-4B",
+      "adapters": [
+        "lora/TanXS/Qwen3-4B-LoRA-ZH-WebNovelty-v0.0",
+        "lora/nissenj/Qwen3-4B-lora-v2"
+      ]
+    },
+    {
+      "id": "qwen35-tp2-ep2",
+      "kind": "tp_ep",
+      "cards": 2,
+      "timeout_minutes": 90,
+      "model": "qwen3.5/Qwen3.5-35B-A3B",
+      "gpu_memory_utilization": 0.4
+    },
+    {
+      "id": "qwen35-tp4-ep4",
+      "kind": "tp_ep",
+      "cards": 4,
+      "timeout_minutes": 90,
+      "model": "qwen3.5/Qwen3.5-35B-A3B",
+      "gpu_memory_utilization": 0.4
+    },
+    {
+      "id": "deepseek-tp8-ep8",
+      "kind": "tp_ep",
+      "cards": 8,
+      "timeout_minutes": 240,
+      "model": "vllm-w8a8-models/DeepSeek-R1-0528-Channel-INT8-w8a8",
+      "gpu_memory_utilization": 0.6,
+      "quantization": "compressed-tensors"
+    },
+    {
+      "id": "deepseek-gsm8k",
+      "kind": "gsm8k",
+      "cards": 8,
+      "timeout_minutes": 360,
+      "model": "DeepSeek-R1-Channel-FP8-w8a8",
+      "config": "deepseek_r1_gsm8k_evalscope.yaml",
+      "quantization": "compressed-tensors"
+    }
+  ],
   "groups": {
     "v033-package": [
       "adapter_extension/**"
@@ -42,6 +108,7 @@
     "v033-source-contract",
     "v033-device-gfx936",
     "v033-device-gfx938",
-    "v033-device-gfx938-k8s"
+    "v033-device-gfx938-k8s",
+    "v033-models-k8s"
   ]
 }

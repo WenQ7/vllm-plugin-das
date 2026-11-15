@@ -10,6 +10,7 @@ import argparse
 import ast
 import json
 import os
+import runpy
 from pathlib import Path
 import subprocess
 import sys
@@ -28,7 +29,34 @@ GFX938_DEVICE_DIRS = {
     'device-gfx938': 'gfx938',
     'device-gfx938-multi-card': 'gfx938/multi_card',
 }
-DEVICE_TIERS = ('device', *GFX938_DEVICE_DIRS)
+DEVICE_TIERS = ('device', *GFX938_DEVICE_DIRS, 'model')
+MODEL_TEST_FILE = 'tests/vllm033/models/test_v033_models.py'
+MODEL_MAP = ROOT / '.github/configs/hcu-test-map-v033.json'
+
+
+def load_model_cases():
+    return json.loads(MODEL_MAP.read_text(encoding='utf-8'))['model_cases']
+
+
+def _model_target(case):
+    return f"{MODEL_TEST_FILE}::test_{case['kind']}[{case['id']}]"
+
+
+def _setup_model_job(case, report, environment):
+    artifact_dir = report.resolve().parent
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    environment.update(
+        HCU_V033_MODEL_ARTIFACTS=str(artifact_dir),
+        VLLM_HCU_INTEGRATION_LOG_DIR=str(artifact_dir / 'model-logs'),
+        HF_HUB_OFFLINE='1', HF_DATASETS_OFFLINE='1', TRANSFORMERS_OFFLINE='1',
+    )
+    if case['kind'] != 'gsm8k':
+        return
+    bootstrap = runpy.run_path(str(ROOT / '.github/scripts/hcu_ci/ensure_evalscope.py'))
+    bootstrap['ensure_evalscope'](
+        [{'kind': 'distribution', 'name': 'evalscope', 'match': 'exact', 'version': '1.9.1'}],
+        extra_protected_distributions=('hcu-adapter', 'sgl-kernel', 'hcu-vllm-das-plugin'),
+    )
 
 
 def _has_hcu_contracts(path):
@@ -53,6 +81,8 @@ def _has_hcu_contracts(path):
 def test_files(tier):
     if tier == 'source':
         return SOURCE_TESTS
+    if tier == 'model':
+        return [MODEL_TEST_FILE]
     directory = ROOT / 'tests/vllm033'
     if tier in GFX938_DEVICE_DIRS:
         directory = directory / GFX938_DEVICE_DIRS[tier]
@@ -137,13 +167,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tier', choices=('source', 'portable', *DEVICE_TIERS), required=True)
     parser.add_argument('--list', action='store_true')
+    parser.add_argument('--model-case', help='ID of a v0.33 model matrix entry')
     parser.add_argument('--expected-cards', type=int, choices=(1, 2, 4, 8),
                         help='Verify the exact gfx938 allocation from the runner pool')
     parser.add_argument('--junit', type=Path, default=Path('v033-results.xml'))
     args = parser.parse_args()
-    if args.expected_cards is not None and args.tier not in GFX938_DEVICE_DIRS:
+    model_case = None
+    if args.tier == 'model':
+        model_case = next((case for case in load_model_cases()
+                           if case['id'] == args.model_case), None)
+        if model_case is None:
+            parser.error('model tier requires a known --model-case')
+        if args.expected_cards != model_case['cards']:
+            parser.error('--expected-cards must match the selected model case')
+    elif args.model_case is not None:
+        parser.error('--model-case requires the model tier')
+    if args.expected_cards is not None and args.tier not in (*GFX938_DEVICE_DIRS, 'model'):
         parser.error('--expected-cards requires a gfx938 device tier')
-    files = test_files(args.tier)
+    files = [_model_target(model_case)] if model_case else test_files(args.tier)
     if args.list:
         print(json.dumps(files)); return 0
     if not files:
@@ -180,6 +221,8 @@ def main():
         subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps',
                         '--no-build-isolation', '--force-reinstall',
                         str(ROOT / 'adapter_extension')], env=environment, cwd=ROOT, check=True)
+        if model_case is not None:
+            _setup_model_job(model_case, args.junit, environment)
         if args.tier == 'portable':
             environment['VLLM_TARGET_ROOT'] = installed_root
             _run_public_selector_cases(environment)

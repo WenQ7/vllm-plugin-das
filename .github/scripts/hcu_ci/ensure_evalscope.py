@@ -25,7 +25,11 @@ def _installed(name: str) -> str | None:
         return None
 
 
-def ensure_evalscope(requirements: list[dict]) -> bool:
+def ensure_evalscope(
+    requirements: list[dict],
+    *,
+    extra_protected_distributions: tuple[str, ...] = (),
+) -> bool:
     requested = [
         item for item in requirements
         if item.get("kind") == "distribution" and item.get("name") == "evalscope"
@@ -45,7 +49,7 @@ def ensure_evalscope(requirements: list[dict]) -> bool:
 
     before = {
         name: installed
-        for name in PROTECTED_DISTRIBUTIONS
+        for name in (*PROTECTED_DISTRIBUTIONS, *extra_protected_distributions)
         if (installed := _installed(name)) is not None
     }
     with tempfile.TemporaryDirectory(prefix="hcu-ci-evalscope-") as temporary:

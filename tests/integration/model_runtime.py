@@ -375,10 +375,15 @@ def run_vllm_case(
     extra_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
     log_label: str | None = None,
+    vllm_plugins: str | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
-    env.pop("VLLM_PLUGINS", None)
-    env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
+    if vllm_plugins is None:
+        env.pop("VLLM_PLUGINS", None)
+        env["VLLM_HCU_USE_FLASH_ATTN_UNIFIED"] = "1"
+    else:
+        env["VLLM_PLUGINS"] = vllm_plugins
+        env.pop("VLLM_HCU_USE_FLASH_ATTN_UNIFIED", None)
     env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     env.setdefault("PYTHONUNBUFFERED", "1")
     if gpu_memory_utilization is not None:
@@ -1387,6 +1392,9 @@ def _case_tp_ep_smoke_rank(
         if all2all_backend is not None
         else {}
     )
+    quantization = os.environ.get("VLLM_HCU_TEST_TP_EP_QUANTIZATION")
+    if quantization:
+        all2all_kwargs["quantization"] = quantization
     llm = _create_llm(
         **_llm_kwargs(
             model_path,

@@ -329,6 +329,8 @@ def _write_github_outputs(path: Path, payload: dict[str, Any]) -> None:
             "fallback": str(payload["fallback"]).lower(),
         }
     )
+    if "model_matrix" in payload:
+        values["model_matrix"] = json.dumps(payload["model_matrix"], separators=(",", ":"))
     with path.open("a", encoding="utf-8") as stream:
         for name, value in values.items():
             stream.write(f"{name}={value}\n")

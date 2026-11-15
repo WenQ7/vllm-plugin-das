@@ -111,7 +111,7 @@ class ImagePolicyTests(unittest.TestCase):
 
     def test_pr_code_jobs_do_not_persist_checkout_credentials(self):
         for name in ['select', 'v033-source-contract', 'v033-device-gfx936',
-                     'v033-device-gfx938', 'v033-device-gfx938-k8s']:
+                     'v033-device-gfx938', 'v033-device-gfx938-k8s', 'v033-models-k8s']:
             with self.subTest(job=name):
                 block = job_block(self.source, name)
                 self.assertIn('    permissions:\n      contents: read\n', block)

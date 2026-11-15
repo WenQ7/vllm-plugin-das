@@ -26,6 +26,7 @@ jobs:
       contents: read
     outputs:
       has_jobs: ${{ steps.select.outputs.has_jobs }}
+      model_matrix: ${{ steps.select.outputs.model_matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -279,9 +280,54 @@ jobs:
           path: v033-device.xml
           retention-days: 30
 
+  v033-models-k8s:
+    name: v033-models-k8s (${{ matrix.id }})
+    needs: [select, authorize-device, resolve-device-image]
+    if: >-
+      needs.select.outputs.has_jobs == 'true' &&
+      needs.authorize-device.outputs.authorized == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.model_matrix) }}
+    runs-on: hygon-bw1100-${{ matrix.cards }}card
+    timeout-minutes: ${{ matrix.timeout_minutes }}
+    permissions:
+      contents: read
+    container:
+      image: ${{ needs.resolve-device-image.outputs.image }}
+      credentials:
+        username: ${{ secrets.HARBOR_USERNAME }}
+        password: ${{ secrets.HARBOR_PASSWORD }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Run the selected installed v0.33 model regression
+        env:
+          HCU_MODEL_CASE: ${{ matrix.id }}
+          HCU_EXPECTED_CARDS: ${{ matrix.cards }}
+          HCU_CI_V033_MODEL_ROOTS: ${{ vars.HCU_CI_V033_MODEL_ROOTS }}
+          HCU_CI_V033_GSM8K_PATH: ${{ vars.HCU_CI_V033_GSM8K_PATH }}
+        run: |
+          test "${HCU_CI_IN_K8S:-}" = 1
+          source /opt/dtk/env.sh
+          python -I tools/run_v033_ci.py --tier model --model-case "$HCU_MODEL_CASE" \
+            --expected-cards "$HCU_EXPECTED_CARDS" --junit v033-model-results/pytest.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v033-model-${{ matrix.id }}
+          path: v033-model-results/
+          retention-days: 30
+
   v033-ci-gate:
     if: always()
-    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938, v033-device-gfx938-k8s]
+    needs: [select, v033-source-contract, authorize-device, resolve-device-image, v033-device-gfx936, v033-device-gfx938, v033-device-gfx938-k8s, v033-models-k8s]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -294,6 +340,7 @@ jobs:
       GFX938_RESULT: ${{ needs.v033-device-gfx938.result }}
       GFX938_K8S_RESULT: ${{ needs.v033-device-gfx938-k8s.result }}
       DEVICE_RESULT: ${{ needs.v033-device-gfx936.result }}
+      MODEL_RESULT: ${{ needs.v033-models-k8s.result }}
     steps:
       - name: Require each selected stage to pass
         run: |
@@ -306,7 +353,7 @@ jobs:
             echo 'Selected HCU tests require a trusted author or trusted ready-hcu authorization' >&2
             exit 1
           fi
-          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success ]] || exit 1
+          [[ "$IMAGE_RESULT" == success && "$DEVICE_RESULT" == success && "$MODEL_RESULT" == success ]] || exit 1
           case "$HCU_CI_V033_K8S_MODE" in
             legacy|compare) [[ "$GFX938_RESULT" == success ]] ;;
             k8s) [[ "$GFX938_K8S_RESULT" == success ]] ;;
