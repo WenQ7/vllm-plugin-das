@@ -25,6 +25,7 @@ class Step5LLTPTokenBuffer:
         self._direct_tp_output = (
             os.environ.get("HCU_STEP5_DEEPEP_TP_DIRECT_OUT") == "1"
         )
+        self.defer_tp_result = False
         if self._size != 4:
             raise RuntimeError("Step5 LL token partition requires TP4")
         # Allocate before the first asynchronous transport. One buffer is
@@ -34,6 +35,21 @@ class Step5LLTPTokenBuffer:
             dtype=torch.bfloat16,
             device=torch.cuda.current_device(),
         )
+
+    @property
+    def tp_size(self) -> int:
+        return self._size
+
+    def get_fused_shared_communicator(self, rows: int):
+        if rows != 64 or os.environ.get("VLLM_CUSTOM_ALLREDUCE_ALGO", "2stage") not in (
+            "2stage", "twoshot"
+        ):
+            return None
+        communicator = getattr(self._tp, "device_communicator", None)
+        reduce = getattr(communicator, "ca_comm", None)
+        if reduce is not None and not reduce.disabled and reduce.fully_connected:
+            return reduce
+        return None
 
     def __getattr__(self, name):
         return getattr(self._buffer, name)
@@ -96,7 +112,8 @@ class Step5LLTPTokenBuffer:
         output = kwargs.pop("out", None)
         if output is None or output.shape != (n, x.shape[-1]):
             raise RuntimeError("Step5 LL token partition requires caller-owned output")
-        local = self._local_output[:width]
+        defer_tp_result = self.defer_tp_result
+        local = output[:width] if defer_tp_result else self._local_output[:width]
         _, event, recv_hook = self._buffer.low_latency_combine(
             x,
             topk_idx[start : start + width],
@@ -109,6 +126,8 @@ class Step5LLTPTokenBuffer:
         def gather():
             if recv_hook is not None:
                 recv_hook()
+            if defer_tp_result:
+                return
             if self._direct_tp_output and output.is_contiguous():
                 dist.all_gather_into_tensor(
                     output, local, group=self._tp.device_group

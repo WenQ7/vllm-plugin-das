@@ -41,6 +41,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   ops.def("all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, int reg_buffer_sz_bytes) -> ()");
   ops.impl("all_reduce", torch::kCUDA, &all_reduce);
+  ops.def("step5_tp4_fused_output(int communicator, Tensor routed, Tensor shared, Tensor(a!) out, "
+          "int registered_buffer, int buffer_bytes, float scale) -> ()");
+  ops.impl("step5_tp4_fused_output", torch::kCUDA, &step5_tp4_fused_output);
   ops.def("dispose", &dispose);
   ops.def("meta_size", &meta_size);
   ops.def("register_buffer", &register_buffer);
