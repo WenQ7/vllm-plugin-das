@@ -505,14 +505,17 @@ def test_gemma_rmsnorm_uses_new_out_keyword(
         gemma_rmsnorm=gemma_rmsnorm,
         gemma_fused_add_rmsnorm=lambda *args: None,
     )
-    forward = _load_gemma_forward()
-    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    impl = _function(
+        "vllm_hcu/ops/gemma_rms_norm.py", "_hcu_gemma_rms_norm", {"torch": torch}
+    )
     x = torch.ones((2, 4))
-    actual = forward(owner, x)
+    weight = torch.ones(4)
+    epsilon = 1e-6
+    actual = impl(x, weight, epsilon)
 
     assert calls[0][0] is x
-    assert calls[0][1] is owner.weight
-    assert calls[0][2] == owner.variance_epsilon
+    assert calls[0][1] is weight
+    assert calls[0][2] == epsilon
     assert calls[0][3] is actual
 
 
@@ -524,11 +527,12 @@ def test_gemma_rmsnorm_rejects_legacy_only_installation(
     legacy.op = SimpleNamespace(gemma_rmsnorm=lambda *args: args[0])
     monkeypatch.setitem(sys.modules, "lightop", legacy)
     monkeypatch.delitem(sys.modules, "lightop.norm", raising=False)
-    forward = _load_gemma_forward()
-    owner = SimpleNamespace(weight=torch.ones(4), variance_epsilon=1e-6)
+    impl = _function(
+        "vllm_hcu/ops/gemma_rms_norm.py", "_hcu_gemma_rms_norm", {"torch": torch}
+    )
 
     with pytest.raises(ImportError, match="lightop.norm"):
-        forward(owner, torch.ones((2, 4)))
+        impl(torch.ones((2, 4)), torch.ones(4), 1e-6)
 
 
 def test_fuse_silu_quant_prefers_categorized_kernel_and_consumes_result(
@@ -1030,7 +1034,7 @@ def _install_masked_fp8_gemm(
 def _masked_fp8_namespace(logger: _WarningLogger) -> dict[str, object]:
     return {
         "torch": torch,
-        "MoEActivation": SimpleNamespace(SILU="silu"),
+        "MoEActivation": SimpleNamespace(SILU="silu", SWIGLUSTEP="swiglustep"),
         "current_platform": SimpleNamespace(is_rocm=lambda: True),
         "_resize_cache": lambda _cache, shape: torch.empty(shape),
         "logger": logger,
@@ -1040,7 +1044,9 @@ def _masked_fp8_namespace(logger: _WarningLogger) -> dict[str, object]:
 def _masked_fp8_self() -> SimpleNamespace:
     return SimpleNamespace(
         block_shape=None,
-        quant_config=SimpleNamespace(use_int8_w8a8=False, use_fp8_w8a8=True),
+        quant_config=SimpleNamespace(
+            use_int8_w8a8=False, use_fp8_w8a8=True, gemm1_clamp_limit=None
+        ),
         w1_scale="w1-scale",
         w2_scale="w2-scale",
         _hcu_logical_n=4,
