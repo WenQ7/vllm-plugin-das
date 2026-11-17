@@ -52,6 +52,7 @@ from vllm.v1.worker.ubatching import (
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+_step5_shared_dispatch_logger = init_logger("vllm.hcu.step5.shared_dispatch")
 
 # Prefill (>= this many tokens summed over DP ranks; 0 disables): naive DP/EP
 # dispatch -> experts -> combine pipelined over two halves of the source DP
@@ -1305,6 +1306,7 @@ class FusedMoEKernelModularImpl:
         apply_router_weight_on_input: bool,
         prequanted_a1_scale: torch.Tensor | None = None,
         prequanted_a1: bool = False,
+        shared_experts: SharedExperts | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -1391,6 +1393,14 @@ class FusedMoEKernelModularImpl:
             )
 
             if hook is not None:
+                if (
+                    self._hcu_step5_owner
+                    and shared_experts is not None
+                    and shared_experts.run_step5_dispatch_projection()
+                ):
+                    _step5_shared_dispatch_logger.info_once(
+                        "Step5 shared down projection active between DeepEP dispatch send and receive"
+                    )
                 if dbo_enabled():
                     # If DBO is being used, register the hook with the ubatch
                     # context and call it in dbo_maybe_run_recv_hook instead of
@@ -1934,6 +1944,7 @@ class FusedMoEKernelModularImpl:
             apply_router_weight_on_input,
             prequanted_a1_scale=scale,
             prequanted_a1=quanted_hidden_states is not None,
+            shared_experts=shared_experts,
         )
 
         # Stash the original unquantized hidden states on the LoRA context

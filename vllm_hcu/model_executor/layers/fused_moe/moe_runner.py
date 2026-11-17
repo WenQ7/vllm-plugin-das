@@ -8,6 +8,7 @@ import inspect
 import os
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -67,6 +68,14 @@ from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
 )
 
 logger = init_logger(__name__)
+_step5_ipc_logger = init_logger("vllm.hcu.step5.fused_moe")
+
+@lru_cache(maxsize=1)
+def _step5_tp4_output_kernel():
+    import vllm_hcu.hcu_ops
+
+    return torch.ops.hcu_ops.step5_tp4_fused_output
+
 
 # Fold the naive DP combine (reduce-scatter over DP), the shared-expert add and
 # the TP all-reduce into one custom all-reduce over the EP group (see
@@ -386,6 +395,55 @@ direct_register_custom_op(
 )
 
 
+def _step5_moe_forward_output(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    shared_fusion = layer._step5_shared_fusion(hidden_states)
+    shared, routed = layer._forward_impl(
+        hidden_states, router_logits, shared_experts_input, input_ids,
+        quanted_hidden_states=quanted_hidden_states, scale=scale,
+        topk_weights=topk_weights, topk_ids=topk_ids,
+    )
+    if torch._C._is_alias_of(routed, hidden_states):
+        routed = routed.clone()
+    output = layer._finish_forward((shared, routed), shared_fusion)
+    if shared_fusion is not None:
+        _step5_ipc_logger.info_once("Step5 TP4 MoE finalization inside custom op active")
+    return output
+
+
+def _step5_moe_forward_output_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="step5_moe_forward_output",
+    op_func=_step5_moe_forward_output,
+    mutates_args=["hidden_states"],
+    fake_impl=_step5_moe_forward_output_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
@@ -623,6 +681,35 @@ class MoERunner(MoERunnerInterface):
             self._quant_method.moe_kernel is not None
             and self._quant_method.moe_kernel.output_is_reduced()
         )
+
+    def _step5_shared_fusion(self, hidden_states: torch.Tensor):
+        native_tp4 = os.environ.get("HCU_STEP5_TP4_FUSED_OUTPUT") == "1"
+        if not (
+            getattr(self, "_hcu_step5_owner", False)
+            and henvs.optional_custom_op_enabled(native_tp4)
+            and self._shared_experts is not None
+            and not self.enable_dbo
+            and not self.moe_config.is_sequence_parallel
+            and self.moe_config.pcp_size == 1
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and self._quant_method.moe_kernel is not None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[1] == 4096
+            and self._fused_output_is_reduced()
+        ):
+            return None
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_tp_tokens import (
+            Step5LLTPTokenBuffer,
+        )
+
+        prepare = self._quant_method.moe_kernel.prepare_finalize
+        buffer = getattr(prepare, "buffer", None)
+        if not isinstance(buffer, Step5LLTPTokenBuffer):
+            return None
+        communicator = buffer.get_fused_shared_communicator(hidden_states.shape[0])
+        return (buffer, communicator) if communicator is not None else None
 
     def _maybe_reduce_shared_expert_output(
         self,
@@ -886,6 +973,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_quanted_input: tuple[
             torch.Tensor, torch.Tensor
         ] | None = None,
+        deferred_step5_shared_projection: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -910,11 +998,12 @@ class MoERunner(MoERunnerInterface):
                 f"monolithic quant method {type(self._quant_method).__name__}"
             )
 
-        self._maybe_apply_shared_experts(
-            shared_experts_input,
-            SharedExpertsOrder.NO_OVERLAP,
-            x_and_scale_quanted=shared_experts_quanted_input,
-        )
+        if not deferred_step5_shared_projection:
+            self._maybe_apply_shared_experts(
+                shared_experts_input,
+                SharedExpertsOrder.NO_OVERLAP,
+                x_and_scale_quanted=shared_experts_quanted_input,
+            )
         if self._ep_fused_combine:
             _EP_COMBINE.arm(self._shared_experts, shared_experts_input)
 
@@ -968,6 +1057,9 @@ class MoERunner(MoERunnerInterface):
                     **quantized_kwargs,
                 )
 
+        if deferred_step5_shared_projection:
+            assert self._shared_experts is not None
+            self._shared_experts.run_step5_dispatch_projection()
         self._maybe_apply_shared_experts(
             shared_experts_input,
             SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
@@ -1090,6 +1182,24 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
+        if (
+            getattr(self, "_hcu_step5_owner", False)
+            and self._shared_experts is not None
+            and os.environ.get("HCU_STEP5_TP4_OPAQUE_FINALIZE") == "1"
+            and og_hidden_dim_pre_xform is None
+            and og_hidden_dim_post_xform is None
+            and not self._quant_method.has_unpadded_output
+            and self.routed_output_transform is None
+        ):
+            # Resolve the runtime fusion decision and finalize the output
+            # together. The compiled batch dimension may be symbolic.
+            return torch.ops.vllm.step5_moe_forward_output(
+                hidden_states, router_logits, shared_experts_input, input_ids,
+                quanted_hidden_states, scale, topk_weights, topk_ids,
+                self._encode_layer_name(),
+            )
+
+        shared_fusion = self._step5_shared_fusion(hidden_states)
         result = self._forward_entry(
             hidden_states,
             router_logits,
@@ -1105,6 +1215,17 @@ class MoERunner(MoERunnerInterface):
             else 0,
         )
 
+        return self._finish_forward(
+            result, shared_fusion, og_hidden_dim_pre_xform, og_hidden_dim_post_xform
+        )
+
+    def _finish_forward(
+        self,
+        result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        shared_fusion,
+        og_hidden_dim_pre_xform: int | None = None,
+        og_hidden_dim_post_xform: int | None = None,
+    ) -> torch.Tensor:
         #
         # Note: there are two all-reduce points below. They are mutually
         # exclusive, controlled by _fused_output_is_reduced
@@ -1115,6 +1236,9 @@ class MoERunner(MoERunnerInterface):
         #    them first and all-reduce the sum in _maybe_reduce_final_output.
 
         shared_output, fused_output = _unpack(result)
+
+        if shared_fusion is not None:
+            return self._maybe_add_zero_expert_output(fused_output)
 
         if self._ep_fused_combine:
             # The op already combined, added shared output and all-reduced.
@@ -1488,20 +1612,58 @@ class MoERunner(MoERunnerInterface):
             with self._pcp_routing_inputs(
                 input_ids, num_local_tokens
             ) as routing_input_ids:
-                shared_output, hidden_states = self._apply_quant_method(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    shared_experts_input=shared_experts_input,
-                    input_ids=routing_input_ids,
-                    quanted_hidden_states=quanted_hidden_states,
-                    scale=scale,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    output_dtype=dispatch_output_dtype,
-                    shared_experts_quanted_input=(
-                        shared_experts_x_and_scale_quanted
-                    ),
-                )
+                shared_fusion = self._step5_shared_fusion(hidden_states)
+                if shared_fusion is not None:
+                    buffer, communicator = shared_fusion
+                    buffer.defer_tp_result = True
+                deferred_step5_projection = False
+                try:
+                    if (
+                        os.environ.get("HCU_STEP5_SHARED_DOWN_IN_DISPATCH") == "1"
+                        and shared_fusion is not None
+                        and buffer.tp_size == 4
+                        and hidden_states.shape == (64, 4096)
+                        and shared_experts_input is not None
+                        and shared_experts_x_and_scale_quanted is None
+                        and not self._ep_fused_combine
+                        and not self.routed_experts.quant_method.is_monolithic
+                    ):
+                        assert self._shared_experts is not None
+                        deferred_step5_projection = (
+                            self._shared_experts.defer_step5_dispatch_projection(shared_experts_input)
+                        )
+                    shared_output, hidden_states = self._apply_quant_method(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        shared_experts_input=shared_experts_input,
+                        input_ids=routing_input_ids,
+                        quanted_hidden_states=quanted_hidden_states,
+                        scale=scale,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        output_dtype=dispatch_output_dtype,
+                        shared_experts_quanted_input=shared_experts_x_and_scale_quanted,
+                        deferred_step5_shared_projection=deferred_step5_projection,
+                    )
+                finally:
+                    if deferred_step5_projection:
+                        self._shared_experts._step5_dispatch_activation = None
+                    if shared_fusion is not None:
+                        buffer.defer_tp_result = False
+                if shared_fusion is not None:
+                    output = torch.empty_like(hidden_states)
+                    self._wait_late_shared_experts()
+                    # Match the vLLM custom all-reduce's shape-only warmup.
+                    capturing = torch.cuda.is_current_stream_capturing()
+                    if capturing or not communicator._IS_CAPTURING:
+                        registered = 0 if capturing else communicator.buffer_ptrs[communicator.rank]
+                        _step5_tp4_output_kernel()(
+                            communicator._ptr, hidden_states[:num_local_tokens // 4],
+                            shared_output, output, registered, communicator.max_size,
+                            self.routed_scaling_factor,
+                        )
+                        _step5_ipc_logger.info_once("Step5 TP4 native fused output active")
+                    return shared_output, output
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
