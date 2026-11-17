@@ -291,6 +291,16 @@ def _w4a8_masked_kernel_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight.view(experts, n_blocks * 32, k_blocks * 32)
 
 
+def _step5_masked_gemm_options(stage: str) -> dict:
+    flag = f"HCU_STEP5_DEEPGEMM_MASKED_{stage}_MODE"
+    mode = os.environ.get(flag)
+    if mode is None:
+        return {}
+    if mode not in ("1000", "1001", "1002"):
+        raise ValueError(f"{flag} requires DeepGEMM pair32 mode 1000, 1001, or 1002")
+    return {"config": {"MODE": int(mode)}}
+
+
 class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -627,26 +637,48 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 expected_m,
             )
         elif current_platform.is_rocm():
-            if activation == MoEActivation.SWIGLUSTEP:
+            g1_options = {}
+            g2_options = {}
+            swiglu = activation == MoEActivation.SWIGLUSTEP
+            fused_g1 = False
+            if swiglu:
                 from deepgemm import m_grouped_fp8_gemm_nt_masked as masked_gemm
 
                 if N != 3072 or K != 4096 or self.block_shape is not None:
                     raise ValueError(
                         "Step5 LL SwiGLUStep requires channel FP8 expert shapes"
                     )
+                g1_options = _step5_masked_gemm_options("G1")
+                g2_options = _step5_masked_gemm_options("G2")
+                fused_g1 = (
+                    g1_options.get("config", {}).get("MODE") == 1001
+                    and getattr(expert_tokens_meta, "_hcu_step5_tp_tokens", False)
+                    and topk_ids.shape[0] == 64
+                    and henvs.optional_custom_op_enabled(
+                        os.environ.get("HCU_STEP5_DEEPGEMM_PAIR32_EPILOGUES") == "1"
+                    )
+                )
             else:
                 from deepgemm.m_group_gemm import (
                     m_grouped_fp8_gemm_nt_masked_ll as masked_gemm,
                 )
 
+            activation_limit = float(self.quant_config.gemm1_clamp_limit or 7.0)
+            if fused_g1:
+                workspace1 = _resize_cache(workspace13, (E, max_num_tokens, N // 2))
+                g1_options["swiglu_limit"] = activation_limit
+                init_logger("vllm.hcu.step5").info_once(
+                    "Step5 DeepGEMM pair32 G1 SwiGLUStep active"
+                )
             masked_gemm(
                 (a1q, a1q_scale),
                 (w1, self.w1_scale),
                 workspace1,
                 expert_num_tokens,
                 expected_m,
+                **g1_options,
             )
-            if activation == MoEActivation.SWIGLUSTEP:
+            if swiglu:
                 from vllm_hcu.model_executor.layers.fused_moe.ep_fused_moe import (
                     ep_masked_swiglustep_quant_deepgemm,
                 )
@@ -663,8 +695,11 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 )
                 a2q, a2q_scale = ep_masked_swiglustep_quant_deepgemm(
                     workspace1, expert_num_tokens,
-                    limit=float(self.quant_config.gemm1_clamp_limit or 7.0),
-                    q=q_out, scale=scale_out,
+                    limit=activation_limit,
+                    q=q_out,
+                    scale=scale_out,
+                    activated=fused_g1,
+                    row_workers=int(os.environ.get("HCU_STEP5_DEEPEP_SWIGLU_ROW_WORKERS", "32")),
                 )
             else:
                 from lightop.activation import fuse_silu_mul_fp8_quant_ep
@@ -680,6 +715,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
                 output,
                 expert_num_tokens,
                 expected_m,
+                **g2_options,
             )
         else:
             fp8_m_grouped_gemm_nt_masked(
