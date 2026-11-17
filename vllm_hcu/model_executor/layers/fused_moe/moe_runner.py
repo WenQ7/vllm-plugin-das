@@ -4,6 +4,7 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 """HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
+import importlib
 import inspect
 import os
 from collections.abc import Callable, Iterable
@@ -71,10 +72,10 @@ from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
 logger = init_logger(__name__)
 _step5_ipc_logger = init_logger("vllm.hcu.step5.fused_moe")
 
+
 @lru_cache(maxsize=1)
 def _step5_tp4_output_kernel():
-    import vllm_hcu.hcu_ops
-
+    importlib.import_module("vllm_hcu.hcu_ops")
     return torch.ops.hcu_ops.step5_tp4_fused_output
 
 
