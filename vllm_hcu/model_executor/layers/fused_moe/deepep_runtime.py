@@ -960,17 +960,6 @@ def configure_step5_ll_tp_tokens(prepare, moe):
             buffer._hcu_step5_tp_tokens_proxy = proxy
         prepare.buffer = proxy
         prepare._hcu_step5_tp_tokens = True
-    if henvs.optional_custom_op_enabled(
-        os.environ.get("HCU_STEP5_DEEPEP_TP_TOKENS") == "1"
-    ):
-        if num_dispatchers != 8 or os.environ.get("HCU_STEP5_DEEPEP_SWIGLUSTEP") != "1":
-            raise ValueError("Step5 LL token partition requires EP8 and Step5 activation")
-        from .step5_ll_tp_tokens import Step5LLTPTokenBuffer
-        proxy = getattr(buffer, "_hcu_step5_tp_tokens_proxy", None)
-        if proxy is None:
-            proxy = Step5LLTPTokenBuffer(buffer, max_tokens_per_rank, 4096)
-            buffer._hcu_step5_tp_tokens_proxy = proxy
-        self.buffer = proxy
 
 
 def ll_do_quant(module, self, x, a1_dtype, quant_config, expert_num_tokens=None):
