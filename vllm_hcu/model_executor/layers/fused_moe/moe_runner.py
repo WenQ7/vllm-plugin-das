@@ -699,7 +699,7 @@ class MoERunner(MoERunnerInterface):
             and hidden_states.dtype == torch.bfloat16
             and hidden_states.ndim == 2
             and hidden_states.shape[1] == 4096
-            and self._fused_output_is_reduced()
+            and self._fused_output_is_reduced
         ):
             return None
         from vllm_hcu.model_executor.layers.fused_moe.step5_ll_tp_tokens import (

@@ -6463,6 +6463,34 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         assert patch_shared_experts.apply_to_module(shared_module) is True
         assert patch_shared_experts.apply_to_module(shared_module) is False
 
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_tp_tokens import (
+            Step5LLTPTokenBuffer,
+        )
+
+        os.environ["HCU_STEP5_TP4_FUSED_OUTPUT"] = "1"
+        buffer = object.__new__(Step5LLTPTokenBuffer)
+        communicator = object()
+        buffer.get_fused_shared_communicator = (
+            lambda rows: communicator if rows == 64 else None
+        )
+        kernel = SimpleNamespace(prepare_finalize=SimpleNamespace(buffer=buffer))
+        runner = SimpleNamespace(
+            _hcu_step5_owner=True,
+            _shared_experts=object(),
+            enable_dbo=False,
+            moe_config=SimpleNamespace(is_sequence_parallel=False, pcp_size=1),
+            routed_input_transform=None,
+            routed_output_transform=None,
+            _quant_method=SimpleNamespace(moe_kernel=kernel),
+            _fused_output_is_reduced=False,
+        )
+        hidden_states = torch.zeros((64, 4096), dtype=torch.bfloat16)
+        resolve_fusion = runner_module.MoERunner._step5_shared_fusion
+        assert resolve_fusion(runner, hidden_states) is None
+        runner._fused_output_is_reduced = True
+        assert resolve_fusion(runner, hidden_states) == (buffer, communicator)
+        os.environ.pop("HCU_STEP5_TP4_FUSED_OUTPUT")
+
         schema = tuple(inspect.signature(runner_module._moe_forward).parameters)
         assert schema == (
             "hidden_states", "router_logits", "shared_experts_input", "input_ids",
