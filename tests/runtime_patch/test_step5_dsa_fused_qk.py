@@ -161,6 +161,29 @@ class Step5DSAQKContracts(unittest.TestCase):
                 self.assertEqual(tuple(t.dtype for t in fake),(dtype,dtype))
             self.assertEqual(len(torch.native_norm_calls),4)
 
+    def test_runtime_master_disable_overrides_cached_dispatch(self):
+        with runtime() as (module,torch,launches,_,registered):
+            owner=attention()
+            self.assertTrue(module.can_dispatch(owner))
+            self.assertIsNotNone(module._qk_kernel)
+            # The model retains this startup selection, so exercise forward
+            # directly instead of calling can_dispatch again after disabling.
+            os.environ["VLLM_HCU_USE_CUSTOM_OPS"]="0"
+            for rows in (0,16,64,512):
+                x=TensorMetadata((rows,2688),strides=(4096,1))
+                p=TensorMetadata((rows,),"i64")
+                before=(len(torch.native_norm_calls),len(torch.rope_calls))
+                q,k=module.forward(owner,p,x)
+                self.assertEqual((q.shape,k.shape),((rows,2304),(rows,192)))
+                self.assertEqual((q.dtype,k.dtype),(torch.bfloat16,torch.bfloat16))
+                self.assertEqual(len(torch.native_norm_calls)-before[0],2 if rows else 0)
+                self.assertEqual(len(torch.rope_calls)-before[1],1 if rows else 0)
+            self.assertEqual(launches,[])
+            self.assertEqual(torch.norm_calls,[])
+            os.environ["VLLM_HCU_USE_CUSTOM_OPS"]="1"
+            module.forward(owner,TensorMetadata((16,),"i64"),TensorMetadata((16,2688)))
+            self.assertEqual(len(launches),1)
+
     def test_real_entry_and_fake_only_allocate_qk(self):
         with runtime() as (module,torch,launches,allocated,registered):
             owner=attention()

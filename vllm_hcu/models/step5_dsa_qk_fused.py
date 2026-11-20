@@ -130,6 +130,13 @@ def _reference(qkv, positions, q_weight, k_weight, cos_sin_cache,
 
     rows = qkv.shape[0]
     q_size, k_size = num_heads * 192, num_kv_heads * 192
+    # Native RoPE reshapes with an inferred head count, which is ambiguous
+    # for zero tokens. Preserve the op's empty-output contract on fallback.
+    if rows == 0:
+        return (
+            torch.empty((0, q_size), dtype=qkv.dtype, device=qkv.device),
+            torch.empty((0, k_size), dtype=qkv.dtype, device=qkv.device),
+        )
     q, k, _ = qkv.split((q_size, k_size, k_size), dim=-1)
     q = _reference_norm(q.view(rows, num_heads, 192).contiguous(), q_weight, eps).view(rows, q_size)
     k = _reference_norm(k.view(rows, num_kv_heads, 192).contiguous(), k_weight, eps).view(rows, k_size)
@@ -141,7 +148,10 @@ def _reference(qkv, positions, q_weight, k_weight, cos_sin_cache,
 def _impl(qkv: torch.Tensor, positions: torch.Tensor, q_weight: torch.Tensor,
           k_weight: torch.Tensor, cos_sin_cache: torch.Tensor,
           num_heads: int, num_kv_heads: int, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
-    if (_qk_kernel is None or qkv.shape[0] > 64
+    # The model caches can_dispatch at startup. Recheck the master switch
+    # inside the opaque op so later calls can still select the reference path.
+    if (not henvs.optional_custom_op_enabled(_ENABLED)
+            or _qk_kernel is None or qkv.shape[0] > 64
             or not _inputs_eligible(qkv, positions, q_weight, k_weight, cos_sin_cache, num_heads, num_kv_heads)):
         return _reference(qkv, positions, q_weight, k_weight, cos_sin_cache,
                           num_heads, num_kv_heads, eps)
