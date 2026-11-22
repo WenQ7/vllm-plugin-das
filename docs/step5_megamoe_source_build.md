@@ -67,6 +67,11 @@ running the Step5 kernel on ambiguously packed weights.
 ```bash
 pytest tests/runtime_patch/test_step5_megamoe_contract.py
 pytest tests/runtime_patch/test_moe_deepep.py
+
+# Reserve eight idle GPUs first; run against the two installed source wheels.
+STEP5_MEGAMOE_TEST_OUTPUT=/tmp/step5-mega-validation \
+  python -m torch.distributed.run --standalone --nproc-per-node=8 \
+  tests/distributed/single_node/tp_ep/step5_megamoe_replay.py
 ```
 
 DeepGEMM supplies CPU layout/build contracts, stock-source isolation checks,
