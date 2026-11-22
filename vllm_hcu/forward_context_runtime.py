@@ -18,6 +18,16 @@ _DEEPEP_AUTO_CAPTURE_MODE: ContextVar[object | None] = ContextVar(
 )
 
 
+def _step5_megamoe_dp_rows(num_tokens, num_tokens_across_dp):
+    """Carry already-coordinated DP counts without another collective."""
+    allowed = ((16, 32, 64, 128)
+               if os.environ.get("HCU_STEP5_MEGAMOE_ALL_DECODE") == "1" else (64,))
+    if (os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") != "1"
+            or num_tokens not in allowed or num_tokens_across_dp is None):
+        return None
+    return tuple(num_tokens_across_dp.tolist())
+
+
 @contextmanager
 def deepep_auto_capture_mode_scope(cudagraph_mode: object | None):
     """Expose the descriptor mode while upstream calls FULL capture as NONE."""
@@ -330,6 +340,10 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+
+    mega_dp_rows = _step5_megamoe_dp_rows(num_tokens, num_tokens_across_dp)
+    if mega_dp_rows is not None:
+        additional_kwargs["step5_pair32_megamoe_dp_rows"] = mega_dp_rows
 
     forward_context = module.create_forward_context(
         attn_metadata,

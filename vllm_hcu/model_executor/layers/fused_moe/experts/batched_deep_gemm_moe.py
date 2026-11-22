@@ -43,7 +43,7 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.math_utils import cdiv, round_up
 from vllm_hcu.platforms import envs as henvs
-from vllm_hcu.runtime_compat.step5 import is_step5_owner
+from vllm_hcu.runtime_compat.step5 import is_step5_owner, uses_original_pair32
 
 logger = init_logger(__name__)
 
@@ -292,13 +292,15 @@ def _w4a8_masked_kernel_weight(weight: torch.Tensor) -> torch.Tensor:
 
 
 def _step5_masked_gemm_options(stage: str) -> dict:
+    options = {"weight_layout": "pair32"} if uses_original_pair32() else {}
     flag = f"HCU_STEP5_DEEPGEMM_MASKED_{stage}_MODE"
     mode = os.environ.get(flag)
     if mode is None:
-        return {}
+        return options
     if mode not in ("1000", "1001", "1002"):
         raise ValueError(f"{flag} requires DeepGEMM pair32 mode 1000, 1001, or 1002")
-    return {"config": {"MODE": int(mode)}}
+    options["config"] = {"MODE": int(mode)}
+    return options
 
 
 class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):

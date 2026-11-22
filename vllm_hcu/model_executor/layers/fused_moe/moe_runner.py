@@ -1027,7 +1027,15 @@ class MoERunner(MoERunnerInterface):
                     input_ids=input_ids,
                 )
 
-            if quanted_hidden_states is None:
+            mega_out = None
+            if (quanted_hidden_states is None and self._hcu_step5_owner and
+                    henvs.optional_custom_op_enabled(
+                        os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") == "1")):
+                from .step5_pair32_megamoe import apply_decode
+                mega_out = apply_decode(self, hidden_states, topk_weights, topk_ids)
+            if mega_out is not None:
+                fused_out = mega_out
+            elif quanted_hidden_states is None:
                 fused_out = self.routed_experts.forward_modular(
                     x=hidden_states,
                     topk_weights=topk_weights,
@@ -1744,6 +1752,12 @@ class MoERunner(MoERunnerInterface):
     # This is called after all weight loading and post-processing, so it
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
+        if self._hcu_step5_owner and henvs.optional_custom_op_enabled(
+            os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") == "1"
+        ):
+            if getattr(self, "_step5_pair32_mega_state", None) is None:
+                from .step5_pair32_megamoe import initialize
+                initialize(self)
         # NOTE(rob): WIP refactor. For quant methods that own the MK
         # we create the MK during process_weights_after_loading.
         if (

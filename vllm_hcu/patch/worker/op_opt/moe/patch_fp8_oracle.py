@@ -298,6 +298,14 @@ def apply_to_module(module: ModuleType) -> bool:
 
             from vllm_hcu.runtime_compat.step5 import is_step5_owner
 
+            from vllm_hcu.runtime_compat.step5 import uses_original_pair32
+
+            if (fp8_backend == hcu_enum.BATCHED_DEEPGEMM
+                    and is_step5_owner(layer) and uses_original_pair32()):
+                from deepgemm import pack_fp8_weight_pair32
+                pack_weight = pack_fp8_weight_pair32
+                layer._hcu_step5_fp8_weight_layout = "pair32"
+
             ep_fused = False
             if (
                 henvs.optional_custom_op_enabled(
