@@ -69,7 +69,9 @@ pytest tests/runtime_patch/test_step5_megamoe_contract.py
 pytest tests/runtime_patch/test_moe_deepep.py
 
 # Reserve eight idle GPUs first; run against the two installed source wheels.
-STEP5_MEGAMOE_TEST_OUTPUT=/tmp/step5-mega-validation \
+GPU_MAX_HW_QUEUES=4 ROCBLAS_DEVICE_MEMORY_SIZE=0 \
+  HIP_FORCE_DEV_KERNARG=1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
+  STEP5_MEGAMOE_TEST_OUTPUT=/tmp/step5-mega-validation \
   python -m torch.distributed.run --standalone --nproc-per-node=8 \
   tests/distributed/single_node/tp_ep/step5_megamoe_replay.py
 ```
@@ -78,3 +80,7 @@ DeepGEMM supplies CPU layout/build contracts, stock-source isolation checks,
 Pair32 epilogue tests and eight-rank replay tests under `op_test/step5_megamoe`.
 Validation of this rebased source build must be reported separately from the
 previous experiment's prebuilt binary performance numbers.
+
+The queue and BLAS workspace settings above match the tested environment for
+the independent PyTorch GEMM reference. Without them the first source-wheel
+run failed to create a hipBLAS handle; the retained rerun passed all96 cases.
