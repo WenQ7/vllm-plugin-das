@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,16 @@ from types import ModuleType
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_forward_context_helper_has_its_runtime_imports(monkeypatch):
+    path = ROOT / "vllm_hcu/forward_context_runtime.py"
+    spec = importlib.util.spec_from_file_location("_step5_context_import_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", "1")
+    monkeypatch.setenv("HCU_STEP5_MEGAMOE_ALL_DECODE", "1")
+    assert module._step5_megamoe_dp_rows(16, SimpleNamespace(tolist=lambda: [16,16])) == (16,16)
 
 
 def function(path, name, namespace):
