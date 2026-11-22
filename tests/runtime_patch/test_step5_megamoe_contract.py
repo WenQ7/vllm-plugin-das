@@ -14,6 +14,68 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 
+@pytest.mark.parametrize("capturing", [False, True])
+def test_tp4_finish_uses_the_current_output_rows(capturing):
+    path = ROOT / "vllm_hcu/model_executor/layers/fused_moe/moe_runner.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    method = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_forward_impl"
+    )
+    block = next(
+        n
+        for n in ast.walk(method)
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "shared_fusion is not None"
+        and any(
+            isinstance(k, ast.Name) and k.id == "_step5_tp4_output_kernel"
+            for k in ast.walk(n)
+        )
+    )
+
+    class Tensor:
+        def __init__(self, rows):
+            self.shape = (rows, 4096)
+
+        def __getitem__(self, index):
+            return Tensor(index.stop)
+
+    calls = []
+    shared = object()
+    space = {
+        "torch": SimpleNamespace(
+            empty_like=lambda t: Tensor(t.shape[0]),
+            cuda=SimpleNamespace(is_current_stream_capturing=lambda: capturing),
+        ),
+        "self": SimpleNamespace(
+            _wait_late_shared_experts=lambda: None, routed_scaling_factor=1
+        ),
+        "communicator": SimpleNamespace(
+            _IS_CAPTURING=False, buffer_ptrs=[123], rank=0, _ptr=1, max_size=65536
+        ),
+        "buffer": SimpleNamespace(tp_size=4),
+        "hidden_states": Tensor(64),
+        "shared_output": shared,
+        "_step5_tp4_output_kernel": lambda: lambda *args: calls.append(args),
+        "_step5_ipc_logger": SimpleNamespace(info_once=lambda *args: None),
+    }
+    fn = ast.FunctionDef(
+        name="run_finish",
+        args=ast.arguments(
+            posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
+        ),
+        body=block.body,
+        decorator_list=[],
+    )
+    module = ast.Module(body=[fn], type_ignores=[])
+    ast.fix_missing_locations(module)
+    exec(compile(module, str(path), "exec"), space)
+    result = space["run_finish"]()
+    assert result[0] is shared and result[1].shape == (64, 4096)
+    assert len(calls) == 1 and calls[0][1].shape == (16, 4096)
+
+
 def test_forward_context_helper_has_its_runtime_imports(monkeypatch):
     path = ROOT / "vllm_hcu/forward_context_runtime.py"
     spec = importlib.util.spec_from_file_location("_step5_context_import_check", path)
@@ -21,7 +83,9 @@ def test_forward_context_helper_has_its_runtime_imports(monkeypatch):
     spec.loader.exec_module(module)
     monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", "1")
     monkeypatch.setenv("HCU_STEP5_MEGAMOE_ALL_DECODE", "1")
-    assert module._step5_megamoe_dp_rows(16, SimpleNamespace(tolist=lambda: [16,16])) == (16,16)
+    assert module._step5_megamoe_dp_rows(
+        16, SimpleNamespace(tolist=lambda: [16, 16])
+    ) == (16, 16)
 
 
 def function(path, name, namespace):

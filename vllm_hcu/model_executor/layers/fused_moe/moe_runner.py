@@ -1730,7 +1730,7 @@ class MoERunner(MoERunnerInterface):
                     if capturing or not communicator._IS_CAPTURING:
                         registered = 0 if capturing else communicator.buffer_ptrs[communicator.rank]
                         _step5_tp4_output_kernel()(
-                            communicator._ptr, hidden_states[:num_local_tokens // 4],
+                            communicator._ptr, hidden_states[:hidden_states.shape[0] // buffer.tp_size],
                             shared_output, output, registered, communicator.max_size,
                             self.routed_scaling_factor,
                         )
