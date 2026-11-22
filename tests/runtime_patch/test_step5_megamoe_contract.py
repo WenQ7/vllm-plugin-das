@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -93,3 +95,43 @@ def test_fallback_g1_and_g2_keep_the_weight_layout(monkeypatch, original, mode):
         options = fn(stage)
         assert options.get("weight_layout") == ("pair32" if original else None)
         assert options.get("config") == ({"MODE": 1001} if mode else None)
+
+
+@pytest.mark.parametrize("step5", [False, True])
+@pytest.mark.parametrize("master", [False, True])
+def test_weight_conversion_keeps_other_models_on_upstream_layout(
+    monkeypatch, step5, master
+):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", str(int(master)))
+    monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", "1")
+    monkeypatch.setenv("VLLM_HCU_EP_FUSED_MOE", "0")
+    deepgemm = ModuleType("deepgemm")
+    deepgemm.marlin_fp8_contiguous_weight = lambda w: torch.full_like(w, 11)
+    deepgemm.marlin_fp8_masked_weight = lambda w: torch.full_like(w, 22)
+    deepgemm.pack_fp8_weight_pair32 = lambda w: torch.full_like(w, 33)
+    monkeypatch.setitem(sys.modules, "deepgemm", deepgemm)
+    path = ROOT / "vllm_hcu/patch/worker/op_opt/moe/patch_fp8_oracle.py"
+    node = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.FunctionDef)
+        and n.name == "hcu_convert_to_fp8_moe_kernel_format"
+    )
+    node.decorator_list = []
+    module = ast.Module(body=[node], type_ignores=[])
+    ast.fix_missing_locations(module)
+    namespace = {
+        "hcu_enum": SimpleNamespace(
+            HCU_DEEPGEMM="hcu", AITER="aiter", DEEPGEMM="dg", BATCHED_DEEPGEMM="batched"
+        )
+    }
+    exec(compile(module, str(path), "exec"), namespace)
+    layer = SimpleNamespace(weight_block_size=None, _hcu_step5_owner=step5)
+    w = torch.zeros((1, 32, 64))
+    scale = torch.ones((1, 32))
+    result = namespace[node.name]("batched", layer, w, w, scale, scale, None, None)
+    assert bool((result[0] == (33 if step5 and master else 22)).all())
+    assert getattr(layer, "_hcu_step5_fp8_weight_layout", None) == (
+        "pair32" if step5 and master else None
+    )
