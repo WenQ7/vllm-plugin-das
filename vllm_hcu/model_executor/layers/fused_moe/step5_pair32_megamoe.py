@@ -8,7 +8,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 
 logger = init_logger("vllm.hcu.step5.pair32_megamoe")
-ALL_ROWS = os.environ.get("HCU_STEP5_MEGAMOE_ALL_DECODE") == "1"
+ALL_ROWS = os.environ.get("HCU_MEGAMOE_ALL_DECODE") == "1"
 ALLOWED_DP_ROWS = (16, 32, 64, 128) if ALL_ROWS else (64,)
 
 

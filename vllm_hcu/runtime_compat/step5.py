@@ -10,7 +10,7 @@ def uses_original_pair32():
     from vllm_hcu.platforms import envs
 
     return envs.optional_custom_op_enabled(
-        os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") == "1"
+        os.environ.get("HCU_PAIR32_MEGAMOE_DECODE") == "1"
         or os.environ.get("HCU_STEP5_DEEPGEMM_PAIR32_EPILOGUES") == "1"
     )
 

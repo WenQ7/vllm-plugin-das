@@ -29,16 +29,21 @@ probe directories or worker-extension modules to `PYTHONPATH`.
 In addition to the existing Step5 Channel-FP8/DeepEP deployment configuration:
 
 ```bash
-export HCU_STEP5_PAIR32_MEGAMOE_DECODE=1
-export HCU_STEP5_MEGAMOE_ALL_DECODE=1
+export HCU_PAIR32_MEGAMOE_DECODE=1
+export HCU_MEGAMOE_ALL_DECODE=1
 export DG_MEGA_STEP5_PHASED_VARIANT=g2-fused-completion
 export DG_MEGA_PEER_MEMORY=ipc
 ```
 
+Set these variables before starting the service. The two HCU MegaMoE switches
+now use model-neutral names; update launch scripts that used their previous
+STEP5-prefixed names. The rename does not expand supported models or shapes,
+and does not merge the two native backends.
+
 This path requires Step5, gfx938, single-node EP8/TP4 with direct peer memory,
 352 experts, top-k8, hidden4096 and intermediate1536. Supported uniform
 DP row counts are16/32/64/128, corresponding to4/8/16/32 local source tokens.
-Without `HCU_STEP5_MEGAMOE_ALL_DECODE=1`, the existing64-row integration is
+Without `HCU_MEGAMOE_ALL_DECODE=1`, the existing64-row integration is
 retained. Without the MegaMoE flag, other models and the ordinary backend
 selection stay on the upstream path. The custom-op master switch also gates
 the feature.

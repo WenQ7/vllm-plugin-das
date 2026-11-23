@@ -81,8 +81,8 @@ def test_forward_context_helper_has_its_runtime_imports(monkeypatch):
     spec = importlib.util.spec_from_file_location("_step5_context_import_check", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", "1")
-    monkeypatch.setenv("HCU_STEP5_MEGAMOE_ALL_DECODE", "1")
+    monkeypatch.setenv("HCU_PAIR32_MEGAMOE_DECODE", "1")
+    monkeypatch.setenv("HCU_MEGAMOE_ALL_DECODE", "1")
     assert module._step5_megamoe_dp_rows(
         16, SimpleNamespace(tolist=lambda: [16, 16])
     ) == (16, 16)
@@ -111,8 +111,8 @@ def function(path, name, namespace):
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("rows", [0, 16, 32, 64, 128, 129])
 def test_context_preserves_coordinated_counts(monkeypatch, all_rows, enabled, rows):
-    monkeypatch.setenv("HCU_STEP5_MEGAMOE_ALL_DECODE", str(int(all_rows)))
-    monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", str(int(enabled)))
+    monkeypatch.setenv("HCU_MEGAMOE_ALL_DECODE", str(int(all_rows)))
+    monkeypatch.setenv("HCU_PAIR32_MEGAMOE_DECODE", str(int(enabled)))
     fn = function(
         Path("vllm_hcu/forward_context_runtime.py"),
         "_step5_megamoe_dp_rows",
@@ -179,7 +179,7 @@ def test_weight_conversion_keeps_other_models_on_upstream_layout(
 ):
     torch = pytest.importorskip("torch")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", str(int(master)))
-    monkeypatch.setenv("HCU_STEP5_PAIR32_MEGAMOE_DECODE", "1")
+    monkeypatch.setenv("HCU_PAIR32_MEGAMOE_DECODE", "1")
     monkeypatch.setenv("VLLM_HCU_EP_FUSED_MOE", "0")
     deepgemm = ModuleType("deepgemm")
     deepgemm.marlin_fp8_contiguous_weight = lambda w: torch.full_like(w, 11)

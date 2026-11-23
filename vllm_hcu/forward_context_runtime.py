@@ -22,8 +22,8 @@ _DEEPEP_AUTO_CAPTURE_MODE: ContextVar[object | None] = ContextVar(
 def _step5_megamoe_dp_rows(num_tokens, num_tokens_across_dp):
     """Carry already-coordinated DP counts without another collective."""
     allowed = ((16, 32, 64, 128)
-               if os.environ.get("HCU_STEP5_MEGAMOE_ALL_DECODE") == "1" else (64,))
-    if (os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") != "1"
+               if os.environ.get("HCU_MEGAMOE_ALL_DECODE") == "1" else (64,))
+    if (os.environ.get("HCU_PAIR32_MEGAMOE_DECODE") != "1"
             or num_tokens not in allowed or num_tokens_across_dp is None):
         return None
     return tuple(num_tokens_across_dp.tolist())

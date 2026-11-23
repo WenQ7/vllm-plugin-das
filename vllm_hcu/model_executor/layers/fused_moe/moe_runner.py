@@ -1030,7 +1030,7 @@ class MoERunner(MoERunnerInterface):
             mega_out = None
             if (quanted_hidden_states is None and self._hcu_step5_owner and
                     henvs.optional_custom_op_enabled(
-                        os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") == "1")):
+                        os.environ.get("HCU_PAIR32_MEGAMOE_DECODE") == "1")):
                 from .step5_pair32_megamoe import apply_decode
                 mega_out = apply_decode(self, hidden_states, topk_weights, topk_ids)
             if mega_out is not None:
@@ -1753,7 +1753,7 @@ class MoERunner(MoERunnerInterface):
     # should be safe to swap out the quant_method.
     def maybe_init_modular_kernel(self) -> None:
         if self._hcu_step5_owner and henvs.optional_custom_op_enabled(
-            os.environ.get("HCU_STEP5_PAIR32_MEGAMOE_DECODE") == "1"
+            os.environ.get("HCU_PAIR32_MEGAMOE_DECODE") == "1"
         ):
             if getattr(self, "_step5_pair32_mega_state", None) is None:
                 from .step5_pair32_megamoe import initialize
