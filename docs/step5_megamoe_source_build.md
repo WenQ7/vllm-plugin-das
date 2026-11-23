@@ -14,11 +14,12 @@ PYTORCH_ROCM_ARCH=gfx938 MAX_JOBS=2 pip wheel . --no-build-isolation --no-deps -
 pip install --force-reinstall --no-deps dist/deepgemm-*.whl
 ```
 
-The normal DeepGEMM wheel contains `deepgemm.op`, stock `deepgemm.mega._C`,
-and `deepgemm.mega_step5._C_step5`. The last is an ordinary source-built
-package extension, with a separate translation unit and isolated namespace.
-There is no manual `.so` copy or external-library-path setting. The regular
-vllm-hcu build compiles its existing `hcu_ops` extension as before.
+The normal DeepGEMM wheel contains `deepgemm.op` and one MegaMoE extension,
+`deepgemm.mega._C`. Both ordinary W6 LL/HT and Pair32 phased compute are linked
+into `_C`; allocation and IPC bindings are shared. Separate compute translation
+units preserve each family's compiler flags. There is no `_C_step5` extension,
+manual `.so` copy, or external-library-path setting. The regular vllm-hcu build
+compiles its existing `hcu_ops` extension as before.
 
 From this plugin checkout, use the repository's normal build/install procedure.
 Do not add the previous experiment's `plugin-allrows`, `deepgemm-python`,
@@ -37,8 +38,8 @@ export DG_MEGA_PEER_MEMORY=ipc
 
 Set these variables before starting the service. The two HCU MegaMoE switches
 now use model-neutral names; update launch scripts that used their previous
-STEP5-prefixed names. The rename does not expand supported models or shapes,
-and does not merge the two native backends.
+STEP5-prefixed names. The rename does not expand supported models or shapes.
+The native backends are now merged.
 
 This path requires Step5, gfx938, single-node EP8/TP4 with direct peer memory,
 352 experts, top-k8, hidden4096 and intermediate1536. Supported uniform
@@ -46,7 +47,10 @@ DP row counts are16/32/64/128, corresponding to4/8/16/32 local source tokens.
 Without `HCU_MEGAMOE_ALL_DECODE=1`, the existing64-row integration is
 retained. Without the MegaMoE flag, other models and the ordinary backend
 selection stay on the upstream path. The custom-op master switch also gates
-the feature.
+the feature. The adapter creates the shared buffer with
+`kernel="pair32_phased", weight_layout="pair32"`. Ordinary MegaMoE callers
+continue to default to `kernel="ll_ht", weight_layout="w6"`. Kernel choice
+is fixed per buffer, and the IPC handle collective verifies rank agreement.
 
 Forward context carries the already-coordinated DP counts. All ranks reject
 uneven or unsupported counts together and use ordinary DeepEP/DeepGEMM.

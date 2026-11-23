@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import vllm_hcu.hcu_ops
-from deepgemm.mega_step5.mega_moe import (
+from deepgemm.mega.mega_moe import (
     _C,
     get_symm_buffer_for_mega_moe,
     transform_weights_for_mega_moe,
@@ -67,7 +67,8 @@ def main():
     adapter.get_ep_group = lambda: ep
     adapter.get_forward_context = lambda: context
     buffer = get_symm_buffer_for_mega_moe(
-        dist.group.WORLD, 352, 32, 8, 4096, 1536, peer_memory_mode="ipc"
+        dist.group.WORLD, 352, 32, 8, 4096, 1536, peer_memory_mode="ipc",
+        kernel="pair32_phased", weight_layout="pair32",
     )
 
     def make_weight(n, k):
@@ -81,7 +82,7 @@ def main():
     raw_gate, gate_sf = make_weight(3072, 4096)
     raw_down, down_sf = make_weight(4096, 1536)
     gate, down = transform_weights_for_mega_moe(
-        (raw_gate, gate_sf), (raw_down, down_sf)
+        (raw_gate, gate_sf), (raw_down, down_sf), weight_layout="pair32",
     )
     prepare = SimpleNamespace(buffer=SimpleNamespace(defer_tp_result=False))
     runner = SimpleNamespace(

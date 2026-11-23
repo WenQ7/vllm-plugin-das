@@ -42,11 +42,11 @@ def tp_output_gather():
 
 
 def initialize(runner):
-    from deepgemm.mega_step5.mega_moe import get_symm_buffer_for_mega_moe
-    from deepgemm.mega_step5.mega_moe import _C
+    from deepgemm.mega.mega_moe import get_symm_buffer_for_mega_moe
+    from deepgemm.mega.mega_moe import _C
 
     logger.info_once(
-        "Step5 isolated MegaMoE backend=%s variant=%s",
+        "MegaMoE backend=%s kernel=pair32_phased variant=%s",
         _C.__file__,
         os.environ.get("DG_MEGA_STEP5_PHASED_VARIANT"),
     )
@@ -95,6 +95,7 @@ def initialize(runner):
                 )
         buffer = get_symm_buffer_for_mega_moe(
             topology.cpu_group, 352, 32, 8, 4096, 1536, peer_memory_mode="ipc",
+            kernel="pair32_phased", weight_layout="pair32",
         )
         topology._step5_pair32_megamoe_decode_buffer = buffer
         logger.info_once("Step5 MegaMoE Pair32 EP8 IPC buffer initialized")
@@ -141,7 +142,7 @@ def apply_decode(runner, x, weights, ids):
     local_rows = x.shape[0] // 4
     start = tp_rank * local_rows
     local = slice(start, start + local_rows)
-    from deepgemm.mega_step5.mega_moe import fp8_mega_moe, mega_moe_preprocess
+    from deepgemm.mega.mega_moe import fp8_mega_moe, mega_moe_preprocess
 
     output = (
         torch.empty_like(x)

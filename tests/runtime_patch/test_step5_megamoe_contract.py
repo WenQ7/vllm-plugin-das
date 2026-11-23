@@ -8,10 +8,43 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 from types import ModuleType
+from unittest.mock import Mock
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_megamoe_initialization_selects_pair32_in_the_unified_extension(monkeypatch):
+    api = ModuleType("deepgemm.mega.mega_moe")
+    native = SimpleNamespace(__file__="deepgemm/mega/_C.so")
+    api._C = native
+    api.get_symm_buffer_for_mega_moe = Mock(return_value=object())
+    for name in ("deepgemm", "deepgemm.mega"):
+        package = ModuleType(name)
+        package.__path__ = []
+        monkeypatch.setitem(sys.modules, name, package)
+    monkeypatch.setitem(sys.modules, "deepgemm.mega.mega_moe", api)
+    topology = SimpleNamespace(world_size=8, rank_in_group=0, cpu_group=object())
+    layer = SimpleNamespace(
+        _hcu_step5_fp8_weight_layout="pair32",
+        w13_weight=SimpleNamespace(shape=(44, 64, 96, 2, 4, 16, 16), dtype="fp8"),
+        w2_weight=SimpleNamespace(shape=(44, 24, 128, 2, 4, 16, 16), dtype="fp8"),
+        w13_weight_scale=Mock(), w2_weight_scale=Mock(),
+    )
+    fn = function(
+        Path("vllm_hcu/model_executor/layers/fused_moe/step5_pair32_megamoe.py"),
+        "initialize",
+        dict(os=os, logger=SimpleNamespace(info_once=Mock()), ALL_ROWS=False,
+             torch=SimpleNamespace(float8_e4m3fn="fp8", cuda=SimpleNamespace(is_current_stream_capturing=lambda: False)),
+             get_ep_group=lambda: topology,
+             get_tp_group=lambda: SimpleNamespace(world_size=4, rank_in_group=0)),
+    )
+    runner = SimpleNamespace(routed_experts=layer)
+    result = fn(runner)
+    assert result[0] is api.get_symm_buffer_for_mega_moe.return_value
+    assert api.get_symm_buffer_for_mega_moe.call_args.kwargs == {
+        "peer_memory_mode": "ipc", "kernel": "pair32_phased", "weight_layout": "pair32"}
 
 
 @pytest.mark.parametrize("capturing", [False, True])
