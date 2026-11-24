@@ -31,6 +31,7 @@ from boltops.fused_moe.triton.moe_config_utils import try_get_optimal_moe_config
 from boltops.fused_moe.triton.moe_compat import per_token_quant_triton
 from boltops.fused_moe.triton.moe_sorting_hipc import moe_sorting_fwd
 from vllm_hcu.platforms import envs as henvs
+from .step5_wide_fp8_gemm import needs_wide_a, invoke_wide_fp8
 
 FP8 = torch.float8_e4m3fn
 _announced = False
@@ -544,7 +545,7 @@ def _invoke_persistent(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted
         B_scale.stride(1) if B_scale.ndim >= 2 else 0,
         A.size(0), 0, 0,
         MUL_ROUTED_WEIGHT=False,
-        USE_ADDR_OFFSET_INT64_A=A.numel() * A.element_size() >= lim,
+        USE_ADDR_OFFSET_INT64_A=needs_wide_a(A),
         USE_ADDR_OFFSET_INT64_B=B.numel() * B.element_size() >= lim,
         USE_ADDR_OFFSET_INT64_C=C.numel() * C.element_size() >= lim,
         top_k=top_k, compute_type=compute_type, use_fp8_w8a8=True, use_int8_w8a8=False,
@@ -567,6 +568,10 @@ def _gemm(A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids, sorted_
                            sorted_w, expert_ids, nvalid, top_k, compute_type, config=config,
                            **{k: v for k, v in kw.items() if k != "ck_sorting"})
         return
+    if needs_wide_a(A):
+        return invoke_wide_fp8(
+            A, B, C, A_scale, B_scale, topk_weights, topk_ids, sorted_ids,
+            sorted_w, expert_ids, nvalid, top_k, compute_type, config, **kw)
     invoke_fused_moe_kernel(A, B, C, A_scale, B_scale, None, topk_weights, topk_ids,
                             sorted_ids, sorted_w, expert_ids, nvalid, False, top_k,
                             compute_type=compute_type, use_fp8_w8a8=True,

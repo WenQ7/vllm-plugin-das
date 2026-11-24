@@ -462,12 +462,15 @@ def _fp32_gemma_rms_norm(hidden_size: int, eps: float) -> GemmaRMSNorm:
     The Step5 library adapter supports mixed activation/gamma dtypes without
     rounding gamma. Other providers retain the native FP32 reduction path.
     """
+    from vllm_hcu.runtime_compat.step5 import is_step5_tp4_deepep_ll
+
     norm = GemmaRMSNorm(hidden_size, eps)
     norm.weight = nn.Parameter(
         torch.zeros(hidden_size, dtype=torch.float32), requires_grad=False
     )
     library_selected = (
-        getattr(norm, "_hcu_step5_owner", False)
+        is_step5_tp4_deepep_ll()
+        and getattr(norm, "_hcu_step5_owner", False)
         and norm._forward_method.__name__ == "forward_hip"
         and henvs.optional_custom_op_enabled(henvs.VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM)
     )

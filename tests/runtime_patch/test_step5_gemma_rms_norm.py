@@ -65,7 +65,10 @@ def test_other_models_keep_original_lightop_adapter(monkeypatch):
 
 @pytest.mark.parametrize("step5,selected,master", [
     (True, True, True), (True, False, True), (False, True, True), (True, True, False)])
-def test_model_constructor_preserves_fp32_and_explicit_provider(monkeypatch, step5, selected, master):
+@pytest.mark.parametrize("decode_profile", [False, True])
+def test_model_constructor_preserves_fp32_and_explicit_provider(monkeypatch, step5, selected, master, decode_profile):
+    from vllm_hcu.runtime_compat import step5
+    monkeypatch.setattr(step5, 'is_step5_tp4_deepep_ll', lambda: decode_profile)
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_OPS", "1" if master else "0")
     monkeypatch.setenv("VLLM_HCU_USE_CUSTOM_GEMMA_RMS_NORM", "1")
 
@@ -93,5 +96,5 @@ def test_model_constructor_preserves_fp32_and_explicit_provider(monkeypatch, ste
     finally:
         torch.set_default_dtype(previous)
     assert layer.weight.dtype == torch.float32
-    expected = 'forward_hip' if step5 and selected and master else 'forward_native'
+    expected = 'forward_hip' if decode_profile and step5 and selected and master else 'forward_native'
     assert layer._forward_method.__name__ == expected
