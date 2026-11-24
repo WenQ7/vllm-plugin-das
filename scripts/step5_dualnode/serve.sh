@@ -2,7 +2,7 @@
 set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-}"
-case "$mode" in prefill|decode|decode-perf) ;; *) echo 'Usage: serve.sh prefill|decode|decode-perf [--dry-run]' >&2; exit 2;; esac
+case "$mode" in prefill|prefill-wasp128|decode|decode-perf) ;; *) echo 'Usage: serve.sh prefill|prefill-wasp128|decode|decode-perf [--dry-run]' >&2; exit 2;; esac
 dry_run=0
 if [[ "${2:-}" == --dry-run ]]; then dry_run=1; fi
 [[ $# == 1 || ( $# == 2 && "$2" == --dry-run ) ]] || exit 2
@@ -12,7 +12,7 @@ source "${STEP5_CONFIG_FILE:-$script_dir/config.env}"
 [[ ${#NODE_IPS[@]} == 2 ]] || exit 2
 cache_base="$CACHE_ROOT/$mode/node$NODE_RANK"
 CACHE_DIR="$cache_base"
-if [[ "$mode" == prefill ]]; then
+if [[ "$mode" == prefill || "$mode" == prefill-wasp128 ]]; then
   unset VLLM_HCU_STEP5_DECODE_PRODUCERS VLLM_HCU_STEP5_DSA_FUSED_QK
   source "$script_dir/prefill.env"
   role=(--api-server-count 1)
@@ -23,6 +23,14 @@ if [[ "$mode" == prefill ]]; then
     --enable-eplb --eplb-config "$eplb" --max-num-batched-tokens 8192
     --long-prefill-token-threshold 0 --kv-cache-memory-bytes 5100273664
     --gpu-memory-utilization .590 --no-async-scheduling)
+  if [[ "$mode" == prefill-wasp128 ]]; then
+    source "$script_dir/prefill-wasp128.env"
+    # Keep the same TP1/DP16 layout and physical expert map; use cross-node HT.
+    for ((i=0; i<${#phase[@]}; i++)); do
+      if [[ "${phase[$i]}" == --all2all-backend ]]; then phase[$((i+1))]=deepep_high_throughput; fi
+    done
+    phase+=(--moe-backend auto)
+  fi
 else
   if [[ "$mode" == decode-perf ]]; then
     export STEP5_SPECULATIVE_CONFIG='{"method":"mtp","num_speculative_tokens":3,"rejection_sample_method":"synthetic","synthetic_acceptance_rates":[0.838992,0.598322,0.362686],"use_local_argmax_reduction":true}'

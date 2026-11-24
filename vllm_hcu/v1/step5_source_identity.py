@@ -12,6 +12,8 @@ class Step5SourceIdentityExtension:
 
         root=Path(vllm_hcu.__file__).resolve().parent
         files=['models/step5_text.py',
+               'model_executor/layers/fused_moe/step5_wasp128.py',
+               'model_executor/layers/fused_moe/deepep_runtime.py',
                'model_executor/layers/fused_moe/step5_wide_fp8_gemm.py',
                'model_executor/layers/fused_moe/dp_pipe_output_pool.py',
                'ops/step5/decode_producers_runtime.py']

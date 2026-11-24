@@ -164,11 +164,14 @@ def _step5_fused_scatter_rows(meta, topk_ids, local_num_experts, hidden_size):
     ):
         raise ValueError("Step5 fused scatter is missing dispatch layout metadata")
     shape, counts = layout
+    alignment = getattr(meta, "_hcu_step5_fused_scatter_alignment", 256)
+    if alignment not in (128, 256):
+        raise ValueError("Unsupported Step5 fused-scatter alignment")
     if (
         shape != tuple(topk_ids.shape)
         or not isinstance(counts, tuple)
         or len(counts) != local_num_experts
-        or any(type(c) is not int or c < 0 or c % 256 for c in counts)
+        or any(type(c) is not int or c < 0 or c % alignment for c in counts)
     ):
         raise ValueError("Step5 fused scatter has mismatched dispatch counts or batch shape")
     rows = sum(counts)
@@ -629,7 +632,9 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                 output.zero_()
                 return
             a1q, a1q_scale, expert_ids, inv_perm = fused_scatter
-            align_used = _HCU_HT_EP_TOKEN_ALIGNMENT
+            align_used = getattr(expert_tokens_meta, "_hcu_step5_fused_scatter_alignment", _HCU_HT_EP_TOKEN_ALIGNMENT)
+            if (align_used == 128) != bool(getattr(self, "_hcu_step5_wasp128_enabled", False)):
+                raise ValueError("Step5 WASP128 GEMM and dispatch alignment disagree")
         else:
             M_sum, _ = compute_aligned_M_and_alignment(
                 M=topk_ids.size(0),
@@ -706,7 +711,10 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     expert_ids,
                 )
             else:
-                m_grouped_fp8_gemm_nt_contiguous(
+                grouped_fp8 = m_grouped_fp8_gemm_nt_contiguous
+                if step5_channel_fp8 and fused_scatter is not None and align_used == 128:
+                    from ..step5_wasp128 import grouped_fp8
+                grouped_fp8(
                     (a1q, a1q_scale),
                     (w1, self.w1_scale),
                     mm1_out,
@@ -756,7 +764,7 @@ class DeepGemmExperts(mk.FusedMoEExpertsModular):
                     )
 
                 mm2_out = _resize_cache(workspace2, (M_sum, K))
-                m_grouped_fp8_gemm_nt_contiguous(
+                grouped_fp8(
                     (a2q, a2q_scale),
                     (w2, self.w2_scale),
                     mm2_out,

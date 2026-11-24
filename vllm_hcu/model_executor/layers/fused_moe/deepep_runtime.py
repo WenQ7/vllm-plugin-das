@@ -133,6 +133,13 @@ def configure_step5_ht_kernel(kernel, moe_quant_config, moe_config):
                     and moe_quant_config.block_shape is None
                 ):
                     raise ValueError("Step5 fused DeepEP scatter requires TP1 channel-FP8 DeepGemmExperts")
+                wasp128 = False
+                if os.environ.get("HCU_STEP5_WASP128") == "1":
+                    from .step5_wasp128 import nightly_weight_packer
+
+                    wasp128 = nightly_weight_packer(moe_config) is not None
+                prepare._hcu_step5_wasp128_enabled = wasp128
+                experts._hcu_step5_wasp128_enabled = wasp128
             import deep_ep
             from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 
@@ -545,6 +552,8 @@ def ht_do_dispatch(
     if fused_scatter:
         if not (has_scales and expert_alignment == 256 and num_experts in (352, 368)):
             raise ValueError("Step5 fused scatter requires E22/E23 with EP16 per-token FP8 scales")
+        if getattr(self, "_hcu_step5_wasp128_enabled", False):
+            expert_alignment = 128
         data, scales = token_data
         if data.dtype != module.torch.float8_e4m3fn or scales.shape != (data.size(0), 1):
             raise ValueError("Step5 fused scatter requires FP8 [M,4096] and float32 [M,1]")
@@ -676,8 +685,10 @@ def ht_receiver(
     ubatch_id = module.dbo_current_ubatch_id()
     if getattr(self, "_hcu_step5_fused_scatter_enabled", False):
         counts = tuple(expert_num_tokens_per_expert_list)
+        alignment = 128 if getattr(self, "_hcu_step5_wasp128_enabled", False) else 256
+        expert_tokens_meta._hcu_step5_fused_scatter_alignment = alignment
         if len(counts) not in (22, 23) or any(
-            type(c) is not int or c < 0 or c % 256 for c in counts
+            type(c) is not int or c < 0 or c % alignment for c in counts
         ):
             raise ValueError("Step5 fused scatter requires aligned E22/E23 dispatch counts")
         rows = sum(counts)

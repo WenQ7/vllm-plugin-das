@@ -28,8 +28,9 @@ Fill the two node addresses, interfaces, model/tokenizer paths, asset root and
 local cache directory. Use the same wheel and asset contents on both nodes.
 Prefill requires the qualified hipBLASLt build matched by its Dense recipe.
 Decode requires DeepEP's layered LL/rail mapping ABI and the HCU DeepGEMM
-channel-FP8 build with code-object V5 support (measured source `7da8cd9`). A
-similarly named generic dependency wheel does not establish compatibility.
+channel-FP8 build. The earlier Decode measurements used source `7da8cd9` with
+code-object V5. The WASP128 profile below uses the pinned nightly API; changing
+DeepGEMM requires revalidating Decode as well as Prefill.
 For containers, map `/dev/kfd`, `/dev/dri` **and `/dev/infiniband`**, use host
 networking, adequate shared memory and unlimited memlock.
 
@@ -50,6 +51,7 @@ peer. Append `--dry-run` to inspect the command without loading a model:
 
 ```bash
 NODE_RANK=0 bash scripts/step5_dualnode/serve.sh prefill
+NODE_RANK=0 bash scripts/step5_dualnode/serve.sh prefill-wasp128
 NODE_RANK=0 bash scripts/step5_dualnode/serve.sh decode
 NODE_RANK=0 bash scripts/step5_dualnode/serve.sh decode-perf
 ```
@@ -70,3 +72,39 @@ The launcher enables the read-only `step5_source_identity` worker RPC. Query
 `/collective_rpc` with `{"method":"step5_source_identity","timeout":30}` and
 compare installed versions, native-extension hashes and critical source hashes
 on all workers for both profiles. This detects stale wheels or source overlays.
+
+## WASP128 with the public nightly wheel
+
+The EP16 integration follows the single-node EP8 implementation in
+[PR #504](https://github.com/HYGON-AI/vllm-plugin-das/pull/504), reviewed at
+`f4a68aec67965e6cd31a53578109be0a013e91d1`. In the existing Python 3.12 / DTK
+26.10 / Torch 2.11 environment, install the same dependency on both machines:
+
+```bash
+python -m pip install --no-deps --force-reinstall \
+  'deepgemm==2.1.0+dtk2610.torch2110.2611231831.gebe489' \
+  --index-url https://pypi.sourcefind.cn/nightly/dtk/
+```
+
+The cp312 x86_64 wheel SHA256 is
+`e631d987ea05ed10874154fdc4ad718c6ca8fb0f28f9a957e83725bbe507d23c`.
+This wheel exports `m_grouped_fp8_gemm_nt_contiguous_wasp_pair32`, rather than
+the old private `m_grouped_fp8_gemm_nt_contiguous_step5_ep8` convenience API.
+Its ordinary gfx938 Marlin packer selects Pair32 V2, so this profile explicitly
+calls `pack_fp8_weight_pair32` for WASP128. The layouts are not interchangeable.
+
+`prefill-wasp128` keeps TP1/DP16/EP16 and the external physical expert map.
+It switches to cross-node DeepEP HT/MNVL, separate DBO communication buffers,
+fused scatter and 128-row expert slices. Both G1 `[M,4096] x [E,3072,4096]`
+and G2 `[M,1536] x [E,4096,1536]` use nightly `MODE=1002` (BM128/BN256).
+Both 22 local experts (352 global) and 23 (368 including EPLB replicas) are
+supported. Explicit profile guards prevent using this packing in Native
+Prefill, TP4 Decode, unrelated models or master-disabled custom-op runs.
+
+Do not copy EP8's `NCCL_IB_DISABLE=1`, intra-node-only flag, local EP8 map or
+DP8 startup arguments to a two-node run. The common launcher retains RDMA,
+the configured per-node GPU order, DP16 start ranks and the MNVL path.
+`prefill` remains the historical Native backend; `prefill-wasp128` is a
+different workload configuration and needs its own performance/quality run.
+Neither single-node benchmark results nor historical two-node Native results
+are validation of end-to-end EP16 WASP128 throughput or model accuracy.
