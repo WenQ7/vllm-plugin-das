@@ -1104,10 +1104,22 @@ class FusedMoEBlock(nn.Module):
             and self.share_expert.limit is not None
         ):
             self.gate.fuse_shared_expert(self.share_expert)
+        ll_indices_dtype = torch.int32
+        if (
+            henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_ROUTER_DIRECT_LL_INDICES") == "1"
+            )
+            and vllm_config.parallel_config.all2all_backend == "deepep_low_latency"
+            and self.tp_size == 4
+            and not self.effective_sequence_parallel
+        ):
+            ll_indices_dtype = torch.int64
+            logger.info_once("Step5 router writes DeepEP LL int64 indices directly")
         custom_routing_function = functools.partial(
             router_bias_func,
             router_bias=self.router_bias,
             routed_scaling_factor=config.moe_router_scaling_factor,
+            indices_dtype=ll_indices_dtype,
         )
         self.experts = FusedMoEFactory(
             gate=self.gate,

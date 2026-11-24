@@ -159,7 +159,18 @@ def test_deepseek_expert_resolvers_strictly_separate_activation_and_clamp(
         module._lightop_clamp("fuse_silu_mul_quant")
 
 
-def test_all2all_dispatch_selection_contract():
+def test_all2all_dispatch_selection_contract(monkeypatch):
+    from vllm_hcu.model_executor.layers.fused_moe import deepep_runtime
+
+    dispatch_modes = []
+    monkeypatch.setattr(
+        deepep_runtime,
+        "configure_step5_ll_tp_tokens",
+        lambda prepare, moe: dispatch_modes.append(
+            (prepare.use_fp8_dispatch, prepare.use_int8_dispatch)
+        ),
+    )
+
     class DeepEPLLPrepareAndFinalize:
         pass
 
@@ -214,6 +225,9 @@ def test_all2all_dispatch_selection_contract():
     result = module.maybe_make_prepare_finalize(moe, int8_config)
     assert result.use_fp8_dispatch is False
     assert result.use_int8_dispatch is True
+    # Upstream leaves FP8 off for channel quantization during construction.
+    # Step5's TP adapter must see the final HCU dispatch mode.
+    assert dispatch_modes == [(True, False), (False, True)]
 
 
 def test_all2all_auto_builds_ht_and_ll_around_one_manager_handle():
@@ -6448,6 +6462,34 @@ def test_moe_runner_and_shared_experts_cold_replacement_contract():
         assert patch_moe_runner.apply_to_module(runner_module) is False
         assert patch_shared_experts.apply_to_module(shared_module) is True
         assert patch_shared_experts.apply_to_module(shared_module) is False
+
+        from vllm_hcu.model_executor.layers.fused_moe.step5_ll_tp_tokens import (
+            Step5LLTPTokenBuffer,
+        )
+
+        os.environ["HCU_STEP5_TP4_FUSED_OUTPUT"] = "1"
+        buffer = object.__new__(Step5LLTPTokenBuffer)
+        communicator = object()
+        buffer.get_fused_shared_communicator = (
+            lambda rows: communicator if rows == 64 else None
+        )
+        kernel = SimpleNamespace(prepare_finalize=SimpleNamespace(buffer=buffer))
+        runner = SimpleNamespace(
+            _hcu_step5_owner=True,
+            _shared_experts=object(),
+            enable_dbo=False,
+            moe_config=SimpleNamespace(is_sequence_parallel=False, pcp_size=1),
+            routed_input_transform=None,
+            routed_output_transform=None,
+            _quant_method=SimpleNamespace(moe_kernel=kernel),
+            _fused_output_is_reduced=False,
+        )
+        hidden_states = torch.zeros((64, 4096), dtype=torch.bfloat16)
+        resolve_fusion = runner_module.MoERunner._step5_shared_fusion
+        assert resolve_fusion(runner, hidden_states) is None
+        runner._fused_output_is_reduced = True
+        assert resolve_fusion(runner, hidden_states) == (buffer, communicator)
+        os.environ.pop("HCU_STEP5_TP4_FUSED_OUTPUT")
 
         schema = tuple(inspect.signature(runner_module._moe_forward).parameters)
         assert schema == (

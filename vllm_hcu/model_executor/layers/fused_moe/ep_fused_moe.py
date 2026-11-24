@@ -791,3 +791,114 @@ def ep_fused_experts(hidden_states, w1, w2, topk_weights, topk_ids, expert_map, 
                           topk_ids[s:s + CHUNK], expert_map, w1_scale, w2_scale,
                           a1_scale=None if a1 is None or a1.numel() == 1 else a1[s:s + CHUNK], **kw)
         for s in range(0, M, CHUNK)])
+
+
+@triton.jit
+def _ep_masked_swiglustep_quant_deepgemm_kernel(
+    q_ptr,
+    scale_ptr,
+    in_ptr,
+    counts_ptr,
+    T: tl.constexpr,
+    D: tl.constexpr,
+    LIMIT: tl.constexpr,
+    LANES: tl.constexpr,
+    CH: tl.constexpr,
+    ACTIVATED: tl.constexpr,
+):
+    # Each expert owns a fixed row-worker grid. Counts remain GPU values,
+    # so graph replay handles new routing without processing padded rows.
+    expert = tl.program_id(0) // LANES
+    lane = tl.program_id(0) % LANES
+    count = tl.minimum(tl.load(counts_ptr + expert), T)
+    cols = tl.arange(0, CH)
+    for row in range(lane, count, LANES):
+        flat = expert.to(tl.int64) * T + row
+        if ACTIVATED:
+            offs = flat * D + cols
+            y0 = tl.load(in_ptr + offs)
+            y1 = tl.load(in_ptr + offs + CH)
+            y2 = tl.load(in_ptr + offs + 2 * CH)
+        else:
+            offs = flat * (2 * D) + cols
+            y0 = _ep_swiglu_chunk(in_ptr, offs, True, LIMIT, D)
+            y1 = _ep_swiglu_chunk(in_ptr, offs + CH, True, LIMIT, D)
+            y2 = _ep_swiglu_chunk(in_ptr, offs + 2 * CH, True, LIMIT, D)
+        amax = tl.maximum(
+            tl.maximum(tl.max(tl.abs(y0), 0), tl.max(tl.abs(y1), 0)),
+            tl.max(tl.abs(y2), 0),
+        )
+        scale = tl.maximum(amax.to(tl.float32), 1.0e-10) / 448.0
+        inv = 1.0 / scale
+        out = flat * D + cols
+        tl.store(q_ptr + out, (y0 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + CH, (y1 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(q_ptr + out + 2 * CH, (y2 * inv).to(q_ptr.dtype.element_ty))
+        tl.store(scale_ptr + flat, scale)
+
+
+def ep_masked_swiglustep_quant_deepgemm(
+    cache1, counts, limit=7.0, *, q=None, scale=None, row_workers=32, activated=False
+):
+    """Step5's existing post-SiLU clamp/BF16/FP8 math on LL expert rows."""
+    input_width = 1536 if activated else 3072
+    if (
+        cache1.dtype != torch.bfloat16
+        or cache1.ndim != 3
+        or cache1.shape[-1] != input_width
+        or not cache1.is_contiguous()
+    ):
+        raise ValueError(f"Step5 LL activation requires contiguous BF16 [E,T,{input_width}]")
+    experts, capacity, _ = cache1.shape
+    if (
+        counts.dtype != torch.int32
+        or counts.shape != (experts,)
+        or not counts.is_contiguous()
+        or counts.device != cache1.device
+    ):
+        raise ValueError("Step5 LL requires contiguous GPU per-expert counts")
+    q_shape = (experts, capacity, 1536)
+    scale_shape = (experts, capacity, 1)
+    if q is None:
+        q = torch.empty(q_shape, dtype=FP8, device=cache1.device)
+    if scale is None:
+        scale = torch.empty(scale_shape, dtype=torch.float32, device=cache1.device)
+    if (
+        q.shape != q_shape
+        or q.dtype != FP8
+        or not q.is_contiguous()
+        or scale.shape != scale_shape
+        or scale.dtype != torch.float32
+        or not scale.is_contiguous()
+        or q.device != cache1.device
+        or scale.device != cache1.device
+    ):
+        raise ValueError("Step5 LL activation output/scale geometry differs")
+    if row_workers not in (8, 16, 32):
+        raise ValueError("Step5 LL activation expects 8, 16, or 32 row workers")
+    if activated and experts == 44 and os.environ.get("HCU_STEP5_COMPACT_ACTIVATED_QUANT") == "1":
+        from vllm.logger import init_logger
+        from vllm_hcu.model_executor.layers.fused_moe.step5_compact_quant import compact_activated_quant
+
+        row_reductions = os.environ.get("HCU_STEP5_COMPACT_ACTIVATED_QUANT_ROW_REDUCTIONS") == "1"
+        compact_activated_quant[(256,)](
+            q, scale, cache1, counts, capacity, 1536, experts, 512,
+            min_flat_row=row_reductions, fused_row_max=row_reductions,
+            num_warps=1, num_stages=1,
+        )
+        logger = init_logger("vllm.hcu.step5")
+        logger.info_once("Step5 compact activated FP8 quantization active")
+        if row_reductions:
+            logger.info_once("Step5 compact FP8 row reductions active")
+        return q, scale
+    num_warps = 4
+    if (
+        activated
+        and os.environ.get("HCU_STEP5_DEEPEP_SWIGLU_ACTIVATED_QUANT_WARPS") == "1"
+    ):
+        num_warps = 1
+    _ep_masked_swiglustep_quant_deepgemm_kernel[(experts * row_workers,)](
+        q, scale, cache1, counts, T=capacity, D=1536, LIMIT=float(limit),
+        LANES=row_workers, CH=512, ACTIVATED=activated, num_warps=num_warps, num_stages=1,
+    )
+    return q,scale

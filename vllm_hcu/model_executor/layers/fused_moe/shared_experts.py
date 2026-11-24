@@ -93,6 +93,7 @@ class SharedExperts(torch.nn.Module):
         self._output_pending_on_stream: list[bool] = [False, False]
         self._output_pending_late: list[bool] = [False, False]
         self._output_pending_fused_router: list[bool] = [False, False]
+        self._step5_dispatch_activation: torch.Tensor | None = None
         self._layer = layer
         self._moe_config = moe_config
 
@@ -225,6 +226,13 @@ class SharedExperts(torch.nn.Module):
         # shared expert on the auxiliary stream would fail the stream handoff
         # check and recompute both operations, so serialize this short path.
         if self._requires_main_stream_for_fused_activation(hidden_states):
+            if (
+                os.environ.get("HCU_STEP5_VERIFY_SHARED_MAIN_STREAM") == "1"
+                and hidden_states.shape[0] == 64
+            ):
+                init_logger("vllm.hcu.step5.shared").info_once(
+                    "Step5 fused-router shared down projection: main stream active"
+                )
             return SharedExpertsOrder.NO_OVERLAP
 
         force_stream = bool(
@@ -308,6 +316,30 @@ class SharedExperts(torch.nn.Module):
                 "Step5 fused-router shared down projection: auxiliary stream active",
                 flush=True,
             )
+        return True
+
+    def defer_step5_dispatch_projection(self, hidden_states: torch.Tensor) -> bool:
+        """Take the independent router activation on its producer stream."""
+        if (
+            self._determine_shared_experts_order(hidden_states)
+            != SharedExpertsOrder.NO_OVERLAP
+        ):
+            return False
+        take = getattr(self._layer, "pop_fused_router_activation", None)
+        if not callable(take):
+            return False
+        assert self._step5_dispatch_activation is None
+        assert self._output[self._output_idx] is None
+        self._step5_dispatch_activation = take(hidden_states)
+        return self._step5_dispatch_activation is not None
+
+    def run_step5_dispatch_projection(self) -> bool:
+        activation, self._step5_dispatch_activation = self._step5_dispatch_activation, None
+        if activation is None:
+            return False
+        self._output[self._output_idx] = self._layer.forward_fused_router_activation(
+            activation
+        )
         return True
 
     def requires_input_preservation(self, hidden_states: torch.Tensor) -> bool:
