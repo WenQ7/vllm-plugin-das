@@ -71,6 +71,7 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
+        self.capture_use_preregistered = False
         self.disabled = True
         # Native/IPC ownership must be inert before any early return or
         # fallible allocation.  ``__del__`` can run for a partially-created
@@ -239,6 +240,8 @@ class CustomAllreduce:
         if self.disabled:
             return False
         inp_size = inp.numel() * inp.element_size()
+        if inp_size == 0:
+            return False
         # custom allreduce requires input byte size to be multiples of 16
         if inp_size % 16 != 0:
             return False
@@ -276,7 +279,10 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                # Some graph-pool allocations cannot be exported through the
+                # driver's IPC pointer query. The opt-in staging path uses
+                # the communicator-owned buffer, whose lifetime is stable.
+                return self.all_reduce(input, registered=not self.capture_use_preregistered)
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.

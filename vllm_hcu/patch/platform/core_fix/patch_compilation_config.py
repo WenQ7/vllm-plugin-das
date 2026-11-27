@@ -306,6 +306,11 @@ def apply_to_module(module: ModuleType) -> bool:
             data_parallel_size,
         )
 
+        from vllm_hcu.megamoe_compile import apply_bound_megamoe_splitting
+        if apply_bound_megamoe_splitting(self):
+            from vllm.logger import init_logger
+            init_logger(__name__).info_once('Keep DeepGEMM MegaMoE collectives outside Inductor autotuning')
+
         # With Inductor graph partitioning enabled, the operator's
         # ``cudagraph_unsafe`` tag is authoritative. HCU currently uses the
         # legacy Dynamo splitting path, so target vLLM's manually maintained

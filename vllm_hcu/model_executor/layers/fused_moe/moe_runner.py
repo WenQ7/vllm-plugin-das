@@ -4,10 +4,12 @@
 # Modified by Hygon Information Technology Co., Ltd., 2026.
 """HCU-owned v0.25.1 MoE runner with pre-quantized input support."""
 
+import importlib
 import inspect
 import os
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -68,6 +70,13 @@ from vllm_hcu.model_executor.layers.fused_moe.combine_runtime import (
 )
 
 logger = init_logger(__name__)
+_step5_ipc_logger = init_logger("vllm.hcu.step5.fused_moe")
+
+
+@lru_cache(maxsize=1)
+def _step5_tp4_output_kernel():
+    importlib.import_module("vllm_hcu.hcu_ops")
+    return torch.ops.hcu_ops.step5_tp4_fused_output
 
 # Fold the naive DP combine (reduce-scatter over DP), the shared-expert add and
 # the TP all-reduce into one custom all-reduce over the EP group (see
@@ -387,6 +396,55 @@ direct_register_custom_op(
 )
 
 
+def _step5_moe_forward_output(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    shared_fusion = layer._step5_shared_fusion(hidden_states)
+    shared, routed = layer._forward_impl(
+        hidden_states, router_logits, shared_experts_input, input_ids,
+        quanted_hidden_states=quanted_hidden_states, scale=scale,
+        topk_weights=topk_weights, topk_ids=topk_ids,
+        step5_shared_fusion=shared_fusion,
+    )
+    if torch._C._is_alias_of(routed, hidden_states):
+        routed = routed.clone()
+    if shared_fusion is not None:
+        return layer._maybe_add_zero_expert_output(routed)
+    return layer._finish_forward((shared, routed))
+
+
+def _step5_moe_forward_output_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor | None,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    quanted_hidden_states: torch.Tensor | None,
+    scale: torch.Tensor | None,
+    topk_weights: torch.Tensor | None,
+    topk_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+direct_register_custom_op(
+    op_name="step5_moe_forward_output",
+    op_func=_step5_moe_forward_output,
+    mutates_args=["hidden_states"],
+    fake_impl=_step5_moe_forward_output_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
 def _unpack(
     result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
@@ -624,6 +682,31 @@ class MoERunner(MoERunnerInterface):
             self._quant_method.moe_kernel is not None
             and self._quant_method.moe_kernel.output_is_reduced()
         )
+
+    def _step5_shared_fusion(self, hidden_states: torch.Tensor):
+        # Resolve the exact shape only when the opaque op runs, not when
+        # Inductor traces forward with a symbolic token dimension.
+        if not (
+            getattr(self._quant_method, "_hcu_deferred_tp_tail", False)
+            and getattr(self, "_hcu_step5_owner", False)
+            and henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_TP4_FUSED_OUTPUT") == "1"
+            )
+            and self._shared_experts is not None
+            and not self.enable_dbo
+            and not self.moe_config.is_sequence_parallel
+            and self.moe_config.pcp_size == 1
+            and self.routed_input_transform is None
+            and self.routed_output_transform is None
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 2
+            and hidden_states.shape[1] == 4096
+            and self._fused_output_is_reduced
+        ):
+            return None
+        buffer = self._quant_method
+        communicator = buffer.get_fused_shared_communicator(hidden_states.shape[0])
+        return (buffer, communicator) if communicator is not None else None
 
     def _maybe_reduce_shared_expert_output(
         self,
@@ -1091,6 +1174,25 @@ class MoERunner(MoERunnerInterface):
             )
         )
 
+        if (
+            getattr(self, "_hcu_step5_owner", False)
+            and getattr(self._quant_method, "_hcu_deferred_tp_tail", False)
+            and self._shared_experts is not None
+            and os.environ.get("HCU_STEP5_TP4_OPAQUE_FINALIZE") == "1"
+            and henvs.optional_custom_op_enabled(
+                os.environ.get("HCU_STEP5_TP4_FUSED_OUTPUT") == "1"
+            )
+            and og_hidden_dim_pre_xform is None
+            and og_hidden_dim_post_xform is None
+            and not self._quant_method.has_unpadded_output
+            and self.routed_output_transform is None
+        ):
+            return torch.ops.vllm.step5_moe_forward_output(
+                hidden_states, router_logits, shared_experts_input, input_ids,
+                quanted_hidden_states, scale, topk_weights, topk_ids,
+                self._encode_layer_name(),
+            )
+
         result = self._forward_entry(
             hidden_states,
             router_logits,
@@ -1106,6 +1208,14 @@ class MoERunner(MoERunnerInterface):
             else 0,
         )
 
+        return self._finish_forward(result, og_hidden_dim_pre_xform, og_hidden_dim_post_xform)
+
+    def _finish_forward(
+        self,
+        result: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        og_hidden_dim_pre_xform: int | None = None,
+        og_hidden_dim_post_xform: int | None = None,
+    ) -> torch.Tensor:
         #
         # Note: there are two all-reduce points below. They are mutually
         # exclusive, controlled by _fused_output_is_reduced
@@ -1420,6 +1530,7 @@ class MoERunner(MoERunnerInterface):
         scale: torch.Tensor | None = None,
         topk_weights: torch.Tensor | None = None,
         topk_ids: torch.Tensor | None = None,
+        step5_shared_fusion=None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Entry point called by the custom op to run the MoE computation.
 
@@ -1551,20 +1662,43 @@ class MoERunner(MoERunnerInterface):
                 )
             )
             with routing_context as (hidden_states, router_logits, routing_input_ids):
-                shared_output, hidden_states = self._apply_quant_method(
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                    shared_experts_input=shared_experts_input,
-                    input_ids=routing_input_ids,
-                    quanted_hidden_states=quanted_hidden_states,
-                    scale=scale,
-                    topk_weights=topk_weights,
-                    topk_ids=topk_ids,
-                    output_dtype=dispatch_output_dtype,
-                    shared_experts_quanted_input=(
-                        shared_experts_x_and_scale_quanted
-                    ),
-                )
+                if step5_shared_fusion is not None:
+                    buffer, communicator = step5_shared_fusion
+                    buffer.defer_tp_result = True
+                try:
+                    shared_output, hidden_states = self._apply_quant_method(
+                        hidden_states=hidden_states,
+                        router_logits=router_logits,
+                        shared_experts_input=shared_experts_input,
+                        input_ids=routing_input_ids,
+                        quanted_hidden_states=quanted_hidden_states,
+                        scale=scale,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        output_dtype=dispatch_output_dtype,
+                        shared_experts_quanted_input=(
+                            shared_experts_x_and_scale_quanted
+                        ),
+                    )
+                finally:
+                    if step5_shared_fusion is not None:
+                        buffer.defer_tp_result = False
+                if step5_shared_fusion is not None:
+                    from vllm_hcu.model_executor.layers.fused_moe.megamoe_tp4_tail import (
+                        finish_megamoe_tp4_tail,
+                    )
+
+                    output = torch.empty_like(hidden_states)
+                    self._wait_late_shared_experts()
+                    capturing = torch.cuda.is_current_stream_capturing()
+                    finish_megamoe_tp4_tail(
+                        communicator, hidden_states, shared_output, output,
+                        self.routed_scaling_factor, _step5_tp4_output_kernel(),
+                        capturing=capturing,
+                    )
+                    if capturing or not communicator._IS_CAPTURING:
+                        _step5_ipc_logger.info_once("Step5 MegaMoE TP4 fused output active")
+                    return shared_output, output
             return self._maybe_combine(
                 shared_output,
                 hidden_states,

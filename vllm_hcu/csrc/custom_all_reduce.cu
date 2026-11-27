@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 Hygon Information Technology Co., Ltd.
 
 #include <ATen/cuda/Exceptions.h>
+#include <ATen/hip/HIPContext.h>
+#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
@@ -222,3 +224,105 @@ void free_shared_buffer(fptr_t buffer) {
   AT_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(buffer)));
 }
 
+namespace {
+
+constexpr int kRanks = 4;
+constexpr int kThreads = 512;
+constexpr int kElements = 64 * 4096;
+using Value = nv_bfloat16;
+using Packet = vllm::packed_t<Value>::P;
+using Accumulator = vllm::packed_t<Value>::A;
+constexpr int kPart = kElements / Packet::size / kRanks;
+
+__global__ __launch_bounds__(kThreads, 1) void fuse_tp4_routed_and_shared(
+    vllm::RankData* data, vllm::RankSignals signals, vllm::Signal* self_signal,
+    const Packet* routed, Packet* out, int rank, float scale) {
+    const int first = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    const Packet* peers[kRanks];
+    Packet* temporary[kRanks];
+    #pragma unroll
+    for (int step = 0; step < kRanks; ++step) {
+        const int owner = (rank + step) % kRanks;
+        peers[step] = static_cast<const Packet*>(data->ptrs[owner]);
+        temporary[step] = vllm::get_tmp_buf<Packet>(signals.signals[owner]);
+    }
+
+    vllm::barrier_at_start<kRanks>(signals, self_signal, rank);
+    for (int i = first; i < kPart; i += stride) {
+        // Reduce exactly as the original shared all-reduce. Round the shared
+        // sum and scaled routed output before the final BF16 addition.
+        const auto shared_sum = vllm::packed_reduce<Packet, kRanks, Accumulator>(
+            peers, rank * kPart + i);
+        Packet combined;
+        #pragma unroll
+        for (int j = 0; j < Packet::size; ++j) {
+            const Value scaled = vllm::downcast_s<Value>(vllm::upcast_s(routed[i].data[j]) * scale);
+            combined.data[j] = vllm::downcast_s<Value>(
+                vllm::upcast_s(shared_sum.data[j]) + vllm::upcast_s(scaled));
+        }
+        temporary[0][i] = combined;
+    }
+    vllm::barrier_at_end<kRanks>(signals, self_signal, rank);
+    for (int i = first; i < kPart; i += stride) {
+        #pragma unroll
+        for (int step = 0; step < kRanks; ++step) {
+            const int owner = (rank + step) % kRanks;
+            out[owner * kPart + i] = temporary[step][i];
+        }
+    }
+}
+
+vllm::RankData* register_shared_input(vllm::CustomAllreduce* reduce, const torch::Tensor& shared,
+                                     int64_t registered_buffer, int64_t buffer_bytes,
+                                     hipStream_t stream) {
+    void* registered_input = shared.data_ptr();
+    if (registered_buffer) {
+        TORCH_CHECK(buffer_bytes >= kElements * sizeof(Value), "Input exceeds the registered buffer");
+        registered_input = reinterpret_cast<void*>(registered_buffer);
+        C10_HIP_CHECK(hipMemcpyAsync(registered_input, shared.data_ptr(), kElements * sizeof(Value),
+                                     hipMemcpyDeviceToDevice, stream));
+    }
+
+    hipStreamCaptureStatus capturing;
+    C10_HIP_CHECK(hipStreamIsCapturing(stream, &capturing));
+    if (capturing == hipStreamCaptureStatusActive) {
+        auto* data = reduce->d_rank_data_base_ + reduce->graph_unreg_buffers_.size();
+        TORCH_CHECK(data < reduce->d_rank_data_end_, "Out of rank data for graph capture");
+        reduce->graph_unreg_buffers_.push_back(registered_input);
+        return data;
+    }
+    auto buffer = reduce->buffers_.find(registered_input);
+    TORCH_CHECK(buffer != reduce->buffers_.end(), "Expected a registered shared input");
+    return buffer->second;
+}
+
+}  // namespace
+
+void step5_tp4_fused_output(int64_t communicator, torch::Tensor routed,
+                             torch::Tensor shared, torch::Tensor out,
+                             int64_t registered_buffer, int64_t buffer_bytes, double scale) {
+    auto* reduce = reinterpret_cast<vllm::CustomAllreduce*>(communicator);
+    TORCH_CHECK(reduce && reduce->world_size_ == kRanks && reduce->fully_connected_,
+                "Expected a fully connected TP4 custom all-reduce");
+    TORCH_CHECK(routed.is_cuda() && shared.device() == routed.device() && out.device() == routed.device(),
+                "Expected tensors on the local accelerator");
+    for (const auto& tensor : {routed, shared, out}) {
+        TORCH_CHECK(tensor.scalar_type() == at::kBFloat16 && tensor.is_contiguous(),
+                    "Expected contiguous BF16 tensors");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignof(Packet) == 0,
+                    "Expected aligned tensors");
+    }
+    TORCH_CHECK(routed.sizes() == c10::IntArrayRef({16, 4096}) &&
+                shared.sizes() == c10::IntArrayRef({64, 4096}) && out.sizes() == shared.sizes(),
+                "Expected the 64-token TP4 Step5 graph shape");
+    const c10::hip::HIPGuardMasqueradingAsCUDA guard(routed.device());
+    const hipStream_t stream = at::cuda::getCurrentHIPStream();
+    auto* data = register_shared_input(reduce, shared, registered_buffer, buffer_bytes, stream);
+
+    hipLaunchKernelGGL(fuse_tp4_routed_and_shared, vllm::defaultBlockLimit, kThreads, 0, stream,
+                       data, reduce->sg_, reduce->self_sg_,
+                       static_cast<const Packet*>(routed.data_ptr()), static_cast<Packet*>(out.data_ptr()),
+                       reduce->rank_, static_cast<float>(scale));
+    C10_HIP_CHECK(hipGetLastError());
+}

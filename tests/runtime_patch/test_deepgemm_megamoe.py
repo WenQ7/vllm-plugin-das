@@ -36,7 +36,8 @@ def adapter(monkeypatch):
 @pytest.mark.parametrize("rows", [0, 1, 3, 4, 5, 16, 64, 256])
 @pytest.mark.parametrize("decode", [False, True])
 @pytest.mark.parametrize("clamp", [0., None])
-def test_tp_slices_preserve_every_row_and_empty_ranks_participate(adapter, monkeypatch, rows, decode, clamp):
+@pytest.mark.parametrize("mode", ["w8a8", "w4a8"])
+def test_tp_slices_preserve_every_row_and_empty_ranks_participate(adapter, monkeypatch, rows, decode, clamp, mode):
     mega = NS()
     package = ModuleType("deepgemm")
     package.mega = mega
@@ -49,11 +50,13 @@ def test_tp_slices_preserve_every_row_and_empty_ranks_participate(adapter, monke
     for rank in range(4):
         method = adapter.DeepGemmMegaMoEMethod(NS(experts_per_token=2, activation="swiglustep"), None)
         method._capacity, method._tp_size, method._tp_rank = 64, 4, rank
+        method._mega_mode = mode
         method._weights = (object(), object())
         method._buffer = NS(decode=decode, topk_idx=torch.ones(64, 2, dtype=torch.int64),
                             topk_weights=torch.ones(64, 2))
         state = {}
-        def preprocess(local, local_ids, local_weights, buffer, valid):
+        def preprocess(local, local_ids, local_weights, buffer, valid, **kwargs):
+            assert kwargs == ({} if mode == "w8a8" else {"mode": "w4a8"})
             assert local_ids.shape == local_weights.shape == (valid, 2)
             state["x"] = local.clone()
             if not decode:
@@ -61,7 +64,9 @@ def test_tp_slices_preserve_every_row_and_empty_ranks_participate(adapter, monke
                 assert (buffer.topk_weights[valid:] == 0).all()
         def run(output, *args, **kwargs):
             calls.append((rank, len(output)))
-            assert kwargs == {"activation_clamp": 7. if clamp is None else 0., "fast_math": True, "tokens_all_ranks": -1}
+            expected = {"activation_clamp": 7. if clamp is None else 0., "fast_math": True, "tokens_all_ranks": -1}
+            if mode == "w4a8": expected["mode"] = "w4a8"
+            assert kwargs == expected
             output.copy_(state["x"])
         mega.mega_moe_preprocess, mega.fp8_mega_moe = preprocess, run
         def gather(tensors, sizes):
@@ -188,3 +193,72 @@ def test_selection_uses_quantization_contract_not_model_name(adapter, monkeypatc
     config.parallel_config.enable_eplb = True
     with pytest.raises(ValueError, match="EPLB"):
         adapter.select_method(layer, quant, moe)
+
+
+@pytest.fixture
+def w4_adapter(adapter, monkeypatch):
+    monkeypatch.setitem(sys.modules,
+        "vllm_hcu.model_executor.layers.fused_moe.deepgemm_megamoe", adapter)
+    path = ROOT / "vllm_hcu/model_executor/layers/fused_moe/deepgemm_w4a8.py"
+    spec = importlib.util.spec_from_file_location(
+        "vllm_hcu.model_executor.layers.fused_moe.deepgemm_w4a8", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_w4_packing_preserves_checkpoint_scales_and_uses_true_scales_for_kernel(w4_adapter, monkeypatch):
+    # Meta weights exercise the real production shapes without allocating a
+    # full expert layer. Real CPU scales let us verify the x16 ABI conversion.
+    layer = NS(w13_weight=torch.nn.Parameter(torch.empty(44, 3072, 2048, dtype=torch.int8, device="meta"), requires_grad=False),
+               w2_weight=torch.nn.Parameter(torch.empty(44, 4096, 768, dtype=torch.int8, device="meta"), requires_grad=False),
+               w13_weight_scale=torch.ones(44, 3072, 1) * .25,
+               w2_weight_scale=torch.ones(44, 4096, 1) * .5)
+    calls = []
+    def pack(w1, w2, **kwargs):
+        calls.append((w1, w2, kwargs))
+        return w1, w2
+    mega = NS(transform_weights_for_mega_moe=pack, prepare_w4a8_weight_scales=Mock())
+    package = ModuleType("deepgemm"); package.mega = mega
+    monkeypatch.setitem(sys.modules, "deepgemm", package)
+    monkeypatch.setattr(w4_adapter, "get_ep_group", lambda: NS(world_size=8, rank_in_group=0))
+    monkeypatch.setattr(w4_adapter.DeepGemmW4A8Method, "get_fused_moe_quant_config", lambda *a: object())
+    monkeypatch.setattr(w4_adapter.DeepGemmW4A8Method, "_initialize_buffers", Mock())
+    monkeypatch.setenv("W4A8_L1_LAYOUT", "plain")
+    method = w4_adapter.DeepGemmW4A8Method(NS(), object())
+    method.process_weights_after_loading(layer)
+    torch.testing.assert_close(calls[0][0][1], torch.full((44, 3072), 4.))
+    torch.testing.assert_close(calls[0][1][1], torch.full((44, 4096), 8.))
+    assert calls[0][2] == {"mode": "w4a8", "packed_k": True, "tile256": False}
+    assert (layer.w13_weight_scale == .25).all()
+    assert (layer.w2_weight_scale == .5).all()
+    assert not calls[0][0][1].is_inference()
+    mega.prepare_w4a8_weight_scales.assert_called_once()
+    method._initialize_buffers.assert_called_once_with(layer, mode="w4a8")
+    with pytest.raises(RuntimeError, match="already packed"):
+        method.process_weights_after_loading(layer)
+
+
+def test_w4_selector_rejects_wrong_math_and_preserves_other_shapes(w4_adapter, monkeypatch):
+    config = NS(parallel_config=NS(enable_expert_parallel=True, enable_eplb=False, enable_dbo=False))
+    monkeypatch.setattr(w4_adapter, "get_current_vllm_config", lambda: config)
+    utils = ModuleType("vllm.model_executor.layers.quantization.compressed_tensors.utils")
+    utils.should_ignore_layer = lambda *a, **k: False
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    moe = NS(num_experts=352, num_local_experts=44, hidden_dim=4096,
+             intermediate_size_per_partition=1536, experts_per_token=8, ep_size=8,
+             in_dtype=torch.bfloat16, has_bias=False, is_lora_enabled=False,
+             pcp_size=1, is_sequence_parallel=False, skip_final_all_reduce=False,
+             activation="swiglustep")
+    layer = NS(expert_map_manager=NS(num_fused_shared_experts=0), layer_name="model.experts")
+    quant = NS(ignore=[], packed_modules_mapping={})
+    assert isinstance(w4_adapter.select_method(layer, quant, moe), w4_adapter.DeepGemmW4A8Method)
+    moe.activation = "silu"
+    with pytest.raises(ValueError, match="SWIGLUSTEP"):
+        w4_adapter.select_method(layer, quant, moe)
+    moe.activation = "swiglustep"
+    config.parallel_config.enable_dbo = True
+    with pytest.raises(ValueError, match="DBO"):
+        w4_adapter.select_method(layer, quant, moe)
+    moe.num_experts = 256
+    assert w4_adapter.select_method(layer, quant, moe) is None

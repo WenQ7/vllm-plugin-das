@@ -249,7 +249,33 @@ def test_custom_allreduce_initializes_native_ownership_inert(
     assert communicator.meta_ptrs == []
     assert communicator.buffer_ptrs == []
     assert communicator.rank == -1
+    assert communicator.capture_use_preregistered is False
     communicator.close()
+
+
+@pytest.mark.parametrize('staging',[False,True])
+def test_custom_allreduce_capture_uses_selected_owned_buffer_path(monkeypatch,staging):
+    module=_load_custom_allreduce_source(monkeypatch)
+    communicator=object.__new__(module.CustomAllreduce)
+    communicator.disabled=False
+    communicator._IS_CAPTURING=True
+    communicator.capture_use_preregistered=staging
+    communicator.should_custom_ar=lambda value:True
+    calls=[]
+    communicator.all_reduce=lambda value,registered: calls.append(registered) or value
+    monkeypatch.setattr(module.torch.cuda,'is_current_stream_capturing',lambda:True)
+    value=object()
+    assert communicator.custom_all_reduce(value) is value
+    assert calls==[not staging]
+    communicator.disabled=True
+
+
+def test_custom_allreduce_rejects_empty_graph_pointer(monkeypatch):
+    module=_load_custom_allreduce_source(monkeypatch)
+    communicator=object.__new__(module.CustomAllreduce)
+    communicator.disabled=False
+    assert not communicator.should_custom_ar(module.torch.empty(0))
+    communicator.disabled=True
 
 
 def test_custom_allreduce_close_is_idempotent_and_releases_owned_resources(

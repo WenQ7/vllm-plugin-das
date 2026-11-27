@@ -14,6 +14,9 @@ fptr_t init_custom_ar(const std::vector<int64_t>& fake_ipc_ptrs,
                       bool fully_connected);
 void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
+void step5_tp4_fused_output(int64_t communicator, torch::Tensor routed,
+                           torch::Tensor shared, torch::Tensor out,
+                           int64_t registered_buffer, int64_t buffer_bytes, double scale);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);

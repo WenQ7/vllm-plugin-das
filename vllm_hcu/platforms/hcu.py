@@ -701,6 +701,11 @@ class HCUPlatform(Platform):
 
         normalize_bound_deepep_auto_cudagraph_mode(vllm_config)
 
+        from vllm_hcu.megamoe_compile import configure_megamoe_splitting
+
+        if configure_megamoe_splitting(vllm_config):
+            logger.info_once('Keep DeepGEMM MegaMoE collectives outside Inductor autotuning')
+
         if cache_config and not cache_config.user_specified_block_size:
             backend = vllm_config.attention_config.backend
             if (

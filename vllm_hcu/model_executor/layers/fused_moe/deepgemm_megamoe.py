@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import torch
 
 from vllm.config import get_current_vllm_config
@@ -25,6 +26,9 @@ def activation_clamp(moe, layer):
 
 def select_method(layer, quant_config, moe):
     """Select Channel-FP8 by its quantization contract, never by model name."""
+    if quant_config is not None and quant_config.get_name() == "slimquant_w4a8":
+        from .deepgemm_w4a8 import select_method as select_w4a8
+        return select_w4a8(layer, quant_config, moe)
     if quant_config is None or quant_config.get_name() not in (
         "compressed-tensors", "slimquant_compressed_tensors_marlin",
     ):
@@ -85,6 +89,7 @@ def release_buffers():
 class DeepGemmMegaMoEMethod(FusedMoEMethodBase):
     hcu_owns_dispatch = True
     hcu_output_is_reduced = True
+    _hcu_deferred_tp_tail = True
 
     def __init__(self, moe, weight_quant):
         super().__init__(moe)
@@ -94,6 +99,7 @@ class DeepGemmMegaMoEMethod(FusedMoEMethodBase):
         self.weight_block_size = None
         self._buffer = self._gather = None
         self._weights = None
+        self.defer_tp_result = False
 
     @property
     def topk_indices_dtype(self):
@@ -145,17 +151,31 @@ class DeepGemmMegaMoEMethod(FusedMoEMethodBase):
         layer.w13_weight.data, layer.w2_weight.data = packed[0][0], packed[1][0]
         self._weights = packed
         self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        self._initialize_buffers(layer)
+
+    def _initialize_buffers(self, layer, mode="w8a8"):
+        from deepgemm import mega
+        ep, tp = get_ep_group(), get_tp_group()
+        if mode == "w4a8":
+            communicator = getattr(tp, "device_communicator", None)
+            custom_ar = getattr(communicator, "ca_comm", None)
+            if custom_ar is not None:
+                custom_ar.capture_use_preregistered = True
+        experts = int(self.moe.num_experts)
+        hidden = int(self.moe.hidden_dim)
+        intermediate = int(self.moe.intermediate_size_per_partition)
         self._capacity = math.ceil(int(self.moe.max_num_tokens) / tp.world_size)
         cache = getattr(ep, "_hcu_deepgemm_mega_buffers", None)
         if cache is None:
             cache = ep._hcu_deepgemm_mega_buffers = {}
-        key = (layer.w13_weight.device, experts, self.moe.experts_per_token,
+        key = (mode, layer.w13_weight.device, experts, self.moe.experts_per_token,
                hidden, intermediate, self._capacity)
         if key not in cache:
+            mode_args = {} if mode == "w8a8" else {"mode": mode}
             cache[key] = mega.get_symm_buffer_for_mega_moe(
                 ep.cpu_group, experts, self._capacity, self.moe.experts_per_token,
                 hidden, intermediate, use_fp8_dispatch=True, activation="swiglu",
-                peer_memory_mode="ipc")
+                peer_memory_mode="ipc", **mode_args)
         self._buffer = cache[key]
         self._tp_size, self._tp_rank = tp.world_size, tp.rank_in_group
         if self._tp_size > 1:
@@ -167,6 +187,14 @@ class DeepGemmMegaMoEMethod(FusedMoEMethodBase):
                 gathers[key] = IpcAllGather(tp.cpu_group, layer.w13_weight.device,
                                             self._capacity * hidden * 2)
             self._gather = gathers[key]
+
+    @property
+    def tp_size(self):
+        return self._tp_size
+
+    def get_fused_shared_communicator(self, rows):
+        from .megamoe_tp4_tail import megamoe_tp4_tail_communicator
+        return megamoe_tp4_tail_communicator(self, get_tp_group(), rows)
 
     def apply(self, layer, x, topk_weights, topk_ids,
               shared_experts=None, shared_experts_input=None):
@@ -184,19 +212,32 @@ class DeepGemmMegaMoEMethod(FusedMoEMethodBase):
         start = min(self._tp_rank * local_rows, rows)
         stop = min(start + local_rows, rows)
         valid = stop - start
-        output = torch.empty((local_rows, x.shape[1]), dtype=x.dtype, device=x.device)
-        # Decode publishes actual source counts; unused capacity is never read.
-        # The original unified flow can inspect capacity rows, so clear its tail.
-        if not self._buffer.decode:
+        deferred = self.defer_tp_result
+        if deferred and (rows != 64 or self._tp_size != 4 or valid != 16):
+            raise ValueError("MegaMoE deferred TP tail requires 64 rows and four 16-row slices")
+        # Keep the runner's full-shape contract; only the prefix is produced
+        # in deferred mode and only that prefix may be consumed by the tail.
+        output = torch.empty((rows if deferred else local_rows, x.shape[1]), dtype=x.dtype, device=x.device)
+        # W4 split dispatch and combine are bounded by output[:valid].
+        # This opt-in establishes only that read range; other modes retain
+        # their existing defensive capacity-tail clearing.
+        skip_tail_clear = (
+            getattr(self, "_mega_mode", "w8a8") == "w4a8"
+            and os.environ.get("HCU_MEGAMOE_W4_SKIP_TAIL_CLEAR", "0") == "1"
+        )
+        if not self._buffer.decode and not skip_tail_clear:
             self._buffer.topk_idx[valid:].fill_(-1)
             self._buffer.topk_weights[valid:].zero_()
+        mode_args = {} if getattr(self, "_mega_mode", "w8a8") == "w8a8" else {"mode": self._mega_mode}
         mega.mega_moe_preprocess(x[start:stop], topk_ids[start:stop], topk_weights[start:stop],
-                                 self._buffer, valid)
+                                 self._buffer, valid, **mode_args)
         mega.fp8_mega_moe(output[:valid], *self._weights, self._buffer,
                           activation_clamp=activation_clamp(self.moe, layer),
-                          fast_math=True, tokens_all_ranks=-1)
+                          fast_math=True, tokens_all_ranks=-1, **mode_args)
         if valid < local_rows:
-            output[valid:].zero_()
+            output[valid:local_rows].zero_()
+        if deferred:
+            return output
         if self._gather is not None:
             output = self._gather.gather([output], [local_rows] * self._tp_size)[0]
         return output[:rows]
